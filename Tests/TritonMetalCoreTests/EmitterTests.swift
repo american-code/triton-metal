@@ -100,7 +100,7 @@ final class EmitterTests: XCTestCase {
 
     /// Every fixture must survive the real Metal front-end, not just our emitter.
     func testAllFixturesCompileOnDevice() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         var fixtures: [(String, String)] = [
             ("copy", IRFixtures.copy), ("add", IRFixtures.vectorAdd),
             ("mul", IRFixtures.vectorMul), ("scale_bias", IRFixtures.scaleBias),

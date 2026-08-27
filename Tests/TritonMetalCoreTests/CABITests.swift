@@ -24,8 +24,19 @@ final class CABITests: XCTestCase {
         XCTAssertEqual(tm_is_active(), MetalRuntime.defaultDeviceName() != nil ? 1 : 0)
     }
 
+    /// `tm_is_usable` is the stronger question the CI runners forced: a
+    /// virtualised host reports a device and then cannot run what the emitter
+    /// produces. The two answers must be consistent in the one direction that is
+    /// guaranteed — an unusable machine is never a usable one — and the reason
+    /// string must be present exactly when the verdict is negative.
+    func testIsUsableAgreesWithItsReason() {
+        XCTAssertEqual(tm_is_usable(), MetalRuntime.unusableReason == nil ? 1 : 0)
+        XCTAssertEqual(takeString(tm_unusable_reason()), MetalRuntime.unusableReason)
+        if tm_is_usable() == 1 { XCTAssertEqual(tm_is_active(), 1) }
+    }
+
     func testDeviceNameIsReported() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         XCTAssertEqual(takeString(tm_device_name()), MetalRuntime.defaultDeviceName())
     }
 
@@ -83,7 +94,7 @@ final class CABITests: XCTestCase {
     /// The whole spine through the C ABI only: emit -> compile -> load -> alloc ->
     /// write -> launch -> read -> release.
     func testVectorAddEndToEndThroughTheABI() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         let liveBefore = tm_live_handle_count()
 
         let source = try XCTUnwrap(takeString(IRFixtures.vectorAdd.withCString { tm_emit_msl($0, 4) }))
@@ -139,7 +150,7 @@ final class CABITests: XCTestCase {
     }
 
     func testUnknownLaunchArgumentKindIsRejected() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         let source = try XCTUnwrap(takeString(IRFixtures.copy.withCString { tm_emit_msl($0, 4) }))
         let library = source.withCString { tm_compile_msl($0) }
         let kernel = "copy_kernel".withCString { tm_load_kernel(library, $0) }
@@ -200,7 +211,7 @@ final class CABITests: XCTestCase {
     /// memory in place, and the bounds guard on the copying path is what keeps a
     /// bad offset or length from scribbling on the host.
     func testBufferContentsAndCopyBounds() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         let buffer = tm_alloc_buffer(16)
         XCTAssertNotEqual(buffer, 0, lastError())
         defer { XCTAssertEqual(tm_free_buffer(buffer), 0) }
@@ -223,7 +234,7 @@ final class CABITests: XCTestCase {
     /// The offline `xcrun metal` path feeds `tm_load_metallib`, which is how a
     /// cached `.metallib` re-enters the runtime without recompiling MSL.
     func testMetallibLoadingThroughTheABI() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         let source = try MetalCompiler.emitMSL(ttir: IRFixtures.copy, options: .init())
         let image: Data
         do {
@@ -250,7 +261,7 @@ final class CABITests: XCTestCase {
     /// f32 scalars reach the kernel as a bit pattern in the low 32 bits of the
     /// `values` array — the one launch argument kind the vector-add path misses.
     func testFloatScalarLaunchArguments() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device")
+        try skipWithoutMetal()
         let source = try XCTUnwrap(
             takeString(IRFixtures.scaleBias.withCString { tm_emit_msl($0, 4) }))
         let library = source.withCString { tm_compile_msl($0) }

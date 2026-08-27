@@ -22,7 +22,10 @@ from triton_metal.buffer import MetalBuffer  # noqa: E402
 
 PINNED_VERSION = "3.7.1"
 
-requires_metal = pytest.mark.skipif(not _core.is_active(), reason="no Metal device on this machine")
+requires_metal = pytest.mark.skipif(
+    not _core.is_usable(),
+    reason="no usable Metal device: " + (_core.unusable_reason() or "unknown"),
+)
 
 
 @triton.jit

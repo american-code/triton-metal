@@ -85,7 +85,7 @@ final class EndToEndTests: XCTestCase {
     private func cdiv(_ a: Int, _ b: Int) -> Int { (a + b - 1) / b }
 
     override func setUpWithError() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device on this machine")
+        try skipWithoutMetal()
     }
 
     // MARK: - Kernels

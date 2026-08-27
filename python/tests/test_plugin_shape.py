@@ -90,7 +90,8 @@ module {
 """
 
 requires_metal = pytest.mark.skipif(
-    not _core.is_active(), reason="no Metal device on this machine"
+    not _core.is_usable(),
+    reason="no usable Metal device: " + (_core.unusable_reason() or "unknown"),
 )
 
 

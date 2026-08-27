@@ -107,6 +107,76 @@ public enum MetalRuntime {
         return buffer
     }
 
+    // MARK: - Capability
+
+    /// Why this machine cannot run a lowered kernel, or `nil` when it can.
+    ///
+    /// `MTLCreateSystemDefaultDevice()` returning something is not the same as
+    /// having a GPU that runs what this backend emits. A virtualised host — a
+    /// GitHub Actions macOS runner is the case that forced this — reports an
+    /// "Apple Paravirtual device" that answers every query, and then fails at
+    /// runtime MSL compilation or produces nothing when a dispatch runs. Every
+    /// emitted kernel needs both halves of what is probed here: an ordinary
+    /// device store, and the simdgroup matrix operations `tt.dot` lowers to.
+    ///
+    /// Probed once per process, on the real device, and cached: the result gates
+    /// GPU tests both in Swift and (through `tm_is_usable`) in the Python shim's
+    /// suite, so it must be cheap enough to ask for repeatedly.
+    public static let unusableReason: String? = probeDevice()
+
+    /// True when a dispatch this backend emits will actually run here.
+    public static var isUsable: Bool { unusableReason == nil }
+
+    private static func probeDevice() -> String? {
+        guard device != nil else { return "no Metal device on this machine" }
+        // Both halves in one kernel, so one dispatch answers both questions: a
+        // plain store, and an 8x8 simdgroup multiply-accumulate through
+        // threadgroup memory. `a` is the identity, so `out[i] == i`.
+        let source = """
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void tm_probe(
+                device float *out [[buffer(0)]],
+                uint tid [[thread_position_in_threadgroup]]
+            ) {
+                threadgroup float a[64];
+                threadgroup float b[64];
+                for (uint i = tid; i < 64u; i += 32u) {
+                    a[i] = (i / 8u) == (i % 8u) ? 1.0f : 0.0f;
+                    b[i] = float(i);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_float8x8 fa, fb;
+                simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_load(fa, a, 8u);
+                simdgroup_load(fb, b, 8u);
+                simdgroup_multiply_accumulate(acc, fa, fb, acc);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_store(acc, a, 8u);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint i = tid; i < 64u; i += 32u) { out[i] = a[i]; }
+            }
+            """
+        do {
+            let pipeline = try loadKernel(library: try makeLibrary(source: source), kernelName: "tm_probe")
+            let buffer = try makeBuffer(length: 64 * 4)
+            memset(buffer.contents(), 0, buffer.length)
+            try launch(
+                pipeline: pipeline, threadgroups: MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: 32, arguments: [.buffer(buffer)])
+            let out = UnsafeBufferPointer(
+                start: buffer.contents().assumingMemoryBound(to: Float.self), count: 64)
+            for index in 0..<64 where out[index] != Float(index) {
+                return "\(device?.name ?? "this device") ran the probe kernel but returned "
+                    + "\(out[index]) at \(index) instead of \(index) — its simdgroup matrix "
+                    + "support is not usable"
+            }
+            return nil
+        } catch {
+            return "\(device?.name ?? "this device") cannot run a lowered kernel: \(error)"
+        }
+    }
+
     // MARK: - Launch
 
     public enum LaunchArgument {
@@ -225,6 +295,23 @@ let tmHandles = HandleTable()
 @_cdecl("tm_is_active")
 public func tm_is_active() -> Int32 {
     MetalRuntime.defaultDeviceName() != nil ? 1 : 0
+}
+
+/// Returns 1 when this machine can actually run an emitted kernel.
+///
+/// Stronger than `tm_is_active`, which only asks whether a device object exists.
+/// A virtualised host reports one and then cannot compile or run what the
+/// emitter produces, so the Python suite's GPU tests gate on this instead.
+@_cdecl("tm_is_usable")
+public func tm_is_usable() -> Int32 {
+    MetalRuntime.isUsable ? 1 : 0
+}
+
+/// Why `tm_is_usable` is 0, as a malloc'd string (caller frees via `tm_free`),
+/// or NULL when the device is usable.
+@_cdecl("tm_unusable_reason")
+public func tm_unusable_reason() -> UnsafeMutablePointer<CChar>? {
+    MetalRuntime.unusableReason.map { strdup($0) }
 }
 
 /// Returns a malloc'd device-name string (caller frees via `tm_free`), or NULL.

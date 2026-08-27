@@ -94,8 +94,16 @@ enum GPU {
 }
 
 extension XCTestCase {
+    /// Skips unless this machine can actually run an emitted kernel.
+    ///
+    /// Not the same question as "is there a device". A virtualised host — a
+    /// GitHub Actions macOS runner — reports an "Apple Paravirtual device" that
+    /// answers every Metal query and then fails to compile or dispatch what the
+    /// emitter produces, so the probe in `MetalRuntime.unusableReason` runs a
+    /// real kernel (a store and a simdgroup multiply-accumulate) once per
+    /// process and this gate reports what it found.
     func skipWithoutMetal() throws {
-        try XCTSkipIf(MetalRuntime.device == nil, "no Metal device on this machine")
+        if let reason = MetalRuntime.unusableReason { throw XCTSkip(reason) }
     }
 
     /// Elementwise comparison with an absolute/relative tolerance, reporting the

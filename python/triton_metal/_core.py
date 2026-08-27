@@ -43,6 +43,8 @@ _SIGNATURES = {
     "tm_last_error": (_ptr, []),
     "tm_free": (None, [_ptr]),
     "tm_is_active": (_i32, []),
+    "tm_is_usable": (_i32, []),
+    "tm_unusable_reason": (_ptr, []),
     "tm_device_name": (_ptr, []),
     # Compiler
     "tm_emit_msl": (_ptr, [_str, _i32]),
@@ -108,6 +110,21 @@ def version() -> str:
 
 def is_active() -> bool:
     return bool(_lib.tm_is_active())
+
+
+def is_usable() -> bool:
+    """Whether a dispatch this backend emits will actually run on this machine.
+
+    Stronger than `is_active`: a virtualised host reports a Metal device that
+    answers every query and then fails to compile or run an emitted kernel. The
+    probe itself lives in the Swift core.
+    """
+    return bool(_lib.tm_is_usable())
+
+
+def unusable_reason():
+    """Why `is_usable()` is False, or None when the device is usable."""
+    return _take_string(_lib.tm_unusable_reason())
 
 
 def device_name():

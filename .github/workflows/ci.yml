@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# A queued run of an obsolete commit is not worth a runner.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: swift build + swift test + pytest (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and machine
+        run: |
+          set -o pipefail
+          sw_vers
+          uname -m
+          swift --version
+          python3 --version
+
+      # Whether the runner's GPU can run what this backend emits is a *result*,
+      # not an assumption. GitHub's macOS runners are virtualised and report an
+      # "Apple Paravirtual device": Metal answers every query, and a dispatch may
+      # still fail or come back empty. `MetalRuntime.unusableReason` probes it by
+      # compiling and running a kernel that uses both halves of what an emitted
+      # kernel needs — a device store and a simdgroup multiply-accumulate — and
+      # every GPU test in both suites skips on what it reports. This step only
+      # records the verdict in the log so a run's skips are explainable.
+      - name: Probe the Metal device
+        run: |
+          set -o pipefail
+          swift build --product tmbench 2>&1 | tail -1
+          .build/debug/tmbench --probe
+
+      - name: swift build
+        run: |
+          set -o pipefail
+          swift build 2>&1 | tail -20
+
+      - name: swift test
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tail -60
+
+      # The Python package is a ctypes shim over the dylib `swift build` just
+      # produced; it has no dependency beyond pytest. The Triton round-trip
+      # suite skips itself when `import triton` fails, which it does here —
+      # Triton publishes no macOS wheel and building it from source is ~9
+      # minutes (docs/USAGE.md).
+      - name: pytest (Python shim)
+        working-directory: python
+        run: |
+          set -o pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pytest
+          PYTHONPATH=. python3 -m pytest tests/ -q -rs 2>&1 | tail -40

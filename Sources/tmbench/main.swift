@@ -39,6 +39,7 @@ struct Arguments {
     var attentionPinned: [AttentionConfig] = []
     var attentionElement = "f32"
     var emitAttention: (config: AttentionConfig, dim: Int)?
+    var probe = false
 }
 
 /// `b,h,s,d;b,h,s,d` — the spelling `--attn-shapes` takes.
@@ -116,6 +117,7 @@ func parseArguments() -> Arguments {
                     "\(fields[0]!),\(fields[1]!),\(fields[2]!)")
             else { fail("--emit-attn takes BLOCK_M,BLOCK_N,W,HEAD_DIM") }
             arguments.emitAttention = (config: config, dim: fields[3]!)
+        case "--probe": arguments.probe = true
         case "--verbose", "-v": arguments.verbose = true
         case "--no-verify": arguments.verify = false
         case "--help", "-h":
@@ -137,6 +139,9 @@ func parseArguments() -> Arguments {
                                        print the emitted MSL for one configuration and exit
                   --verbose            print every configuration's throughput
                   --no-verify          skip the CPU-reference correctness check
+                  --probe              report whether this machine can run an
+                                       emitted kernel at all, and exit 0 either
+                                       way (what CI's GPU-test skips key off)
 
                 FlashAttention-2 forward, against the unfused MPS composite
                 (Q K^T, softmax, P V — three dispatches through a real S x S
@@ -170,6 +175,20 @@ func parseArguments() -> Arguments {
 }
 
 let arguments = parseArguments()
+
+// Deliberately exits 0 whichever way it goes: this reports a fact about the
+// machine, and a machine without a usable GPU is a legitimate place to run the
+// emitter tests. CI calls it so that a run's skips are explainable from the log.
+if arguments.probe {
+    print("device: \(MetalRuntime.defaultDeviceName() ?? "none")")
+    if let reason = MetalRuntime.unusableReason {
+        print("usable: no — \(reason)")
+        print("GPU tests in both suites will skip; emitter and parser tests still run.")
+    } else {
+        print("usable: yes (a store and a simdgroup multiply-accumulate both ran correctly)")
+    }
+    exit(0)
+}
 
 if let config = arguments.emit {
     do {
