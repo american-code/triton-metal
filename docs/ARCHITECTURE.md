@@ -789,6 +789,98 @@ Python shim never computes it:
 `block_size` is the product of `block_shape`; a scalar-only kernel reports an
 empty shape and one thread.
 
+## The Swift-native frontend
+
+`Sources/TritonMetalMLX` is a second consumer of the core, beside the C ABI: it
+runs an emitted kernel directly on [MLX](https://github.com/ml-explore/mlx-swift)
+tensors from Swift. Nothing about it is required by the Triton path — it is the
+other way in, for a Swift caller who wants a fused kernel and does not want a
+Python interpreter in the picture.
+
+```
+                   ┌─ tm_* C ABI ──── python/triton_metal ──── Triton plugin ──── @triton.jit
+TritonMetalCore ───┤
+                   └─ TritonMetalMLX ──── MetalPipeline.launch(arrays:) ──── MLXArray
+```
+
+### Why it is a separate target
+
+`TritonMetalCore` must stay dependency-free, so mlx-swift is reached from
+`TritonMetalMLX` and `tmsae` only and the arrow points one way: linking
+`tritonmetal` drags nothing in behind it, and `swift build --product tritonmetal`
+does not compile the MLX C++ core at all. The tests are a separate bundle for the
+same reason — the core's 191 cases must keep running on a machine with no
+`mlx.metallib`, and must not acquire an MLX dependency by association. The
+structure mirrors `MCCLMLX` in mccl, which drew the same line for the same reason.
+
+### The seam
+
+`MetalPipeline` holds an `EmittedKernel` and an `MTLComputePipelineState`.
+`prepare(arrays:scalars:)` checks and binds; `launch(_:grid:)` dispatches;
+`launch(arrays:scalars:grid:)` does both. The argument lists are split once at
+construction and re-interleaved by walking `metadata.arguments`, whose `index` is
+the emitted `[[buffer(N)]]` slot — so the caller passes pointers and scalars as
+two flat lists in `tt.func` order and never counts positions.
+
+The checks are exactly those the metadata can support: arity, dtype against the
+declared pointee type, non-emptiness, and scalar width. **Extents cannot be
+checked**, and the API says so rather than pretending: Triton lowers a tensor's
+shape into pointer arithmetic over scalar size and stride parameters, so a kernel
+argument arrives here as a bare `!tt.ptr<T>` with no rank. `blockShape` describes
+the tile one program walks, which is a different thing. An op-level wrapper knows
+its own shapes and can check them — `SAEEncoder.Compiled` does.
+
+### The zero-copy result
+
+An `MLXArray`'s storage comes from MLX's own Metal allocator, so
+`MTLDevice.makeBuffer(bytesNoCopy:length:)` over it returns a buffer whose
+`contents()` is the array's own address; mlx-swift exposes this as
+`asMTLBuffer(device:noCopy:)`. A kernel dispatched against that buffer reads and
+writes the array in place, at every size tested including 12 bytes — verified by
+writing through the buffer and reading back through MLX, not by comparing
+pointers. docs/USAGE.md §Zero copy, measured has the numbers and the two
+CUDA-shaped expectations that do not apply (page alignment, and Foundation's
+14-byte inline-`Data` threshold).
+
+Only a strided or broadcast array copies: there is no contiguous run of bytes for
+a kernel to address, so `asMTLBuffer` materialises one and `MLXBinding.mode`
+reports `.copied`. That is also why `launch` returns an array per pointer
+argument with the rule *read the returned arrays, not the ones you passed* — on
+the aliased path the returned array is the one you passed, and on the copied path
+it is a new one. One rule, correct in both cases, and it never silently drops a
+result.
+
+### What it is worth, measured
+
+The per-launch difference between this path and the ctypes one is 10–50 µs
+depending on machine, against a synchronous Metal command-buffer round trip of
+230–360 µs that both pay identically — `tm_launch` *is* `MetalRuntime.launch`. So
+"no Python in the hot path" is worth 3–18% of a dispatch here, not an order of
+magnitude. The unconditional win is elsewhere and is not about latency: an
+`MLXArray` needs no copy to become a kernel argument, while a `numpy` array does
+and always will. Both halves are in docs/USAGE.md §Dispatch overhead, measured on
+lab-02 and on the M1 Pro laptop with byte-identical IR on both sides.
+
+### Packaging the dylib
+
+The Triton wheel carries the Swift runtime, so installing it is the only step a
+stranger takes. `Tools/bundle-wheel.sh` stages two things into a Triton checkout
+before `bdist_wheel`, and edits nothing of Triton's:
+
+* `libtritonmetal.dylib` into the plugin's `backend/`, which Triton symlinks to
+  `python/triton/backends/metal`. `MANIFEST.in` grafts `python/triton` and
+  `include_package_data=True` is set, so the file ships as package data of
+  `triton.backends.metal` — the route `name.conf` was already taking.
+* `python/triton_metal/` into the checkout's `python/`, where Triton's
+  `find_packages(where="python")` picks it up as a top-level package. Without it
+  the wheel would contain a backend importing a shim that is not there.
+
+`_core.py` looks inside the installed backend package first (after
+`TRITON_METAL_CORE_LIB`), located through `sysconfig` rather than by importing
+`triton` — `_core` is imported *from* `triton.backends.metal.compiler`, so asking
+the import system for `triton` at that moment would re-enter a half-initialised
+package.
+
 ## Matmul throughput
 
 The matmul tutorial kernel, lowered by this backend, against
@@ -1447,6 +1539,33 @@ cancellation amplification computed from the reference itself.
     cannot fix — a `tt.reduce` result placed at two dimensions — is still refused
     by name.
 
+14. **The MLX frontend** — a separate bundle, `TritonMetalMLXTests`, 37 cases.
+    The dtype mapping both ways and its refusal to narrow anything it does not
+    carry; the contiguity predicate against real layouts (a row of a row-major
+    matrix is contiguous, a column and a transpose are not); the zero-copy claim
+    proved by *writing* — a fill kernel through a bound buffer, read back through
+    `asArray`, through `sum(stream: .cpu)` and through `sum(stream: .gpu)` — at
+    sizes straddling the 16 KB page and Foundation's 14-byte inline-`Data`
+    threshold, plus a check that an array packed into the same page is untouched;
+    that a strided argument is staged rather than aliased and that its
+    `result()` is a *new* array leaving the caller's alone; every argument-checking
+    error path (arity, dtype, unsupported dtype, an integer for an `f32`
+    parameter and a float for an integer one, an out-of-range scalar, a
+    non-positive grid, an empty array), each asserting the message names the
+    offender; that a lazy input is evaluated before its address is taken; that
+    `prepare` binds once and its results track the buffers across launches; and
+    the SAE encoder against MLX's own ops at block multiples, at shapes ragged in
+    all three dimensions, at `[1, 512] @ [512, 4096]`, under a bias low enough to
+    make the ReLU do visible work, and at two non-default block shapes — plus
+    that the epilogue really is fused (one `kernel void`, a `max` and a
+    `simdgroup_multiply_accumulate` in the emitted MSL).
+
+    Every case gates on two things and skips rather than failing when either is
+    missing: `MetalRuntime.unusableReason`, and the presence of `mlx.metallib`.
+    The second gate is checked *before* the first MLX call, because MLX's failure
+    to find its shader library is fatal to the process rather than throwable and
+    cannot be turned into a test failure after the fact.
+
 `MatmulBenchmark` is a further suite that stays off unless `TM_BENCH=1` is set: it
 measures a machine, not a contract. The measurement itself lives in the
 `TritonMetalBench` library and is shared with the **`tmbench`** executable
@@ -1465,6 +1584,14 @@ composite, and verifies its winners against a CPU reference before reporting the
 `tmbench --attn-bwd` does the same for the backward pass, against five MPS GEMMs
 with a softmax and a softmax gradient between them, and checks `dQ`, `dK` and `dV`
 against a CPU reference before believing a timing.
+
+**`tmsae`** is the equivalent for the MLX frontend, and exists for the same
+reason: the lab machine has no XCTest. It checks the SAE encoder against MLX's
+own ops, proves the buffer binding by writing through it, and reports the
+dispatch numbers in §The Swift-native frontend. `tmsae --emit-ir` prints the
+kernel's IR so that `python/examples/sae_encode.py` lowers byte-identical text —
+the two halves of a cross-language timing must not be allowed to drift, and the
+only way to guarantee that is one source of the IR.
 
 ### Continuous integration
 
@@ -1492,6 +1619,15 @@ measured fact about today's runner image, not an assumption the suite depends on
 
 **Every piped step sets `set -o pipefail`.** `swift test 2>&1 | tail -60` without
 it reports the exit status of `tail`, which is a green tick over a failed suite.
+
+**The MLX frontend's 37 cases skip there, and `mlx.metallib` is deliberately not
+fetched.** They gate on a usable device *and* the shader library; the runner
+fails the first gate whatever happens with the second, so downloading it would
+change nothing but the CI's bandwidth. What CI does exercise of that target is
+the compile — `swift build` builds it and mlx-swift's C++ core behind it, which
+is why the job's timeout went from 45 to 60 minutes — plus `tmsae --emit-ir`,
+which prints the SAE kernel's IR without touching MLX or the GPU and so is the
+one end-to-end piece a device-less runner can still run.
 
 The benchmark suites do not run in CI: they measure a machine, and the machine CI
 gives you is a different one every time.

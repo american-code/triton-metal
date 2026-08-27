@@ -34,6 +34,9 @@ Everything that does real work is Swift, exposed through a C ABI:
 ```
 Sources/TritonMetalCore/   Swift: MSL emission, metallib compilation, Metal runtime,
                            kernel launch — exported as tm_* symbols in libtritonmetal.dylib
+Sources/TritonMetalMLX/    Swift: the MLX frontend. Separate target and product, and
+                           the only thing with an external dependency — the core must
+                           never drag mlx-swift in behind it.
 python/triton_metal/       ctypes shim only. Exists because Triton's backend discovery
                            imports a Python module; contains no logic and never will.
 python/plugin/             What Triton's TRITON_PLUGIN_DIRS points at: the vendored
@@ -84,6 +87,40 @@ Triton ships no macOS wheel, so this means building Triton from source with
 `TRITON_PLUGIN_DIRS` pointing at `python/plugin/` — about **9 minutes**, no CUDA
 toolchain, no Xcode, no patch to Triton. Recipe:
 [docs/USAGE.md §Building Triton with the Metal backend](docs/USAGE.md#building-triton-with-the-metal-backend).
+That build now produces **one artifact**: `Tools/bundle-wheel.sh` stages the
+Swift runtime and the shim into the checkout, so the wheel carries
+`libtritonmetal.dylib` inside `triton/backends/metal/` and needs nothing else.
+Verified by installing it into a fresh venv on another machine, with no repo
+checkout on the path, and running all four examples from a neutral directory.
+
+**A Swift-native way in, which the CUDA path does not have.** Triton on CUDA
+reaches the GPU through Python: `@triton.jit` is a Python decorator and the
+launcher is a Python object. Here the compiler is a Swift library, so a Swift
+caller can skip that entirely and run an emitted kernel straight on
+[MLX](https://github.com/ml-explore/mlx-swift) tensors:
+
+```swift
+let encoder = try SAEEncoder.compile()          // relu(x @ W_enc + b_enc), one kernel
+let h = try encoder(activations, dictionary, bias)
+```
+
+`TritonMetalMLX` is a separate target and product, so the core stays
+dependency-free. An `MLXArray` is handed to a kernel with **no copy** — its
+storage came from MLX's own Metal allocator, so `makeBuffer(bytesNoCopy:)`
+returns the array's own address and the kernel's stores land in the array, at
+every size down to 12 bytes (proved by writing through the buffer and reading
+back through MLX, not by comparing pointers). A `numpy` array on the Python path
+cannot avoid that copy: 141–216 µs at `[64, 512] @ [512, 2048]`.
+
+The latency difference is smaller and is stated as measured rather than as a
+slogan. With arguments already bound, the same kernel from byte-identical IR
+launches in **231–233 µs** from Swift against **282–286 µs** through the Python
+ctypes shim on an M1 Max, and 360–367 vs 371–378 µs on an M1 Pro laptop — 3–18%,
+because both are dominated by a synchronous Metal command-buffer round trip that
+`tm_launch` and `MetalPipeline` share.
+[docs/USAGE.md §The Swift-native path](docs/USAGE.md#the-swift-native-path-kernels-on-mlxarrays)
+has the whole table, the SAE kernel checked against MLX's own ops (worst relative
+error 8.3e-07), and what does and does not get copied.
 
 **Working end-to-end spine, with real kernels on it.** Triton IR text -> MSL ->
 `MTLLibrary` -> compute pipeline -> unified-memory buffers -> dispatch -> results,
@@ -195,9 +232,11 @@ finite differences of the forward as well as against an analytic reference.
   to `simdgroup_matrix<bfloat, 8, 8>`, so a bf16 `tt.dot` is a real simdgroup
   matrix multiply rather than a widen-and-multiply, and it is a type of its own
   rather than a second spelling of `f16` — neither converts to the other directly.
-- **Tests**: 191 Swift cases (parser, emitter, layout, casts/math, control flow,
+- **Tests**: 228 Swift cases (parser, emitter, layout, casts/math, control flow,
   rank-2, reductions, `tt.dot`, atomics, FlashAttention-2 forward *and* backward,
-  axis cloning, error paths, and GPU runs verified against CPU references) + 16
+  axis cloning, error paths, and GPU runs verified against CPU references — plus
+  37 for the MLX frontend, in their own bundle so the core's suite keeps running
+  on a machine with no `mlx.metallib`) + 16
   Python cases including vector-add and softmax round trips, plus 7 more that drive
   **real** `@triton.jit` kernels — including a forward+backward gradient check —
   and skip with an actionable message when Triton is not installed, plus opt-in MPS
@@ -230,6 +269,17 @@ To run the `@triton.jit` tutorials you also need Triton built against this plugi
 python python/examples/vector_add.py
 python python/examples/attention_training.py    # forward + backward + a training step
 ```
+
+The Swift-native path needs MLX's shader library, which SwiftPM does not build:
+
+```
+Tools/fetch-metallib.sh                         # into .build/* and the test bundle
+swift run -c release tmsae                      # SAE encoder vs MLX, and the dispatch numbers
+swift run -c release tmsae --emit-ir            # its IR, for the Python comparison
+```
+
+Nothing else needs it: `swift build --product tritonmetal` never compiles MLX,
+and the 37 MLX cases in `swift test` skip cleanly when the library is absent.
 
 Never `xcodebuild`. GEMM throughput against MPS:
 

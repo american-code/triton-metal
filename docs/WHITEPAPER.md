@@ -34,7 +34,7 @@ is a ctypes shim with no logic in it, present only because Triton's backend
 discovery imports a Python module.
 
 The evaluation is deliberately unflattering where the results are. The test suite
-is 191 Swift cases and 23 Python cases (16 of which need no Triton install), at
+is 228 Swift cases and 23 Python cases (16 of which need no Triton install), at
 ~83% region / ~85% function / ~90% line coverage of the Swift core, run on every
 push by GitHub Actions. The lowered matmul reaches **76% of
 `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.64
@@ -162,13 +162,39 @@ is explicitly **M1-generation-scoped**: measured on an M1 Max and an M1 Pro, wit
 the M3/M4 memory-hierarchy rework unmeasured.
 
 **Swift core, C ABI, no Python in the hot path.** All compiler logic is Swift
-behind `tm_*` C symbols; the 282-line Python package is a ctypes shim that computes
+behind `tm_*` C symbols; the 390-line Python package is a ctypes shim that computes
 nothing, present only because Triton's backend discovery imports a Python module
 (§4.2). Launch geometry — block shape, threadgroup size, argument kinds — is
 computed in the core and read out as JSON, so nothing about the lowered kernel is
 reimplemented on the Python side. The backend is therefore callable from Swift,
 from C, or from any language with an FFI, and the Python dependency is confined to
 the frontend.
+
+**A Swift-native frontend, which the CUDA path cannot offer.** Because the
+compiler is a Swift library rather than a Python extension, the Python frontend
+is optional in a way it is not on CUDA, where `@triton.jit` is a Python decorator
+and the launcher a Python object. `TritonMetalMLX` — a separate target and
+product, so the core acquires no dependency — takes Triton IR and runs the
+emitted kernel directly on [MLX](https://github.com/ml-explore/mlx-swift)
+tensors, checking each argument's dtype against the kernel's own emitted
+metadata. An `MLXArray` reaches a kernel with **no copy at all**: its storage came
+from MLX's Metal allocator, so `makeBuffer(bytesNoCopy:)` returns the array's own
+address and the kernel's stores land in the array — verified by writing through
+the buffer and reading back through MLX at every size down to 12 bytes, rather
+than inferred from pointer equality, which Foundation's 14-byte inline-`Data`
+threshold makes unreliable at exactly the sizes where it would matter. The
+demonstration is an interpretability op rather than a toy: a sparse-autoencoder
+encoder, `relu(x @ W_enc + b_enc)`, fused into one kernel and agreeing with MLX's
+own ops to a worst relative error of 8.3e-07 over shapes ragged in all three
+dimensions. The *latency* consequence is smaller than the architectural one and
+is reported as measured: with arguments bound, the same kernel from
+byte-identical IR launches in 231–233 µs from Swift against 282–286 µs through
+the ctypes shim on an M1 Max (360–367 vs 371–378 on an M1 Pro) — 3–18%, because
+both are dominated by a synchronous Metal command-buffer round trip they share.
+What the Swift path removes unconditionally is not the interpreter but the copy:
+a `numpy` array must be staged into a Metal buffer and read back, 141–216 µs at
+`[64, 512] @ [512, 2048]`, and macOS torch wheels being CPU-only means there is
+no way around it on that side.
 
 **Training, not just inference.** The backward pass runs. `tt.atomic_rmw` and
 `tt.atomic_cas` lower to Metal's device atomics, and **FlashAttention-2 backward**
@@ -200,7 +226,12 @@ no float `fetch_max`, which goes through a compare-exchange loop — and expose 
 memory order, so a kernel relying on an atomic's release edge to publish ordinary
 stores is not correctly lowered. Because Triton publishes no macOS wheel, adoption
 costs a **from-source Triton build**: ~9 minutes, once, no CUDA toolchain and no
-Xcode, but it is not `pip install triton`. Every performance number and every
+Xcode, but it is not `pip install triton`. What that build now yields is a single
+self-contained wheel — `Tools/bundle-wheel.sh` stages `libtritonmetal.dylib` into
+`triton/backends/metal/` and the ctypes shim alongside it, so the person who
+receives the wheel installs one artifact and nothing else, verified into a fresh
+virtualenv on a second machine with no checkout on the path. It still has to be
+built by someone with a Mac and a Swift toolchain first. Every performance number and every
 inversion above is **single-generation**, M1 Max and M1 Pro. And Triton-on-CUDA is
 simply more mature: a ttgir layout system, a conformance suite this project has
 not yet ported a subset of, per-architecture pipelining, and a vendor library this
@@ -481,8 +512,9 @@ the code that looks like it does the arithmetic.
 
 ## 6. Test strategy
 
-191 Swift cases across thirteen suites (one, the benchmark, is opt-in and skipped
-by default), plus 23 Python cases. Everything that can run on the real GPU does,
+228 Swift cases across sixteen suites (one, the benchmark, is opt-in and skipped
+by default; three cover the MLX frontend and skip without its shader library),
+plus 23 Python cases. Everything that can run on the real GPU does,
 including on GitHub Actions — where the runner's *Apple Paravirtual device* is
 probed with a real kernel before its GPU results are believed (§6, end).
 
@@ -501,6 +533,9 @@ probed with a real kernel before its GPU results are believed (§6, end).
 | `AttentionTests` | 10 | FA-2 forward at five shapes dividing neither the block nor the fragment, f16-in/f32-accumulate, `num_warps` 1..8, scores that overflow a naive `exp`, and assertions on the three carried tensors, the spilled row maximum, the shared arena and the byte-counted refusal |
 | `AttentionBackwardTests` | 9 | the three backward kernels against an analytic `Double` reference at eight shapes including two f16 ones, against central finite differences of the forward, with the real forward's own statistics feeding them, at `num_warps` 1..8; every tolerance derived from a summation bound; plus the arena, the two resident accumulators, the logsumexp recomputation, and the one shape-and-warp combination that does not fit |
 | `AxisCloningTests` | 5 | the matmul tutorial as Triton prints it when block sizes collide, on the GPU at four of them; that the shared range is duplicated and the orphan removed; that a kernel which already lowers is untouched; and that a `tt.reduce` result at two dimensions is still refused |
+| `MLXBufferTests` | 10 | the dtype mapping both ways and its refusal to narrow; the contiguity predicate against real layouts; the zero-copy claim proved by *writing* through a bound buffer and reading back through `asArray` and both `sum` streams, at sizes straddling the 16 KB page and Foundation's 14-byte inline-`Data` threshold; that a neighbour packed into the same page is untouched; and that a strided binding stages a copy whose `result()` leaves the caller's array alone |
+| `MetalPipelineTests` | 17 | launching a three-pointer/two-scalar kernel on `MLXArray`s and getting the right answer; a strided input staged and still correct; a lazy input evaluated before its address is taken; `prepare` binding once and launching many; the one-call `run`; kernel selection in a multi-kernel module; and every argument-checking refusal — arity, dtype, unsupported dtype, an integer for an `f32` parameter and a float for an integer one, an out-of-range scalar, a non-positive grid, an empty array — each asserting the message names the offender |
+| `SAEEncoderTests` | 10 | the fused encoder against MLX's own ops at block multiples, at shapes ragged in all three dimensions, at `[1, 512] @ [512, 4096]`, and at two non-default block shapes; a bias low enough to make the ReLU do visible work; repeated launches agreeing exactly; the wrapper's own shape refusals; and that the epilogue really is fused — one `kernel void`, with a `max` and a `simdgroup_multiply_accumulate` in the emitted MSL |
 | `MatmulBenchmark` | 2 | opt-in (`TM_BENCH=1`); measures a machine, not a contract |
 
 The Python suite splits in two. Sixteen cases assert the shim's *shape* (the
@@ -564,8 +599,11 @@ mechanical operand-remapping switches with one case per operation in the languag
 of which only the handful an index-arithmetic cone actually contains is exercised.
 The behaviour is covered; the switch arms are not.
 
-Over ~6,900 lines of Swift core and ~3,900 lines of tests. The 282-line Python
-package is the shim. `TritonMetalBench` — the GEMM sweep shared by `tmbench` and
+Over ~6,900 lines of Swift core and ~3,900 lines of tests. The 390-line Python
+package is the shim. `TritonMetalMLX` (~830 lines, with ~760 of tests) sits
+outside this figure: it is a frontend over the core rather than part of it, and
+its suite skips on a machine without MLX's shader library, so folding it in would
+make the core's coverage number depend on whether a metallib was fetched. `TritonMetalBench` — the GEMM sweep shared by `tmbench` and
 the opt-in XCTest wrapper — is measurement infrastructure rather than core and is
 excluded; it is exercised by `tmbench` itself, which verifies every configuration
 it reports against a CPU reference.

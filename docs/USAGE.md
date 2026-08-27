@@ -26,8 +26,8 @@ and [WHITEPAPER.md](WHITEPAPER.md).
 
 ```
 swift build                                     # builds .build/debug/libtritonmetal.dylib
-swift test                                      # 144 cases, on the real GPU where relevant
-cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 15 cases; needs the dylib above
+swift test                                      # 228 cases, on the real GPU where relevant
+cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 16 passed, 1 skipped; needs the dylib
 ```
 
 `swift build -c release` puts the dylib in `.build/release/`. **Never
@@ -36,6 +36,14 @@ cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 15 cases; needs the dy
 Requirements: macOS 14+, an Apple-silicon Metal device. Nothing else — the
 primary compile path is `MTLDevice.makeLibrary(source:)`, which needs no Xcode
 command-line tools.
+
+`swift build` also compiles `TritonMetalMLX` and mlx-swift's bundled MLX C++ core
+behind it (about 70s on an M1 Pro, once). Nothing in the core, the shim or
+`tmbench` depends on it — the dependency is reached only from the MLX frontend
+and `tmsae`, and `swift build --product tritonmetal` skips compiling it entirely.
+Those two also need `mlx.metallib`, which SwiftPM does not build:
+`Tools/fetch-metallib.sh` installs it, and the tests that need it skip cleanly
+without it. See [The Swift-native path](#the-swift-native-path-kernels-on-mlxarrays).
 
 ### Building Triton with the Metal backend
 
@@ -65,7 +73,17 @@ export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
 for v in PTXAS CUOBJDUMP NVDISASM CUDACRT CUDART; do export TRITON_${v}_PATH=/nonexistent; done
 export TRITON_CUPTI_INCLUDE_PATH=/nonexistent TRITON_CUPTI_LIB_PATH=/nonexistent
 
-pip install -e .                             # or `python setup.py bdist_wheel` for a wheel
+pip install -e .                             # for a working checkout
+```
+
+For a **wheel** rather than an editable install, stage this repository's runtime
+into the Triton checkout first, so the wheel is the only artifact anyone needs:
+
+```
+cd /abs/path/to/triton-metal
+swift build -c release
+Tools/bundle-wheel.sh /path/to/triton         # the directory with Triton's setup.py
+cd /path/to/triton && python setup.py bdist_wheel
 ```
 
 Python 3.10+ is required (3.11 is what this was built and tested on; macOS's
@@ -86,11 +104,72 @@ Two caveats worth knowing before you start:
   downloads are skipped. This costs build time, nothing else — neither driver is
   active on a Mac, so `triton.runtime.driver.active` resolves to Metal.
 * `python setup.py bdist_wheel` yields
-  `triton-3.7.1+gitf797708c-cp311-cp311-macosx_26_0_arm64.whl` (69.4 MB) with
-  `metal = triton.backends.metal` in its entry points. It is a normal wheel: it
-  can be installed on another Mac with the same Python minor version, but it does
-  **not** contain `libtritonmetal.dylib` — the shim finds that through
-  `TRITON_METAL_CORE_LIB` or a repo-relative `swift build` output.
+  `triton-3.7.1+gitf797708c-cp311-cp311-macosx_26_0_arm64.whl` (69.7 MB) with
+  `metal = triton.backends.metal` in its entry points. It is a normal wheel, and
+  when `Tools/bundle-wheel.sh` ran first it is also **self-contained** — see
+  below.
+
+### One artifact: what the wheel carries
+
+`Tools/bundle-wheel.sh` copies two things into the Triton checkout before the
+wheel is built. Neither is a patch to Triton; no file of Triton's is edited.
+
+| staged | lands in the wheel as | why that works |
+| --- | --- | --- |
+| `.build/release/libtritonmetal.dylib` | `triton/backends/metal/libtritonmetal.dylib` | Triton symlinks the plugin's `backend/` to `python/triton/backends/metal`, and its `MANIFEST.in` grafts `python/triton` with `include_package_data=True`, so anything in that directory ships as package data — the route `name.conf` already took. |
+| `python/triton_metal/` | top-level `triton_metal/` | Triton's `get_packages()` calls `find_packages(where="python")`, so a package placed in the checkout's `python/` is picked up and shipped. |
+
+`_core.py` then finds the runtime inside the installed backend package, located
+by `sysconfig` path rather than by importing `triton` — this module is imported
+*from* `triton.backends.metal.compiler`, so asking the import system for `triton`
+here would re-enter a half-initialised package. The full order is:
+
+1. `$TRITON_METAL_CORE_LIB` — still wins over everything;
+2. `<site-packages>/triton/backends/metal/libtritonmetal.dylib` — the bundled one;
+3. next to the installed `triton_metal` package;
+4. `.build/release/`, then `.build/debug/` — repo-relative dev builds.
+
+An installed wheel therefore prefers its own runtime over whatever a checkout
+happens to have in `.build`, and a developer who wants the other one says so with
+the environment variable.
+
+The stranger test, run on lab-02 (M1 Max): a fresh venv, the wheel and `numpy`,
+no repo checkout on the path, examples copied to a neutral directory.
+
+```
+$ cd ~/stranger
+$ ./venv/bin/python -m pip install ~/tm-build/triton/dist/triton-3.7.1+...arm64.whl numpy
+$ env -u PYTHONPATH ./venv/bin/python -c "..."
+triton       ~/stranger/venv/lib/python3.11/site-packages/triton/__init__.py
+triton_metal ~/stranger/venv/lib/python3.11/site-packages/triton_metal/__init__.py
+backend      GPUTarget(backend='metal', arch='Apple M1 Max', warp_size=32)
+dylib        ~/stranger/venv/lib/python3.11/site-packages/triton/backends/metal/libtritonmetal.dylib
+device       Apple M1 Max
+
+$ env -u PYTHONPATH ./venv/bin/python vector_add.py
+triton 3.7.1 on Apple M1 Max
+vector add, n=98432: max |triton - numpy| = 0
+OK
+$ env -u PYTHONPATH ./venv/bin/python fused_softmax.py
+fused softmax, (1823, 781): max |triton - numpy| = 1.49012e-08
+OK
+$ env -u PYTHONPATH ./venv/bin/python matmul.py
+matmul 256x256x256 block (128, 64, 32): max |triton - numpy| = 0
+... (four block shapes)
+OK
+$ env -u PYTHONPATH ./venv/bin/python attention_training.py
+  dV[1, 64, 2]  triton +0.011898   finite difference +0.011898   relative 2.86e-08
+gradient descent on 0.5 * ||O - T||^2, forward and backward on the GPU
+  step 0: loss 1541.733643   |dQ| 1.4582   |dK| 1.4173   |dV| 8.3391
+  ...
+  step 8: loss 1482.859741
+OK
+```
+
+`python/examples/sae_encode.py` is the one example that is not self-contained:
+it deliberately reads its IR from `tmsae --emit-ir` so that both halves of the
+dispatch comparison lower identical text. Without a Swift build it says so and
+exits rather than guessing.
 
 ---
 
@@ -411,6 +490,250 @@ pattern (`dense<0xFF800000>`) parses; you do not have to rewrite it.
 
 ---
 
+## The Swift-native path: kernels on MLXArrays
+
+Everything above allocates its own `MTLBuffer`s and fills them by hand, which is
+the right shape for a compiler test and the wrong shape for doing work. The
+`TritonMetalMLX` target is the other end: a Triton kernel launched directly on
+[MLX](https://github.com/ml-explore/mlx-swift) tensors, from Swift, with no
+Python involved at any point.
+
+It is a separate target and a separate product from `TritonMetalCore`, and the
+dependency arrow only points one way — linking `tritonmetal` still drags nothing
+in behind it. Two things need `mlx.metallib` (see below): `swift test`'s
+`TritonMetalMLXTests`, and the `tmsae` executable.
+
+```swift
+import MLX
+import TritonMetalMLX
+
+let pipeline = try MetalPipeline.compile(
+    ttir: SAEEncoder.ir(blockM: 64, blockF: 64, blockD: 32))
+
+let x = MLXArray(activations, [rows, model])       // [M, D]
+let wEnc = MLXArray(dictionary, [model, features]) // [D, F]
+let bEnc = MLXArray(bias, [features])              // [F]
+let out = MLX.zeros([rows, features], dtype: .float32)
+
+let results = try pipeline.launch(
+    arrays: [x, wEnc, bEnc, out],
+    scalars: [.init(rows), .init(model), .init(features)],
+    grid: Grid(Grid.covering(rows, block: 64), Grid.covering(features, block: 64)))
+
+let activated = results[3]     // read the returned array, not `out`
+```
+
+`arrays:` fills the kernel's pointer arguments in `tt.func` order and `scalars:`
+its scalar arguments in `tt.func` order; `MetalPipeline` interleaves them back
+into the emitted `[[buffer(N)]]` slots from the kernel's own metadata, so a
+caller never has to count where the pointers sit among the sizes.
+
+Three conveniences on top:
+
+```swift
+// Compile and launch in one call, when the kernel runs once.
+try MetalPipeline.run(ttir: ir, arrays: [...], scalars: [...], grid: Grid(8))
+
+// Bind once, launch many — see §Dispatch overhead for why this matters.
+let bound = try pipeline.prepare(arrays: [x, wEnc, bEnc, out], scalars: [...])
+for _ in batches { _ = try pipeline.launch(bound, grid: grid) }
+
+// A whole op, with its own shape checking.
+let encoder = try SAEEncoder.compile()
+let h = try encoder(x, wEnc, bEnc)          // relu(x @ W_enc + b_enc)
+```
+
+### Read the returned arrays, not the ones you passed
+
+`launch` returns one array per pointer argument. For a contiguous array the
+returned element **is** the array you passed, mutated in place by the kernel; for
+a strided one it is a new array holding what the kernel left in a staging buffer,
+and the array you passed is untouched. One rule covers both cases and never
+silently loses a result.
+
+### What is checked, and what cannot be
+
+Checked against the kernel's `EmittedKernel` metadata: the number of arrays and
+scalars, each array's dtype against the pointee type the kernel declared, each
+array's non-emptiness, and each scalar's width against its parameter's type. The
+errors name both sides:
+
+```
+argument 0 of 'scaled_add' is !tt.ptr<f32>, but the array passed for it is
+int32 (i32). Pass a float32 array, or change the kernel.
+```
+
+**Per-argument extents are not checked**, and cannot be. Triton lowers a tensor's
+shape into pointer arithmetic over scalar size and stride parameters, so by the
+time a kernel reaches this backend its arguments are bare `!tt.ptr<T>` with no
+rank and no extent. What the metadata carries is the *block* shape
+(`metadata.blockShape`) — the tile one program walks, not the size of anything it
+is pointed at. Whether your `[M, D]` is the `[D, M]` the kernel wanted is between
+you and the kernel. A wrapper that knows its own op can do better, which is what
+`SAEEncoder.Compiled.callAsFunction` does:
+
+```
+x is [8, 64] and W_enc is [32, 128]; their contraction dimensions differ
+W_enc has 128 features but b_enc has 64
+```
+
+### Zero copy, measured
+
+Nothing is copied for a contiguous array, at any size. An `MLXArray`'s storage
+comes out of MLX's own Metal allocator, so `MTLDevice.makeBuffer(bytesNoCopy:)`
+over it returns a buffer whose `contents()` is the array's own address, and a
+kernel dispatched against that buffer reads and writes the array in place.
+mlx-swift exposes this as `MLXArray.asMTLBuffer(device:noCopy:)`, which is what
+the binding calls.
+
+Verified by writing rather than by comparing pointers — `tmsae` runs a fill
+kernel through the bound buffer and reads the result back through MLX:
+
+```
+--- buffer binding: does a kernel's store land in the array? ---
+contiguous [64, 512] (131072 B): aliased = true, kernel's stores visible through MLX = true
+contiguous [512] (2048 B): aliased = true, kernel's stores visible through MLX = true
+contiguous [1, 3] (12 B): aliased = true, kernel's stores visible through MLX = true
+strided view [64]: contiguous = false -> the binding stages a copy
+```
+
+Two expectations that do not hold here, both worth stating because either would
+otherwise look like something to work around:
+
+* **Page alignment is not required — over MLX's storage.** Metal's documentation
+  for `bytesNoCopy` asks for a page-aligned pointer, and MLX only guarantees that
+  above one page. Measured on an M1 Pro (macOS 26.5, 16 KB pages), MLX
+  page-aligns every allocation of ≥ 16384 B and packs smaller ones into a shared
+  page — 32 fresh 2048-byte arrays land page-aligned 4 times, 32 fresh 8192-byte
+  ones 16 times. Metal takes the unaligned pointers anyway, returns the same
+  address, and dispatches against them correctly, so there is no size floor here
+  and no alias/copy lottery — and an array packed into the same page as another
+  is not disturbed. This is a statement about memory MLX's allocator handed out,
+  which came from Metal in the first place; it is **not** a general claim about
+  `bytesNoCopy` over arbitrary host memory, which is why a `numpy` or CPU-torch
+  buffer still has to be copied (§The Python shim).
+* **The 14-byte `Data` trap does not apply.** mccl's MLX adapter found that
+  `Data(bytesNoCopy:count:deallocator:)` is *not* no-copy for payloads of 14
+  bytes or fewer — Foundation stores those inline, so a write through the wrapper
+  lands in a temporary and is lost. This binding never goes through `Data`;
+  `asMTLBuffer` reaches the backing directly. The trap does still catch
+  *verification* code: comparing `buffer.contents()` against
+  `asData(access: .noCopy)`'s base address reports a false mismatch at 12 bytes,
+  which is why the check above writes instead.
+
+The one case that copies is a **strided or broadcast** array — a column of a
+matrix, a transposed view. There is no contiguous run of bytes to hand a kernel,
+so `asMTLBuffer` materialises one; `MLXBinding.mode` reports `.copied` and the
+launch's returned array is the new one.
+
+### Dispatch overhead
+
+The claim worth testing is "no Python in the hot path", and it needs two numbers,
+because the two paths differ in two unrelated places.
+
+`tmsae` and `python/examples/sae_encode.py` run the **same kernel from the same
+IR text** — `tmsae --emit-ir` prints it and the Python script reads that, so
+neither side can drift — and report the same pair. Release builds, 500
+iterations, three runs each, at `[64, 64] @ [64, 64]`, small enough that the host
+side is what is being measured:
+
+| µs/launch | Swift (`MetalPipeline`) | Python (`triton_metal._core`) | Swift saves |
+| --- | --- | --- | --- |
+| **lab-02**, M1 Max, Python 3.11 | | | |
+| dispatch, arguments already bound | **231–233** | **282–286** | ~50 µs (18%) |
+| per call, from the caller's own tensors | 265–267 | 284–296 | ~20–30 µs |
+| **laptop**, M1 Pro, Python 3.10 | | | |
+| dispatch, arguments already bound | **360–367** | **371–378** | ~10 µs (3%) |
+| per call, from the caller's own tensors | 421–454 | 396–413 | — |
+
+Read the dispatch rows first. That is the **same work in both languages** —
+`tm_launch` *is* `MetalRuntime.launch` — so the difference is the ctypes crossing
+and the interpreter loop, and nothing else. It is real and it is consistent in
+sign, but it is 3–18%, not an order of magnitude, because both are dominated by a
+synchronous Metal command-buffer round trip (`commit` + `waitUntilCompleted`)
+that costs ~230 µs on the Mac Studio and ~360 µs on the laptop and that neither
+path can avoid. If a Swift-native frontend is worth having, at these sizes it is
+not mainly for latency.
+
+The per-call rows are the honest picture of the two things that stand between a
+caller's tensors and a kernel, and they are different things on each side.
+
+On the Python side it is a **copy that cannot be avoided**: a `numpy` array is
+host memory, macOS torch wheels are CPU-only (which is why the shim has
+`MetalBuffer` at all), so the inputs go in with `tm_buffer_write` and the output
+comes back with `tm_buffer_read` — 141–216 µs at `[64, 512] @ [512, 2048]`. The
+Swift path never makes that copy.
+
+On the Swift side it is **buffer churn**, and it is avoidable. The binding call
+is not the problem: `asMTLBuffer` costs about 3 µs and is flat in the size of the
+array (4 KB through 16 MB, measured). The cost is handing a command buffer a
+resource it has not seen before rather than one it has — same kernel, same grid,
+same arrays, fresh `MTLBuffer` objects versus reused ones, on lab-02:
+
+```
+--- same dispatch, fresh buffers vs reused ---
+4 x 16 KB          reused  261.5 us, fresh  301.4 us (+39.9 us for 4 buffers)
+3 x 4 MB + 16 KB   reused  271.5 us, fresh  466.9 us (+195.4 us for 4 buffers)
+```
+
+That is exactly what `prepare` removes, and it is why the dispatch row is the one
+to quote for a loop over fixed weights — an SAE's dictionary and bias never
+change between batches. It also explains the laptop's per-call row: it is noisier
+and the fresh-buffer penalty there is larger than the ~10 µs the language saves.
+
+### The demo kernel: a fused SAE encoder
+
+`SAEEncoder` is `relu(x @ W_enc + b_enc)` in one Triton kernel — a blocked GEMM
+over `D` with the bias add and the ReLU folded into the epilogue, on an
+accumulator that is still in registers. It is the op mechanistic-interpretability
+code spends most of its time in: a sparse autoencoder over a model's residual
+stream runs it on every token of every batch, with `F` typically 8–64× `D`.
+
+Checked against MLX's own `maximum(matmul(x, w) + b, 0)`:
+
+```
+--- relu(x @ W_enc + b_enc): Triton kernel vs MLX ops ---
+block 64x64x32, 128 threads/threadgroup
+[8, 64] @ [64, 128]: max |kernel - mlx| = 0.0, relative 0.0
+[64, 512] @ [512, 2048]: max |kernel - mlx| = 0.0, relative 0.0
+[100, 300] @ [300, 700]: max |kernel - mlx| = 1.1920929e-06, relative 6.7423474e-07
+[1, 512] @ [512, 512]: max |kernel - mlx| = 1.4305115e-06, relative 8.2831684e-07
+worst relative error: 8.2831684e-07
+```
+
+The nonzero cases are ragged in all three dimensions, so the masks fire; the
+residual is f32 accumulation order, which MLX and a blocked kernel are not
+obliged to agree on to the last bit.
+
+### Running it
+
+`mlx-swift` compiles the MLX C++ core but does **not** build `mlx.metallib` —
+that is Xcode's build system's job, and `swift build` never runs it. A binary
+without it links, starts, and then *aborts the process* the first time it touches
+the GPU. Fetch the version-matched library out of the `mlx-metal` pip wheel:
+
+```
+Tools/fetch-metallib.sh                  # into .build/{debug,release} and the test bundle
+swift build -c release --product tmsae
+.build/release/tmsae                     # correctness, binding, dispatch numbers
+.build/release/tmsae --emit-ir           # the kernel's IR, for the Python comparison
+
+.build/release/tmsae --emit-ir > /tmp/sae.ttir
+cd python && PYTHONPATH=. python3 examples/sae_encode.py --ir /tmp/sae.ttir --iterations 500
+```
+
+`tmsae` is an executable rather than an XCTest case for the same reason `tmbench`
+is: XCTest ships with Xcode, and the lab machine the numbers are cross-checked on
+has only the command-line tools.
+
+`swift test` covers the same ground — 37 cases in `TritonMetalMLXTests`, a
+separate bundle so the core's suite keeps running on a machine with no
+`mlx.metallib` and acquires no MLX dependency by association. Without the shader
+library those 37 skip cleanly, naming the script that fixes it; CI runs them that
+way, because a virtualised runner fails the device probe regardless.
+
+---
+
 ## The C ABI
 
 Everything above is reachable from any language that can call C. The exports
@@ -599,12 +922,14 @@ scribbling on the host.
 
 ```
 swift build                                             # produces the dylib
-cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 14 passed
+cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 16 passed, 1 skipped
 ```
 
-`_core.py` finds the dylib in this order: `$TRITON_METAL_CORE_LIB`,
-`.build/release/`, `.build/debug/`, then next to the installed package. Set the
-environment variable when embedding a wheel-installed build elsewhere.
+`_core.py` finds the dylib in this order: `$TRITON_METAL_CORE_LIB`, the installed
+`triton/backends/metal/` (where a wheel built by `Tools/bundle-wheel.sh` puts
+it), next to the installed `triton_metal` package, then `.build/release/` and
+`.build/debug/`. Set the environment variable to override all of them; the error
+when nothing is found lists every path it tried.
 
 ### Using `_core` directly
 

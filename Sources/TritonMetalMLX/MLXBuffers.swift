@@ -28,14 +28,20 @@ import TritonMetalCore
 // Two expectations from the CUDA world do not apply and are worth stating, since
 // both would otherwise look like something to work around:
 //
-// **Page alignment is not required.** Metal's documentation for `bytesNoCopy`
-// asks for a page-aligned pointer, and MLX's allocator only guarantees that for
-// allocations of at least one page. Measured on an M1 Pro (macOS 26.5, 16 KB
-// pages), MLX page-aligns every allocation of ≥ 16384 B and packs smaller ones
-// into a shared page — 32 fresh 2048-byte arrays land page-aligned 4 times, 32
-// fresh 8192-byte ones 16 times. `makeBuffer(bytesNoCopy:)` nevertheless accepts
-// the unaligned pointers, returns the same address, and dispatches against them
-// correctly, so there is no size floor here and no alias/copy lottery.
+// **Page alignment is not required, over this memory.** Metal's documentation for
+// `bytesNoCopy` asks for a page-aligned pointer, and MLX's allocator only
+// guarantees that for allocations of at least one page. Measured on an M1 Pro
+// (macOS 26.5, 16 KB pages), MLX page-aligns every allocation of ≥ 16384 B and
+// packs smaller ones into a shared page — 32 fresh 2048-byte arrays land
+// page-aligned 4 times, 32 fresh 8192-byte ones 16 times.
+// `makeBuffer(bytesNoCopy:)` nevertheless accepts the unaligned pointers, returns
+// the same address, and dispatches against them correctly, so there is no size
+// floor here and no alias/copy lottery.
+//
+// That is a finding about memory MLX's allocator handed out, which Metal
+// allocated in the first place — not a general claim about `bytesNoCopy` over
+// arbitrary host memory. The Python shim's `MetalBuffer` still copies a `numpy`
+// or CPU-torch allocation in, and it still has to.
 //
 // **There is no staging copy in either direction.** A CUDA equivalent of this
 // file would `cudaMemcpy` every input to the device and every output back. The
