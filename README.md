@@ -5,8 +5,15 @@ with a **Swift core** and a deliberately thin Python shim.
 
 Triton is how the ecosystem writes custom fused kernels (FlashAttention variants, MoE
 routing, quantization kernels) without hand-rolling CUDA — and Triton targets only
-CUDA/ROCm today. That is CUDA's single biggest portable-code moat. A working Metal
-backend lets that entire body of research code run on Apple Silicon without rewriting.
+CUDA/ROCm, which is CUDA's single biggest portable-code moat. This backend runs that
+same research code unmodified on hardware a team already owns: real `@triton.jit`
+through the pinned Triton 3.7.1, exact results, no patch to Triton — with the matmul
+tutorial at **76% of Apple's own `MPSMatrixMultiplication`** and FlashAttention-2
+forward beating the MPS composite it replaces at `s1024` and below. It is inference-only
+today (no atomics, no backward pass);
+[docs/WHITEPAPER.md §2](docs/WHITEPAPER.md#2-value-proposition-breaking-the-portable-kernel-moat)
+has the full case and its boundaries, including which CUDA optimisation techniques
+transfer to M1-generation Apple silicon and which invert.
 
 ## Documentation
 
@@ -14,7 +21,7 @@ backend lets that entire body of research code run on Apple Silicon without rewr
 | --- | --- |
 | [docs/USAGE.md](docs/USAGE.md) | **Start here.** Runnable Swift, C-ABI and Python examples (every one executed before it was written down), the supported IR subset, exact error behaviour, and concrete starting points for the work that is still missing. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The lowering pipeline, the execution and layout model, the full IR subset and C ABI reference, matmul throughput, and the hard parts ranked. |
-| [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | Motivation, related work, design and implementation rationale, and an evaluation with real coverage and benchmark numbers — including the performance target this milestone missed. |
+| [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | Motivation, the competitive case against CUDA and where CUDA remains ahead (§2), related work, design and implementation rationale, and an evaluation with real coverage and benchmark numbers. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | Measured efficiency vs. published Triton-on-CUDA numbers; the transfer matrix (which CUDA GEMM techniques port to M1-generation Apple silicon and which invert); and fused attention vs. the unfused MPS composite. |
 
 ## Structure & language policy

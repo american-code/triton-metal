@@ -13,8 +13,13 @@ durable pieces of CUDA's portable-code moat, and it means a large and growing
 body of research code simply does not run on Apple silicon.
 
 This paper describes triton-metal, a compiler backend that lowers Triton IR to
-Metal. It reports what works, what does not, and by how much it misses its own
-performance target. The backend takes Triton IR text through a recursive-descent
+Metal. Its thesis is competitive, not merely compatible: the same research kernel
+runs unmodified on hardware a team already owns, at a fraction of Apple's vendor
+library comparable to the fraction Triton reaches against NVIDIA's on its native
+target, and the port yields something the CUDA literature does not contain — a
+measured account of which GPU optimisation techniques transfer to Apple silicon
+and which invert. §2 makes that case and states where CUDA remains ahead. The
+backend takes Triton IR text through a recursive-descent
 parser, a layout-inference pass, and an emitter that produces textual Metal
 Shading Language, then compiles and launches it through Metal at runtime.
 Triton's fused-softmax and matmul tutorial kernels both run on the GPU and match
@@ -49,7 +54,7 @@ FlashAttention's two `tt.dot`s share their axes crosswise and no fixed
 
 The backend is now **pinned to Triton v3.7.1 and driven by it**: real
 `@triton.jit` source, Triton's own frontend and MLIR passes, this backend, a Mac
-GPU (§7.1). Real IR cost the parser one line and the emitter two small
+GPU (§8.1). Real IR cost the parser one line and the emitter two small
 generalisations, which is the most useful thing that section reports — the gap
 between IR written from documentation and IR a release actually prints is small
 but not empty. The backward pass and `tt.atomic_*` remain open.
@@ -84,7 +89,90 @@ works.
 
 ---
 
-## 2. Related work
+## 2. Value proposition: breaking the portable-kernel moat
+
+CUDA's most durable software advantage is not the CUDA language: it is that the
+ecosystem's custom kernels are written in Triton, and Triton emits code for CUDA
+and ROCm and nothing else, which makes that work portable in principle and
+NVIDIA-only in practice. This section states what this backend changes about that;
+its last paragraph, and §8, state what it does not.
+
+**The same source, not a lookalike.** The backend is pinned to Triton **v3.7.1**
+and driven by it: real `@triton.jit` Python, Triton's own frontend and MLIR
+passes, this backend, a Mac GPU. The vector-add, fused-softmax and matmul
+tutorials run as published source and agree with numpy — max absolute error 0,
+0 and 1.49e-08 respectively — and **no patch to Triton is required** (§8.1). The
+backend attaches through the documented out-of-tree plugin interface; the ten
+lines of C++ that Triton's `main.cc` demands of any plugin are the project's entire
+non-Swift surface. That is what separates this from a framework port: an MLX or
+hand-written Metal version of a kernel forks it, while this *executes* it, so the
+upstream file stays the only copy (§3).
+
+**Performance that is credible on arrival.** A portability story running at a
+fraction of vendor speed does not get used. The lowered matmul tutorial reaches
+**76% of `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max
+(4.66 TFLOP/s f32 at 2048), up from ~33% at the first working version (§7.2). For
+calibration, published Triton reaches 62–82% of a CUDA-kernel stack end-to-end on
+its native target, and ~80–100% of cuBLAS on GEMM specifically, after years of
+NVIDIA-specific pipeline work (COMPARISON.md): two optimisation rounds put a new
+backend inside the lower band and not yet in the upper one. Fused attention
+decides whether a Triton backend is useful beyond elementwise work.
+FlashAttention-2 forward runs, and against the composite it replaces
+(`Q K^T` + `MPSMatrixSoftMax` + `P V`) it measures **357%** at `b1 h8 s512 d64`,
+**107%** at `s1024` and 68% at `s2048` on an M1 Max — a mapped crossover near
+`s1024` that f16 moves outward, rather than a single headline ratio (§7.2b).
+
+**Hardware the team already owns.** The practical form of the argument is that a
+lab with Macs gets the Triton ecosystem without a purchase decision: the kernel
+file is read, edited and run on the laptop it was found on, and NVIDIA time is
+rented for the runs that need it rather than for the ability to run at all. Apple
+silicon is a good host for this rather than a merely available one, for the
+architectural reasons §1 gives.
+
+**A measured result the CUDA world does not have.** Porting the optimisation
+playbook produced a transfer matrix useful independently of this compiler.
+Register-resident accumulators, staging locality, literal trip counts and
+vectorized loads transfer. Two things **invert**: double buffering is a wash — and
+a 26% loss once vector staging lands — because Metal has no `cp.async`, so the
+prefetch competes for the same issue slots while larger tiles cost the occupancy
+this GPU uses to hide latency; and register blocking past 1x1 inverts and then
+widens, with 1x1 beating 2x2 at `64x128` by 28% and, after the second round, 45%,
+at identical accumulator-fragment counts. The single largest win has **no CUDA
+analogue at all** — a shared-column wave mapping worth 15%, available only because
+Metal moves whole 8x8 fragments through threadgroup memory instead of distributing
+them over named lanes, so which fragment a simdgroup wants is an emitter decision
+rather than a layout's (§7.2, COMPARISON.md).
+This is transferable guidance for anyone moving GPU work to Apple silicon, and it
+is explicitly **M1-generation-scoped**: measured on an M1 Max and an M1 Pro, with
+the M3/M4 memory-hierarchy rework unmeasured.
+
+**Swift core, C ABI, no Python in the hot path.** All compiler logic is Swift
+behind `tm_*` C symbols; the 282-line Python package is a ctypes shim that computes
+nothing, present only because Triton's backend discovery imports a Python module
+(§4.2). Launch geometry — block shape, threadgroup size, argument kinds — is
+computed in the core and read out as JSON, so nothing about the lowered kernel is
+reimplemented on the Python side. The backend is therefore callable from Swift,
+from C, or from any language with an FFI, and the Python dependency is confined to
+the frontend.
+
+**Where CUDA remains ahead, plainly.** This is an **inference-only** backend
+today: `tt.atomic_*` is unimplemented and the FlashAttention-2 backward pass needs
+it, so training stays on CUDA. There is no `bf16`, no `f64`, and no block
+pointers. Because Triton publishes no macOS wheel, adoption costs a **from-source
+Triton build** — ~9 minutes, once, no CUDA toolchain and no Xcode, but it is not
+`pip install triton`. A kernel whose block sizes are not pairwise distinct is
+**refused**, because the emitter identifies a block axis by its extent, so the
+matmul tutorial runs at `(128, 64, 32)` and is rejected at `(64, 64, 32)`. Every
+performance number and every inversion above is **single-generation**, M1 Max and
+M1 Pro. And Triton-on-CUDA is simply more mature: a ttgir layout system, a
+conformance suite this project has not yet ported a subset of, per-architecture
+pipelining, and a vendor library that this backend still trails by roughly a third
+on GEMM. The claim here is that the portable-kernel moat is crossable and has been
+crossed for the forward pass, not that the crossing is finished.
+
+---
+
+## 3. Related work
 
 **Triton's own backends.** The CUDA backend lowers ttir → ttgir → LLVM IR →
 PTX, with TritonGPU layout encodings (blocked, sliced, mma) that pin down which
@@ -106,7 +194,7 @@ triton-metal is a compiler target.
 
 **MPS / MPSGraph.** Apple's vendor libraries — hand-tuned kernels for the
 operations Apple chose to tune. `MPSMatrixMultiplication` is the right yardstick
-for a GEMM and is used as such in §6, but a vendor library is the opposite of a
+for a GEMM and is used as such in §7, but a vendor library is the opposite of a
 custom-kernel story: it is fast at exactly the operations someone already
 implemented, which is why fused custom kernels exist at all.
 
@@ -114,13 +202,13 @@ implemented, which is why fused custom kernels exist at all.
 out-of-tree backends for other accelerators and for CPU. Their common lesson,
 taken seriously here, is that the interface churns between releases and that
 pinning is not optional; this backend is pinned to v3.7.1 and vendors that tag's
-signatures (§7.1).
+signatures (§8.1).
 
 ---
 
-## 3. Design
+## 4. Design
 
-### 3.1 Emit textual MSL, not AIR
+### 4.1 Emit textual MSL, not AIR
 
 The obvious "serious compiler" choice is to emit AIR (Metal's LLVM bitcode
 dialect) and skip a parse. We emit Metal Shading Language *source text* instead,
@@ -139,7 +227,7 @@ any of the analysis above it. A second path — `xcrun metal` producing `.metall
 bytes offline — exists for callers that want a cacheable artifact. `xcodebuild`
 is never used.
 
-### 3.2 Language policy: Swift core, C ABI, no-logic shim
+### 4.2 Language policy: Swift core, C ABI, no-logic shim
 
 Everything that does work is Swift in `Sources/TritonMetalCore`, exported as
 `tm_*` symbols in `libtritonmetal.dylib`. The Python package
@@ -172,7 +260,7 @@ The Python package exists for one reason: Triton's backend discovery imports a
 Python module, and rebuilding Triton's frontend is a multi-month project that
 would defeat the purpose of a *Triton* backend.
 
-### 3.3 One scalar per lane, and the layout redesign
+### 4.3 One scalar per lane, and the layout redesign
 
 The execution model is: **one Metal threadgroup per Triton program**, and every
 tensor in a kernel is a slice of one **block** — an index space of rank R with a
@@ -232,9 +320,9 @@ that spans the contraction axis *and* is materialised is refused by name.
 
 ---
 
-## 4. Implementation
+## 5. Implementation
 
-### 4.1 Parsing two MLIR spellings
+### 5.1 Parsing two MLIR spellings
 
 Triton prints its IR in MLIR's *pretty* op syntax
 (`%4 = arith.addi %3, %2 : tensor<1024xi32>`), except for ops carrying regions,
@@ -258,7 +346,7 @@ attributes, ttgir layout encodings (parsed, then ignored), and MLIR's raw
 bit-pattern spelling of non-finite floats — `dense<0xFF800000>` is how `-inf`
 arrives, and softmax does not work if you cannot read it.
 
-### 4.2 The safe-math discovery
+### 5.2 The safe-math discovery
 
 **Metal defaults fast math ON.** This is the single most consequential fact we
 found, and it is easy to miss because everything still *runs*.
@@ -281,7 +369,7 @@ The payoff shows up in the numbers: the fused softmax's worst absolute error
 against a CPU reference over 12 rows of 100 columns is **7.45e-08**, about one
 float ULP at those magnitudes.
 
-### 4.3 Cross-lane ops, uniform-region hoisting, recomputation
+### 5.3 Cross-lane ops, uniform-region hoisting, recomputation
 
 A `tt.reduce` lowers to `simd_shuffle_down` within each 32-wide simdgroup plus
 threadgroup memory across simdgroups. Because a reduction needs every thread to
@@ -317,9 +405,9 @@ Hoisting costs the loop its ability to carry per-lane tensors. Exactly three
   so the dot can rebuild it from scratch inside its staging loops.
 
 Anything else — a per-lane tensor — is refused by name. That refusal is the
-FlashAttention-2 blocker (§7).
+FlashAttention-2 blocker (§8).
 
-### 4.4 `tt.dot` lowering, and the staging discovery
+### 5.4 `tt.dot` lowering, and the staging discovery
 
 Per dot: stage A into a threadgroup tile over `(M, K)`, stage B over `(K, N)`,
 barrier, then hand out 8x8 output fragments one per simdgroup:
@@ -353,7 +441,7 @@ the code that looks like it does the arithmetic.
 
 ---
 
-## 5. Test strategy
+## 6. Test strategy
 
 144 Swift cases across ten suites (one, the benchmark, is opt-in and skipped by
 default), plus 21 Python cases. Everything that can run on the real GPU does.
@@ -377,7 +465,7 @@ buffer alignment and dtypes) and run vector-add and softmax round trips over the
 C ABI — moving bytes and comparing numbers, while every compile, allocation and
 launch happens inside the dylib. Six more drive **real** `@triton.jit` kernels
 through the pinned Triton and skip, with an actionable message, on any machine
-that has not built it (§7.1) — so the suite states the dependency without
+that has not built it (§8.1) — so the suite states the dependency without
 acquiring it.
 
 Two strategy choices are worth stating. Sizes divide *nothing*: `129x257x65`
@@ -389,9 +477,9 @@ right message.
 
 ---
 
-## 6. Evaluation
+## 7. Evaluation
 
-### 6.1 Coverage
+### 7.1 Coverage
 
 Regenerated with `swift test --enable-code-coverage`, then
 `xcrun llvm-cov report … -ignore-filename-regex "Tests|\.build"`:
@@ -424,7 +512,7 @@ dictionary of strings and integers. The genuinely reachable-but-untested code is
 in the parser, the layout pass and the emitter — mostly diagnostic paths for
 malformed IR that a well-behaved Triton frontend would never produce.
 
-### 6.2 Matmul throughput
+### 7.2 Matmul throughput
 
 The matmul tutorial kernel, lowered by this backend, against
 `MPSMatrixMultiplication`, f32, square, best configuration per size out of the
@@ -531,7 +619,7 @@ how cheaply the guard can be computed, were.
 
 This is the part of the result we think is worth publishing.
 
-**Scope.** Both results, and the attention crossover in §6.2 below, are
+**Scope.** Both results, and the attention crossover in §7.2b below, are
 **M1-generation** measurements — an M1 Max and an M1 Pro. We give architectural
 reasons for them (Metal has no `cp.async`; an Apple GPU hides latency with
 occupancy; simdgroup-matrix fragments move through threadgroup memory rather than
@@ -573,7 +661,7 @@ named operand traffic as the top fix — ranks the fixes in the wrong order when
 costs are not independent, and says nothing at all about the techniques whose cost
 is occupancy rather than instructions.
 
-### 6.2b Attention throughput
+### 7.2b Attention throughput
 
 FlashAttention-2 forward against the unfused composite it replaces — `Q K^T` and
 `P V` as two `MPSMatrixMultiplication`s with an `MPSMatrixSoftMax` between them,
@@ -582,7 +670,7 @@ comparison for a fused kernel: the composite runs the same arithmetic through
 Apple's own GEMM, which is faster than ours, but it writes the score matrix to
 device memory and reads it back twice.
 
-Same methodology as §6.2 — dispatches packed to ~25ms per sample, median of three.
+Same methodology as §7.2 — dispatches packed to ~25ms per sample, median of three.
 FLOPs counted as `4 * S^2 * D` per head; the softmax is uncounted on both sides.
 
 | shape | M1 Max fused | composite | ratio | M1 Pro fused | composite | ratio |
@@ -610,11 +698,11 @@ and the `s512` margin against *it* would be nearer 1.2x than 1.7x.
 **What one change was worth.** Reducing across a row's lane group rather than
 across the whole threadgroup took the best M1 Pro configuration at
 `b1 h8 s512 d64` from **174 GF to 674 GF** — 3.9x — with nothing else altered.
-This is the same category of result as §6.2's two inversions: the cost that
+This is the same category of result as §7.2's two inversions: the cost that
 dominated was not arithmetic and not memory traffic but *serialization*, and no
 instruction-slot account would have found it.
 
-### 6.3 Where the gap is now
+### 7.3 Where the gap is now
 
 The pre-optimisation account was counted in instruction slots: for the then-best
 64x64x32 / 16-simdgroup shape, one K block cost each simdgroup 16
@@ -626,7 +714,7 @@ operand traffic first and staging third.
 **It ranked them wrong**, and how it did is the most transferable thing in this
 section. The three costs were not independent: staging was hiding behind the
 operand loads, and once staging got cheaper the operand-load fix that had been
-worth 10% became worth under 1% (§6.2). An issue-slot count tells you what the
+worth 10% became worth under 1% (§7.2). An issue-slot count tells you what the
 slots are spent on; it does not tell you which spend is on the critical path.
 
 Two of the three candidates that account produced are now done, and the ordering it
@@ -659,9 +747,9 @@ None of the three is a layout redesign, and two of them are local to `emitDot`.
 
 ---
 
-## 7. Limitations and future work
+## 8. Limitations and future work
 
-### 7.1 The Triton pin, and what real IR cost
+### 8.1 The Triton pin, and what real IR cost
 
 Until this milestone the backend consumed Triton IR *text* and was tested against
 fixtures written from Triton's documentation. It is now pinned to **v3.7.1** — the
@@ -697,14 +785,14 @@ rewrites into shapes the pointer-advance check had not anticipated: a dense spla
 constant, and a scalar product recomputed inside the loop from loop-invariant
 operands. Neither is exotic; both were invisible without a real release.
 
-What the tutorials also did was confirm a limitation §3.3 predicted from the other
+What the tutorials also did was confirm a limitation §4.3 predicted from the other
 direction: because a block axis is identified by its *extent*, `BLOCK_M == BLOCK_N`
 makes a row index and a column index indistinguishable, and the matmul tutorial is
 refused at those sizes rather than mis-compiled. `(128, 64, 32)` runs; `(64, 64, 32)`
 does not. Carrying axis identity independently of extent is now the highest-value
 correctness item in the layout model.
 
-### 7.2 FlashAttention-2, and what it took
+### 8.2 FlashAttention-2, and what it took
 
 **FlashAttention-2 forward now runs**, and what it took is the most transferable
 result in this paper, because what it took was not what we had written down.
@@ -783,14 +871,10 @@ an mma layout must pin down. This is also why `tt.dot` stages through threadgrou
 memory rather than shuffling fragments between lanes: the emitter does not know
 where a fragment's elements live.
 
-**Not pinned to a Triton release.** The plugin surface is written against the
-approximate 3.x layout — `triton.backends` discovery, a stage-dict compiler, a
-driver with `load_binary`/`launch` — rather than signatures read off a tag. Until
-a release is pinned, its signatures verified, and a CI check added, the three
-shim modules are an interface sketch that tests green against the Swift core, not
-a plugin that drops into a PyTorch install. This is the project's most important
-open task, because it gates everything else being *usable* rather than merely
-correct.
+**No CI against the pin.** The plugin surface is now read off v3.7.1's signatures
+rather than the approximate 3.x layout (§8.1), but nothing yet re-verifies it when
+Triton moves. A check that rebuilds against the pinned tag is what would keep the
+adapter from silently drifting out of date.
 
 **Type coverage.** No `f64`, no `bf16` — the latter matters for ML and is the
 more urgent. Block pointers (`!tt.ptr<tensor<…>>`) are not lowered. `tt.atomic_*`
@@ -826,7 +910,7 @@ Triton's own `test_core.py` against numpy references is what would turn
 
 ---
 
-## 8. Conclusion
+## 9. Conclusion
 
 triton-metal is a working spine with real kernels on it. Triton IR text goes in;
 readable MSL, a Metal library, a compute pipeline, unified-memory buffers, a
@@ -851,6 +935,9 @@ a GEMM, inside the band published Triton reaches against cuBLAS on its own targe
 with the remaining third traced to latency and issue slots — not to bandwidth, not
 to arithmetic, and not to any of the three things the previous round predicted in
 the order it predicted them.
-What stands between this and being *used*, though, is not a research problem — it
-is pinning a Triton release, and then the two named blockers on the way to
-FlashAttention-2 forward.
+
+What stands between this and being *used* is no longer a research problem. The
+release is pinned and driven, the forward pass of the kernel that mattered runs,
+and the remaining distance is `tt.atomic_*` and the backward pass it gates, `bf16`,
+a conformance subset, and measurements on silicon newer than M1 — a list of known
+work rather than of open questions.
