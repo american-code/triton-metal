@@ -15,6 +15,7 @@ backend lets that entire body of research code run on Apple Silicon without rewr
 | [docs/USAGE.md](docs/USAGE.md) | **Start here.** Runnable Swift, C-ABI and Python examples (every one executed before it was written down), the supported IR subset, exact error behaviour, and concrete starting points for the work that is still missing. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The lowering pipeline, the execution and layout model, the full IR subset and C ABI reference, matmul throughput, and the hard parts ranked. |
 | [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | Motivation, related work, design and implementation rationale, and an evaluation with real coverage and benchmark numbers — including the performance target this milestone missed. |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | Measured efficiency vs. published Triton-on-CUDA numbers, and the transfer matrix: which CUDA GEMM techniques port to Apple silicon and which invert. |
 
 ## Structure & language policy
 
