@@ -254,8 +254,23 @@ private struct AccumulatorRegisters {
     var matrix: String
     var prefix: String
 
+    /// True when every wave's fragment block sits in the *same* column of the
+    /// block grid, so the B fragment a step loads is wave-independent and can be
+    /// loaded once instead of once per wave (see `loadAccumulator`).
+    var sharedColumns: Bool = false
+
     func rowBlock(_ wave: Int) -> String { "\(prefix)_bm\(wave)" }
-    func columnBlock(_ wave: Int) -> String { "\(prefix)_bn\(wave)" }
+    func columnBlock(_ wave: Int) -> String {
+        sharedColumns ? "\(prefix)_bn" : "\(prefix)_bn\(wave)"
+    }
+
+    /// A zero-filled fragment, for an accumulator seeded with `dense<0.0>` — it
+    /// never has to exist in threadgroup memory at all.
+    var zeroFragment: String {
+        matrix == "simdgroup_half8x8"
+            ? "make_filled_simdgroup_matrix<half, 8, 8>(0.0h)"
+            : "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
+    }
     func live(_ wave: Int) -> String { "\(prefix)_live\(wave)" }
     func register(_ wave: Int, _ row: Int, _ column: Int) -> String {
         "\(prefix)_\(wave)_\(row)_\(column)"
@@ -379,6 +394,22 @@ private struct FunctionEmitter {
         frames.last { $0.kind == .region || $0.kind == .uniformRegion }?.level ?? 0
     }
 
+    /// True when `ssa` is an all-zero splat constant — the seed every Triton
+    /// matmul gives its accumulator (`arith.constant dense<0.000000e+00>`).
+    ///
+    /// Worth detecting on its own because a zero accumulator has no prologue: the
+    /// fragments can be filled in registers rather than staged through a tile and
+    /// read back out of it (see `loadAccumulator`).
+    private func isZeroSplat(_ ssa: String) -> Bool {
+        guard let instruction = definitions[ssa],
+            case .constant(_, let type, let value) = instruction.kind, type.isTensor
+        else { return false }
+        switch value {
+        case .integer(let v): return v == 0
+        case .float(let v): return v == 0
+        }
+    }
+
     /// True when the value is only ever read by a `tt.dot`, so it is rebuilt
     /// inside that dot's staging loops instead of being emitted here.
     private func isDeferred(_ ssa: String) -> Bool {
@@ -476,6 +507,46 @@ private struct FunctionEmitter {
         return min(1024, max(32, (wanted + 31) / 32 * 32))
     }
 
+    /// True when the per-lane block loops spread the threadgroup over the two
+    /// innermost block dimensions rather than over the innermost one alone.
+    ///
+    /// The innermost-only rule is an occupancy bug for a `tt.dot` kernel's
+    /// epilogue: the threadgroup is sized for simdgroup-matrix work (512 threads
+    /// at `num_warps=16`) while `BLOCK_N` is typically 64 or 128, so three
+    /// quarters of the threads have nothing to do while the other quarter walks
+    /// every row of the accumulator tile on its own. Spreading over both
+    /// dimensions puts all of them to work and shortens each thread's row walk by
+    /// the same factor, while keeping `laneWidth` consecutive threads on
+    /// consecutive columns so the device stores stay coalesced.
+    ///
+    /// Two conditions. Only dot kernels, because only they are contractually
+    /// launched at exactly the reported `threads_per_threadgroup` — an
+    /// elementwise kernel strides the innermost dimension by the *runtime*
+    /// `tm_threadgroup_size.x` precisely so that it does not care. And no
+    /// `tt.reduce` anywhere, because a reduction closes the innermost loop and
+    /// then folds across the whole threadgroup, which requires every thread to be
+    /// in the same row (§Cross-lane regions).
+    private var distributesRows: Bool {
+        usesDot && rank >= 2 && !FunctionEmitter.containsReduce(function.body)
+    }
+
+    /// How many threads stride the innermost block dimension when the loops
+    /// spread over two of them. A power of two that divides the threadgroup, so
+    /// that `tid / lanes` and `tid % lanes` between them cover every point of the
+    /// two-dimensional index space exactly once.
+    private var laneWidth: Int {
+        guard distributesRows, let innermost = layout.shape.last else {
+            return threadsPerThreadgroup
+        }
+        var lanes = 1
+        while lanes * 2 <= min(innermost, threadsPerThreadgroup),
+            threadsPerThreadgroup % (lanes * 2) == 0
+        {
+            lanes *= 2
+        }
+        return lanes
+    }
+
     /// Simdgroups per threadgroup — a compile-time constant, which is what lets a
     /// `tt.dot` hand each simdgroup a named set of accumulator registers rather
     /// than a loop-indexed array. Kernels containing a `tt.dot` must be launched
@@ -518,11 +589,21 @@ private struct FunctionEmitter {
             let axis = level - 1
             let extent = layout.shape[axis]
             let variable = "tm_i\(axis)"
+            let lanes = laneWidth
             let open: String
-            if level == rank {
+            if level == rank, lanes < threadsPerThreadgroup {
+                open =
+                    "for (uint \(variable) = tm_thread_id.x % \(lanes)u; "
+                    + "\(variable) < \(extent)u; \(variable) += \(lanes)u) {"
+            } else if level == rank {
                 open =
                     "for (uint \(variable) = tm_thread_id.x; \(variable) < \(extent)u; "
                     + "\(variable) += tm_threadgroup_size.x) {"
+            } else if level == rank - 1, lanes < threadsPerThreadgroup {
+                let rows = threadsPerThreadgroup / lanes
+                open =
+                    "for (uint \(variable) = tm_thread_id.x / \(lanes)u; "
+                    + "\(variable) < \(extent)u; \(variable) += \(rows)u) {"
             } else {
                 open = "for (uint \(variable) = 0u; \(variable) < \(extent)u; ++\(variable)) {"
             }
@@ -1490,6 +1571,166 @@ private struct FunctionEmitter {
         return varying
     }
 
+    /// What a run of consecutive columns has to look like before its four scalar
+    /// device loads may be replaced by one vector load.
+    private struct VectorStagingPlan {
+        /// The `tt.load` being vectorised, and its operands.
+        var pointer: String
+        var mask: String?
+        /// Producers to replay when evaluating the *mask* at one column. Small —
+        /// a couple of comparisons — which is what makes the run-level guard
+        /// cheap enough to be worth having.
+        var maskSlice: [Instruction]
+        /// The address's column stride, as a tree over SSA values. One element is
+        /// what a vector load needs, and it is a runtime fact.
+        var stride: Coefficient
+    }
+
+    /// The coefficient of the column index in a staged address, symbolically.
+    /// Rendered to MSL once the values it names have been emitted.
+    private indirect enum Coefficient {
+        case literal(Int)
+        case value(String)
+        case sum(Coefficient, Coefficient)
+        case difference(Coefficient, Coefficient)
+        case product(Coefficient, Coefficient)
+
+        var isZero: Bool {
+            if case .literal(0) = self { return true }
+            return false
+        }
+    }
+
+    /// Decides whether a staged value is one masked load per column of a run
+    /// whose addresses are affine in the column index — the only shape a vector
+    /// load can serve.
+    ///
+    /// Two properties have to hold, and only one of them is decidable here.
+    /// *Affinity* is: the address is `p0 + c * stride` for some column-invariant
+    /// `stride`, which follows structurally from the staging subgraph (a closed
+    /// set — `tt.make_range`, `tt.splat`, `arith.addi/muli`, `tt.addptr`) and is
+    /// what makes checking the two endpoints of a run sufficient. *Unit stride*
+    /// and *alignment* are runtime facts about the kernel's arguments, so they
+    /// become a runtime test and both paths are emitted (see `stage`).
+    ///
+    /// The mask is required to be monotone in the column index — a conjunction of
+    /// `<`/`<=` against a column-invariant bound, with a literal positive
+    /// coefficient on the varying side — so that the mask at the *last* column of
+    /// the run implies the mask at all four. That is exactly the shape Triton's
+    /// `offs < N` guards have.
+    private func vectorStagingPlan(
+        for ssa: String, producers: [Instruction], varying: [String: Set<Int>], tile: Tile,
+        _ loc: SourceLoc
+    ) -> VectorStagingPlan? {
+        guard options.dotVectorStaging, tile.columns % 4 == 0,
+            let width = tile.element.scalarByteWidth, width == 4 || width == 2
+        else { return nil }
+        // Exactly one load, and it is the staged value itself.
+        var load: OpKind?
+        var loads = 0
+        for instruction in producers {
+            guard case .load(let result, _, _, _) = instruction.kind else { continue }
+            loads += 1
+            if result == ssa { load = instruction.kind }
+        }
+        guard loads == 1, case .load(_, let pointer, let mask, _) = load else { return nil }
+
+        let column = tile.columnAxis
+        var affinity: [String: Coefficient] = [:]
+        /// `nil` means "not affine in the column index".
+        func known(_ value: String) -> Coefficient? {
+            if let recorded = affinity[value] { return recorded }
+            // Anything outside the subgraph is already in scope at the uniform
+            // level, so it cannot vary with the column.
+            return (varying[value] ?? []).contains(column) ? nil : .literal(0)
+        }
+        for instruction in producers {
+            guard let result = FunctionEmitter.soleResult(instruction.kind) else { continue }
+            guard (varying[result] ?? []).contains(column) else {
+                affinity[result] = .literal(0)
+                continue
+            }
+            switch instruction.kind {
+            case .makeRange:
+                affinity[result] = .literal(1)
+            case .intBinary(_, let op, let lhs, let rhs):
+                guard let a = known(lhs), let b = known(rhs) else { break }
+                switch op {
+                case .add:
+                    affinity[result] = a.isZero ? b : (b.isZero ? a : .sum(a, b))
+                case .sub:
+                    affinity[result] = b.isZero ? a : .difference(a, b)
+                case .mul:
+                    // A product is affine only if one side is column-invariant;
+                    // then the coefficient is scaled by that side's runtime value.
+                    if a.isZero { affinity[result] = .product(.value(lhs), b) }
+                    else if b.isZero { affinity[result] = .product(a, .value(rhs)) }
+                default: break
+                }
+            case .addPtr(_, let pointer, let offset):
+                guard let base = known(pointer), let delta = known(offset) else { break }
+                affinity[result] = base.isZero ? delta : (delta.isZero ? base : .sum(base, delta))
+            case .cast(_, let op, let source, _) where op == .extsi || op == .extui:
+                affinity[result] = known(source)
+            case .expandDims(_, _, let source, _), .broadcast(_, _, let source):
+                affinity[result] = known(source)
+            default:
+                break
+            }
+        }
+
+        // The address has to be affine in the column, or the run is not four
+        // consecutive elements of anything and the endpoint reasoning below says
+        // nothing about the columns in between.
+        guard let stride = known(pointer) else { return nil }
+
+        /// A mask that can only go from true to false as the column grows, so
+        /// that its value at the *last* column of a run covers the whole run.
+        func monotone(_ value: String) -> Bool {
+            guard (varying[value] ?? []).contains(column) else { return true }
+            guard let instruction = producers.first(where: {
+                FunctionEmitter.soleResult($0.kind) == value
+            }) else { return false }
+            switch instruction.kind {
+            case .intBinary(_, .and, let lhs, let rhs):
+                return monotone(lhs) && monotone(rhs)
+            case .intCompare(_, let predicate, let lhs, let rhs):
+                guard ["slt", "sle", "ult", "ule"].contains(predicate) else { return false }
+                guard known(rhs)?.isZero == true else { return false }
+                // Only a *literal positive* coefficient proves the direction; a
+                // runtime stride could be negative.
+                if case .literal(let coefficient) = known(lhs), coefficient > 0 { return true }
+                return false
+            case .expandDims(_, _, let source, _), .broadcast(_, _, let source):
+                return monotone(source)
+            default:
+                return false
+            }
+        }
+        if let mask, !monotone(mask) { return nil }
+
+        let slice = (try? mask.map { try recomputationOrder(for: $0, loc) })
+        return VectorStagingPlan(
+            pointer: pointer, mask: mask, maskSlice: slice.flatMap { $0 } ?? [], stride: stride)
+    }
+
+    /// The MSL for a column stride, once the values it names have been emitted.
+    private func render(_ coefficient: Coefficient) -> String? {
+        switch coefficient {
+        case .literal(let value): return "\(value)"
+        case .value(let ssa): return names[ssa]
+        case .sum(let a, let b):
+            guard let a = render(a), let b = render(b) else { return nil }
+            return "(\(a) + \(b))"
+        case .difference(let a, let b):
+            guard let a = render(a), let b = render(b) else { return nil }
+            return "(\(a) - \(b))"
+        case .product(let a, let b):
+            guard let a = render(a), let b = render(b) else { return nil }
+            return "(\(a) * \(b))"
+        }
+    }
+
     /// Writes one tensor value into a threadgroup tile.
     ///
     /// The tile's own two dimensions become the loop nest — outer uniform, inner
@@ -1546,6 +1787,9 @@ private struct FunctionEmitter {
         // to unroll and strength-reduce.
         let unroll = stagingUnroll(tile)
         let lanes = min(tile.paddedColumns / unroll, threadsPerThreadgroup)
+        /// True once the run's vector fast path has opened an `else` around the
+        /// per-element loop, which is then one more frame to close.
+        var vectorElse = false
         frames.append(
             Frame(
                 level: 0, kind: .staging,
@@ -1558,6 +1802,119 @@ private struct FunctionEmitter {
                     level: 0, kind: .staging,
                     open: "for (uint \(group) = (tm_thread_id.x % \(lanes)u) * \(unroll)u; "
                         + "\(group) < \(tile.paddedColumns)u; \(group) += \(lanes * unroll)u) {"))
+            // The run's four loads become one, when the run turns out at runtime
+            // to be contiguous, aligned and entirely inside the mask. Everything
+            // that decides that is evaluated here, once per run, from the two
+            // endpoints of the run — which is sufficient because the plan already
+            // established that the address is affine in the column index.
+            if let plan = vectorStagingPlan(
+                for: ssa, producers: producers, varying: varying, tile: tile, loc), unroll == 4
+            {
+                let ok = "\(tile.name)_vok"
+                let base = "\(tile.name)_vbase"
+                let runFrame = frames.count - 1
+
+                // A run that reaches outside the tile's logical extent is not a
+                // candidate, and — like the per-element path — must not so much as
+                // form an address there, which is why this guards the rebuilds
+                // below rather than only the load.
+                var conditions: [String] = []
+                if tile.paddedColumns != tile.columns {
+                    conditions.append("\(group) + 4u <= \(tile.columns)u")
+                }
+                if tile.paddedRows != tile.rows { conditions.append("\(row) < \(tile.rows)u") }
+
+                /// Rebuilds a slice of the staging subgraph at one column of the
+                /// run, inside a scope of its own so its names do not collide
+                /// with the per-element loop's.
+                func replay(
+                    _ slice: [Instruction], at offset: Int, _ trailing: (String) -> Stmt,
+                    of value: String
+                ) throws -> TMType? {
+                    frames.append(
+                        Frame(
+                            level: 0, kind: .staging,
+                            open: conditions.isEmpty ? "{" : "if (\(ok)) {"))
+                    let scope = frames.count - 1
+                    frames[scope].statements.append(
+                        .line(
+                            "uint \(column) = \(group)\(offset == 0 ? "" : " + \(offset)u");"))
+                    let outerNames = names
+                    let outerTypes = types
+                    let outerLevels = levels
+                    defer {
+                        names = outerNames
+                        types = outerTypes
+                        levels = outerLevels
+                    }
+                    for instruction in slice {
+                        stagingTargetFrame = scope
+                        try emit(instruction)
+                    }
+                    frames[scope].statements.append(trailing(try name(of: value, loc)))
+                    let resolved = types[value]
+                    closeTopFrame()
+                    return resolved
+                }
+
+                // The run's address, evaluated once instead of once per element.
+                // Everything else follows from it: whether consecutive columns are
+                // one element apart, and whether the address is aligned for a
+                // vector load.
+                var stride: String?
+                let addressSlice = try recomputationOrder(for: plan.pointer, loc)
+                let pointerType = try replay(addressSlice, at: 0, { address in
+                    stride = render(plan.stride)
+                    return .line("\(base) = \(address);")
+                }, of: plan.pointer)
+
+                if let pointerType, case .pointer(let pointee) = pointerType.scalarized,
+                    let stride, let width = pointee.scalarByteWidth, width == 4 || width == 2
+                {
+                    frames[runFrame].statements.insert(
+                        contentsOf: [
+                            Stmt.line(
+                                "bool \(ok) = "
+                                    + (conditions.isEmpty
+                                        ? "true;" : conditions.joined(separator: " && ") + ";")),
+                            Stmt.line("\(try declaration(pointerType.scalarized, base, loc));"),
+                        ], at: 0)
+                    // The mask at the run's *last* column covers the whole run,
+                    // because the plan established that it is monotone.
+                    if let mask = plan.mask {
+                        _ = try replay(plan.maskSlice, at: 3, { value in
+                            .line("\(ok) = \(ok) && \(value);")
+                        }, of: mask)
+                    }
+                    frames[runFrame].statements.append(
+                        .line(
+                            "\(ok) = \(ok) && \(stride) == 1 && "
+                                + "(((uintptr_t)\(base) & \(width * 4 - 1)u) == 0u);"))
+
+                    // The fast path: one vector load, four tile writes, and none
+                    // of the per-element address arithmetic the loop below does.
+                    let scalar = try scalarTypeName(pointee, loc)
+                    let vector = "\(tile.name)_vec"
+                    var fast: [Stmt] = [
+                        .line("\(scalar)4 \(vector) = *(device const \(scalar)4 *)(\(base));")
+                    ]
+                    for lane in 0..<4 {
+                        let slot = "\(tile.name)[\(row) * \(tile.stride)u + \(group) + \(lane)u]"
+                        let element = "\(vector)[\(lane)u]"
+                        fast.append(
+                            .line(
+                                "\(slot) = "
+                                    + (pointee == tile.element
+                                        ? element : "\(elementName)(\(element))") + ";"))
+                    }
+                    frames[runFrame].statements.append(
+                        .group(
+                            open: "if (\(ok)) {  // one vector load for the whole run",
+                            body: fast, close: "}"))
+                    frames.append(Frame(level: 0, kind: .staging, open: "else {"))
+                    vectorElse = true
+                }
+            }
             frames.append(
                 Frame(
                     level: 0, kind: .staging,
@@ -1615,6 +1972,7 @@ private struct FunctionEmitter {
             frames[frames.count - 1].statements.append(.line("\(tile.expression) = \(value);"))
         }
         closeTopFrame()
+        if vectorElse { closeTopFrame() }
         if unroll > 1 { closeTopFrame() }
 
         let outer = frames.removeLast()
@@ -1706,6 +2064,8 @@ private struct FunctionEmitter {
         let accumulator: Tile
         let registers: AccumulatorRegisters
         let resident: Bool
+        /// A stand-alone dot seeded with `dense<0.0>`: no staging pass, no load.
+        var zeroed = false
         if let existing = tiles[dot.accumulator] {
             accumulator = existing
             if let held = residentAccumulators[existing.name] {
@@ -1724,7 +2084,8 @@ private struct FunctionEmitter {
                 columnGranularity: blocking.tilesN * FunctionEmitter.fragment, loc)
             registers = self.registers(index, for: accumulator, element: resultElement)
             resident = false
-            statements.append(try stage(dot.accumulator, into: accumulator, loc))
+            zeroed = isZeroSplat(dot.accumulator)
+            if !zeroed { statements.append(try stage(dot.accumulator, into: accumulator, loc)) }
         }
 
         // A and B are padded to the same block granularity as the accumulator so
@@ -1750,7 +2111,9 @@ private struct FunctionEmitter {
         // When the accumulator is resident the fragments were loaded before the
         // contraction loop and are stored back after it, so all that happens here
         // is arithmetic.
-        if !resident { statements.append(contentsOf: loadAccumulator(registers)) }
+        if !resident {
+            statements.append(contentsOf: loadAccumulator(registers, zeroed: zeroed))
+        }
         statements.append(contentsOf: accumulateSteps(index, lhs, rhs, registers))
         if !resident { statements.append(contentsOf: storeAccumulator(registers)) }
         // The trailing barrier exists so the next contraction step's staging
@@ -1810,10 +2173,19 @@ private struct FunctionEmitter {
     }
 
     private func registers(_ index: Int, for tile: Tile, element: TMType) -> AccumulatorRegisters {
-        AccumulatorRegisters(
-            tile: tile, blocking: blocking(rows: tile.rows, columns: tile.columns),
+        let blocking = self.blocking(rows: tile.rows, columns: tile.columns)
+        return AccumulatorRegisters(
+            tile: tile, blocking: blocking,
             matrix: element == .float(width: 16) ? "simdgroup_half8x8" : "simdgroup_float8x8",
-            prefix: "tm_acc\(index)")
+            prefix: "tm_acc\(index)",
+            sharedColumns: FunctionEmitter.sharesColumns(blocking))
+    }
+
+    /// Whether every wave of a simdgroup lands in the same column of the block
+    /// grid, which is true exactly when the grid's width divides the simdgroup
+    /// count — `(s + w*S) % bN == s % bN` iff `bN | S`.
+    static func sharesColumns(_ blocking: RegisterBlocking) -> Bool {
+        blocking.blocksN <= blocking.simdgroups && blocking.simdgroups % blocking.blocksN == 0
     }
 
     /// Which `tilesM x tilesN` grid to give each simdgroup.
@@ -1861,6 +2233,20 @@ private struct FunctionEmitter {
             let occupancy = Double(candidate.blocks) / Double(candidate.waves * simdgroups)
             return occupancy * fit(candidate)
         }
+        /// How to choose between blockings the score cannot separate, best first.
+        ///
+        /// Never widen along N: a block wider than one fragment puts a
+        /// simdgroup's waves in different columns of the block grid, which is
+        /// exactly what the shared-column mapping (and the single B load per
+        /// step it buys) depends on — measured at 4327 GFLOP/s for 1x1 against
+        /// 2836 for 2x2 at `64x128`. *Two* fragments along M, on the other hand,
+        /// keeps the column and halves the waves, and at equal score that is
+        /// worth a geometric mean of +4% across the swept shapes and +8% at the
+        /// fastest one. Beyond two there is no measurement, so nothing is
+        /// promoted past it and the smallest wins.
+        func preference(_ candidate: RegisterBlocking) -> (Int, Int, Int) {
+            (candidate.tilesN, candidate.tilesM == 2 ? 0 : 1, candidate.tilesM * candidate.tilesN)
+        }
 
         var best: RegisterBlocking?
         for tilesM in blockingCandidates where tilesM <= rowFragments {
@@ -1875,12 +2261,8 @@ private struct FunctionEmitter {
                 let better: Bool
                 if abs(delta) > 1e-9 {
                     better = delta > 0
-                } else if candidate.tilesM * candidate.tilesN
-                    != incumbent.tilesM * incumbent.tilesN
-                {
-                    // Smallest blocking that scores as well, per the measurement.
-                    better = candidate.tilesM * candidate.tilesN
-                        < incumbent.tilesM * incumbent.tilesN
+                } else if preference(candidate) != preference(incumbent) {
+                    better = preference(candidate) < preference(incumbent)
                 } else {
                     better = fit(candidate) > fit(incumbent)
                 }
@@ -1906,35 +2288,83 @@ private struct FunctionEmitter {
     /// accumulator stops making a round trip through threadgroup memory on every
     /// K step. That was the second thing docs/ARCHITECTURE.md §Matmul throughput
     /// named.
-    private func loadAccumulator(_ registers: AccumulatorRegisters) -> [Stmt] {
+    ///
+    /// `zeroed` is the common case and the cheap one: an accumulator seeded with
+    /// `arith.constant dense<0.0>` needs no prologue at all — no per-lane pass
+    /// filling a tile with zeros, no `simdgroup_load` reading them back, and
+    /// neither of the two barriers that ordered those against each other. The
+    /// fragments are simply born zero in registers.
+    private func loadAccumulator(_ registers: AccumulatorRegisters, zeroed: Bool = false) -> [Stmt]
+    {
         let blocking = registers.blocking
-        var statements: [Stmt] = [.line("// tt.dot accumulator: \(blocking.summary)")]
-        for wave in 0..<blocking.waves {
-            let flat = "\(registers.prefix)_b\(wave)"
-            let index = wave == 0
-                ? "tm_simd_group" : "(tm_simd_group + \(wave * blocking.simdgroups)u)"
-            if blocking.ragged {
-                // The tail wave has fewer blocks than simdgroups: the ones with
-                // nothing to do read block 0 (harmless) and skip the store.
-                statements.append(
-                    .line("bool \(registers.live(wave)) = \(index) < \(blocking.blocks)u;"))
-                statements.append(
-                    .line("uint \(flat) = \(registers.live(wave)) ? \(index) : 0u;"))
-            } else {
-                statements.append(.line("uint \(flat) = \(index);"))
+        var statements: [Stmt] = [
+            .line(
+                "// tt.dot accumulator: \(blocking.summary)"
+                    + (zeroed ? ", zero-initialised in registers" : ""))
+        ]
+        // When the block grid's width divides the simdgroup count, every wave of
+        // a given simdgroup lands in the *same column* of the grid — `flat / bN`
+        // and `flat % bN` decompose exactly — so the column index is emitted once
+        // instead of once per wave. That is not cosmetic: it is what makes the B
+        // fragment of a contraction step textually identical across waves, and
+        // therefore loadable once (see `accumulateSteps`).
+        if registers.sharedColumns {
+            let column: String
+            switch blocking.blocksN {
+            case 1: column = "0u"
+            case blocking.simdgroups: column = "tm_simd_group"
+            default: column = "tm_simd_group % \(blocking.blocksN)u"
             }
-            statements.append(
-                .line("uint \(registers.rowBlock(wave)) = \(flat) / \(blocking.blocksN)u;"))
-            statements.append(
-                .line("uint \(registers.columnBlock(wave)) = \(flat) % \(blocking.blocksN)u;"))
+            statements.append(.line("uint \(registers.columnBlock(0)) = \(column);"))
+        }
+        for wave in 0..<blocking.waves {
+            if registers.sharedColumns {
+                let groups = blocking.simdgroups / blocking.blocksN
+                // `flat / blocksN` with `flat = simd_group + wave * simdgroups`.
+                let base = blocking.blocksN == 1
+                    ? "tm_simd_group" : "tm_simd_group / \(blocking.blocksN)u"
+                let row = groups == 1
+                    ? "\(wave)u"
+                    : (wave == 0 ? base : "(\(base) + \(wave * groups)u)")
+                if blocking.ragged {
+                    statements.append(
+                        .line("bool \(registers.live(wave)) = \(row) < \(blocking.blocksM)u;"))
+                    statements.append(
+                        .line(
+                            "uint \(registers.rowBlock(wave)) = "
+                                + "\(registers.live(wave)) ? \(row) : 0u;"))
+                } else {
+                    statements.append(.line("uint \(registers.rowBlock(wave)) = \(row);"))
+                }
+            } else {
+                let flat = "\(registers.prefix)_b\(wave)"
+                let index = wave == 0
+                    ? "tm_simd_group" : "(tm_simd_group + \(wave * blocking.simdgroups)u)"
+                if blocking.ragged {
+                    // The tail wave has fewer blocks than simdgroups: the ones with
+                    // nothing to do read block 0 (harmless) and skip the store.
+                    statements.append(
+                        .line("bool \(registers.live(wave)) = \(index) < \(blocking.blocks)u;"))
+                    statements.append(
+                        .line("uint \(flat) = \(registers.live(wave)) ? \(index) : 0u;"))
+                } else {
+                    statements.append(.line("uint \(flat) = \(index);"))
+                }
+                statements.append(
+                    .line("uint \(registers.rowBlock(wave)) = \(flat) / \(blocking.blocksN)u;"))
+                statements.append(
+                    .line("uint \(registers.columnBlock(wave)) = \(flat) % \(blocking.blocksN)u;"))
+            }
 
             var declared: [String] = []
             for row in 0..<blocking.tilesM {
                 for column in 0..<blocking.tilesN {
-                    declared.append(registers.register(wave, row, column))
+                    let name = registers.register(wave, row, column)
+                    declared.append(zeroed ? "\(name) = \(registers.zeroFragment)" : name)
                 }
             }
             statements.append(.line("\(registers.matrix) \(declared.joined(separator: ", "));"))
+            guard !zeroed else { continue }
             for row in 0..<blocking.tilesM {
                 for column in 0..<blocking.tilesN {
                     statements.append(
@@ -1987,25 +2417,53 @@ private struct FunctionEmitter {
         let step = "tm_step\(index)"
 
         var body: [Stmt] = []
+        // One fragment per *distinct address*, not one per use. With the shared
+        // column mapping every wave reads the same B fragment, so a step that
+        // spells out `waves * (tilesM + tilesN)` loads issues far fewer: at
+        // `64x128` on 16 simdgroups, 8 A loads and one B load feed 8
+        // multiply-accumulates instead of 16 loads feeding 8.
+        var loaded: [String: String] = [:]
+        var loads = 0
+        /// The variable an address is already in, or `nil` after claiming it.
+        func fragment(_ name: String, at address: String) -> String? {
+            if let existing = loaded[address] { return existing }
+            loaded[address] = name
+            loads += 1
+            return nil
+        }
+
         for wave in 0..<blocking.waves {
-            let a = (0..<blocking.tilesM).map { "tm_a\(index)_\(wave)_\($0)" }
-            let b = (0..<blocking.tilesN).map { "tm_b\(index)_\(wave)_\($0)" }
-            body.append(.line("\(operandMatrix) \((a + b).joined(separator: ", "));"))
+            var a = (0..<blocking.tilesM).map { "tm_a\(index)_\(wave)_\($0)" }
+            var b = (0..<blocking.tilesN).map { "tm_b\(index)_\(wave)_\($0)" }
+            var declarations: [String] = []
+            var loadLines: [Stmt] = []
             for row in 0..<blocking.tilesM {
-                body.append(
-                    .line(
-                        "simdgroup_load(\(a[row]), \(lhs.name) + "
-                            + "\(registers.fragmentRow(wave, row)) * \(size * lhs.stride)u "
-                            + "+ \(step) * \(size)u, \(lhs.stride)u);"))
+                let address = "\(lhs.name) + "
+                    + "\(registers.fragmentRow(wave, row)) * \(size * lhs.stride)u "
+                    + "+ \(step) * \(size)u"
+                if let existing = fragment(a[row], at: address) {
+                    a[row] = existing
+                    continue
+                }
+                declarations.append(a[row])
+                loadLines.append(
+                    .line("simdgroup_load(\(a[row]), \(address), \(lhs.stride)u);"))
             }
             for column in 0..<blocking.tilesN {
-                body.append(
-                    .line(
-                        "simdgroup_load(\(b[column]), \(rhs.name) + "
-                            + "\(step) * \(size * rhs.stride)u + "
-                            + "\(registers.fragmentColumn(wave, column)) * \(size)u, "
-                            + "\(rhs.stride)u);"))
+                let address = "\(rhs.name) + \(step) * \(size * rhs.stride)u + "
+                    + "\(registers.fragmentColumn(wave, column)) * \(size)u"
+                if let existing = fragment(b[column], at: address) {
+                    b[column] = existing
+                    continue
+                }
+                declarations.append(b[column])
+                loadLines.append(
+                    .line("simdgroup_load(\(b[column]), \(address), \(rhs.stride)u);"))
             }
+            if !declarations.isEmpty {
+                body.append(.line("\(operandMatrix) \(declarations.joined(separator: ", "));"))
+            }
+            body.append(contentsOf: loadLines)
             for row in 0..<blocking.tilesM {
                 for column in 0..<blocking.tilesN {
                     let target = registers.register(wave, row, column)
@@ -2018,7 +2476,6 @@ private struct FunctionEmitter {
         }
 
         let macs = blocking.waves * blocking.tilesM * blocking.tilesN
-        let loads = blocking.waves * (blocking.tilesM + blocking.tilesN)
         return [
             .line(
                 "// tt.dot: \(steps) contraction step\(steps == 1 ? "" : "s"), each "
@@ -2091,6 +2548,12 @@ private struct FunctionEmitter {
     /// True when `body` (or any region inside it) performs a cross-lane
     /// operation, which decides whether the region has to be lowered
     /// threadgroup-uniformly.
+    /// True when `body` contains a reduction, whose fold across the threadgroup
+    /// pins the block loops to the innermost-only distribution.
+    private static func containsReduce(_ body: [Instruction]) -> Bool {
+        contains(body) { if case .reduce = $0 { return true } else { return false } }
+    }
+
     private static func containsCrossLane(_ body: [Instruction]) -> Bool {
         contains(body) {
             switch $0 {
@@ -2265,35 +2728,50 @@ private struct FunctionEmitter {
                     rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
                     columnGranularity: blocking.tilesN * FunctionEmitter.fragment,
                     capacity: operands, loc)
-                let initial = try stage(argument.initial, into: tile, loc)
                 let reason = "a tt.dot accumulator cannot be recomputed"
-                try append(
-                    .line("// tt.dot accumulator: \(shape[0])x\(shape[1]) in threadgroup memory"),
-                    level: level, recomputable: false, reason: reason, loc)
-                try append(initial, level: level, recomputable: false, reason: reason, loc)
+                // The usual `dense<0.0>` seed never goes near threadgroup memory:
+                // the fragments start zero in registers, which skips a whole
+                // per-lane pass over the tile, one `simdgroup_load` per fragment
+                // and both of the barriers that ordered them.
+                let zeroed = isZeroSplat(argument.initial)
+                if !zeroed {
+                    let initial = try stage(argument.initial, into: tile, loc)
+                    try append(
+                        .line(
+                            "// tt.dot accumulator: \(shape[0])x\(shape[1]) in threadgroup memory"),
+                        level: level, recomputable: false, reason: reason, loc)
+                    try append(initial, level: level, recomputable: false, reason: reason, loc)
+                }
 
                 // The accumulator moves into simdgroup registers for the whole
-                // loop: loaded once here, updated in place by every `tt.dot` in
-                // the body, and written back after the loop closes. Without this
-                // each K step reloads and restores every output fragment through
-                // threadgroup memory.
+                // loop: initialised once here, updated in place by every `tt.dot`
+                // in the body, and written back after the loop closes. Without
+                // this each K step reloads and restores every output fragment
+                // through threadgroup memory.
                 usesSimdgroups = true
                 let registers = AccumulatorRegisters(
                     tile: tile, blocking: blocking,
                     matrix: element == .float(width: 16)
                         ? "simdgroup_half8x8" : "simdgroup_float8x8",
-                    prefix: "\(tile.name)_r")
-                try append(
-                    .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
-                    level: level, recomputable: false, reason: reason, loc)
-                for statement in loadAccumulator(registers) {
+                    prefix: "\(tile.name)_r",
+                    sharedColumns: FunctionEmitter.sharesColumns(blocking))
+                if !zeroed {
+                    try append(
+                        .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
+                        level: level, recomputable: false, reason: reason, loc)
+                }
+                for statement in loadAccumulator(registers, zeroed: zeroed) {
                     try append(statement, level: level, recomputable: false, reason: reason, loc)
                 }
                 // Every simdgroup has its fragments; the tile's storage is now
                 // free for the operand tiles to stage into until the loop ends.
-                try append(
-                    .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
-                    level: level, recomputable: false, reason: reason, loc)
+                // Nothing read it when the accumulator was born in registers, so
+                // there is nothing to order against either.
+                if !zeroed {
+                    try append(
+                        .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
+                        level: level, recomputable: false, reason: reason, loc)
+                }
                 let capacity = max(tile.elementCount, operands)
                 stagingArena = (
                     name: tile.name, element: element, capacity: capacity, cursor: 0

@@ -38,9 +38,17 @@ public enum MetalCompiler {
         /// manual double buffering; it costs twice the operand tile memory.
         public var dotDoubleBuffer: Bool
 
+        /// Read a staged run of four consecutive columns with one `float4`/`half4`
+        /// load instead of four scalar ones, when a runtime check says the run is
+        /// contiguous, aligned and entirely unmasked — see `MSLEmitter`'s
+        /// `stage`. See docs/ARCHITECTURE.md §Matmul throughput for what it is
+        /// worth on Apple silicon.
+        public var dotVectorStaging: Bool
+
         public init(
             numSimdgroups: Int = 4, dotRegisterM: Int = 0, dotRegisterN: Int = 0,
-            dotStagingUnroll: Int = 0, dotTilePadding: Int = -1, dotDoubleBuffer: Bool = false
+            dotStagingUnroll: Int = 0, dotTilePadding: Int = -1, dotDoubleBuffer: Bool = false,
+            dotVectorStaging: Bool = true
         ) {
             self.numSimdgroups = numSimdgroups
             self.dotRegisterM = dotRegisterM
@@ -48,6 +56,7 @@ public enum MetalCompiler {
             self.dotStagingUnroll = dotStagingUnroll
             self.dotTilePadding = dotTilePadding
             self.dotDoubleBuffer = dotDoubleBuffer
+            self.dotVectorStaging = dotVectorStaging
         }
     }
 

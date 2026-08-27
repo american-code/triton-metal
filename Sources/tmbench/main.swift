@@ -9,8 +9,9 @@ import TritonMetalCore
 /// measurement is packaged as a plain executable with hand-rolled argument
 /// parsing and no dependencies.
 ///
-///     tmbench [--sizes 512,1024,2048] [--sweep quick|full] [--config M,N,K,W[,RM,RN]]
-///             [--verbose] [--no-verify] [--emit M,N,K,W[,RM,RN]]
+///     tmbench [--sizes 512,1024,2048] [--sweep quick|full]
+///             [--config M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]] [--verbose] [--no-verify]
+///             [--emit M,N,K,W[,...]]
 
 struct Arguments {
     var sizes = [512, 1024, 2048]
@@ -47,12 +48,12 @@ func parseArguments() -> Arguments {
             arguments.sweep = sweep
         case "--config":
             guard let config = GEMMConfig.parse(value(flag)) else {
-                fail("--config takes M,N,K,W or M,N,K,W,RM,RN")
+                fail("--config takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]")
             }
             arguments.pinned.append(config)
         case "--emit":
             guard let config = GEMMConfig.parse(value(flag)) else {
-                fail("--emit takes M,N,K,W or M,N,K,W,RM,RN")
+                fail("--emit takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]")
             }
             arguments.emit = config
         case "--verbose", "-v": arguments.verbose = true
@@ -66,10 +67,13 @@ func parseArguments() -> Arguments {
                   --sizes N,N,...      matrix sizes to measure (default 512,1024,2048)
                   --sweep quick|full   block shapes only, or crossed with every explicit
                                        register blocking (default quick)
-                  --config M,N,K,W[,RM,RN]
+                  --config M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]
                                        measure exactly this configuration; repeatable.
-                                       Overrides --sweep.
-                  --emit M,N,K,W[,RM,RN]
+                                       Overrides --sweep. RM/RN register blocking,
+                                       U staging run length, P tile row padding,
+                                       DB double buffering, V4 vector staging (on
+                                       unless given as 0).
+                  --emit M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]
                                        print the emitted MSL for one configuration and exit
                   --verbose            print every configuration's throughput
                   --no-verify          skip the CPU-reference correctness check

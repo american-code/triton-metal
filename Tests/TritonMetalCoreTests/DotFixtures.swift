@@ -72,7 +72,11 @@ enum DotFixtures {
     /// `tmbench` executable lower byte-identical IR — the executable exists
     /// because XCTest is absent on a command-line-tools-only machine, which is
     /// where the quotable throughput numbers get measured.
-    static func tutorial(blockM: Int, blockN: Int, blockK: Int, element: String = "f32") -> String {
-        GEMMKernel.tutorial(blockM: blockM, blockN: blockN, blockK: blockK, element: element)
+    static func tutorial(
+        blockM: Int, blockN: Int, blockK: Int, element: String = "f32",
+        seed: String = "0.000000e+00"
+    ) -> String {
+        GEMMKernel.tutorial(
+            blockM: blockM, blockN: blockN, blockK: blockK, element: element, seed: seed)
     }
 }

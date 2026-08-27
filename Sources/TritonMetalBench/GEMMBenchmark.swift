@@ -27,12 +27,16 @@ public struct GEMMConfig: Sendable, Hashable {
     public var tilePadding: Int
     /// Ping-pong the operand tiles between two arena halves.
     public var doubleBuffer: Bool
+    /// Read a staged run of four columns with one vector load. On by default;
+    /// the sweep turns it *off* to keep the comparison measurable.
+    public var vectorStaging: Bool
 
     public init(
         blockM: Int, blockN: Int, blockK: Int, simdgroups: Int, registerM: Int = 0,
         registerN: Int = 0, stagingUnroll: Int = 0, tilePadding: Int = -1,
-        doubleBuffer: Bool = false
+        doubleBuffer: Bool = false, vectorStaging: Bool = true
     ) {
+        self.vectorStaging = vectorStaging
         self.blockM = blockM
         self.blockN = blockN
         self.blockK = blockK
@@ -51,6 +55,7 @@ public struct GEMMConfig: Sendable, Hashable {
         options.dotStagingUnroll = stagingUnroll
         options.dotTilePadding = tilePadding
         options.dotDoubleBuffer = doubleBuffer
+        options.dotVectorStaging = vectorStaging
         return options
     }
 
@@ -60,7 +65,7 @@ public struct GEMMConfig: Sendable, Hashable {
             ? "/r\(max(1, registerM))x\(max(1, registerN))" : ""
         let staging = stagingUnroll > 0 ? "/u\(stagingUnroll)" : ""
         let padding = tilePadding >= 0 ? "/p\(tilePadding)" : ""
-        let buffering = doubleBuffer ? "/db" : ""
+        let buffering = (doubleBuffer ? "/db" : "") + (vectorStaging ? "" : "/nov4")
         return "\(blockM)x\(blockN)x\(blockK)/w\(simdgroups)\(blocking)\(staging)\(padding)"
             + buffering
     }
@@ -68,7 +73,7 @@ public struct GEMMConfig: Sendable, Hashable {
     /// `M,N,K,W[,RM,RN[,U[,P[,DB]]]]`, the spelling `tmbench --config` takes.
     public static func parse(_ text: String) -> GEMMConfig? {
         let fields = text.split(separator: ",").map { Int($0.trimmingCharacters(in: .whitespaces)) }
-        guard [4, 6, 7, 8, 9].contains(fields.count), !fields.contains(where: { $0 == nil })
+        guard [4, 6, 7, 8, 9, 10].contains(fields.count), !fields.contains(where: { $0 == nil })
         else {
             return nil
         }
@@ -79,7 +84,8 @@ public struct GEMMConfig: Sendable, Hashable {
             registerN: values.count >= 6 ? values[5] : 0,
             stagingUnroll: values.count >= 7 ? values[6] : 0,
             tilePadding: values.count >= 8 ? values[7] : -1,
-            doubleBuffer: values.count == 9 && values[8] != 0)
+            doubleBuffer: values.count >= 9 && values[8] != 0,
+            vectorStaging: values.count < 10 || values[9] != 0)
     }
 }
 
@@ -116,8 +122,8 @@ public enum GEMMBenchmark {
         /// emitter. 84 configurations.
         case quick
         /// The same, plus every one-axis deviation from the emitter's choice:
-        /// each explicit register blocking, each tile padding, and double
-        /// buffering. One axis at a time rather than the full cross product —
+        /// each explicit register blocking, each tile padding, double buffering,
+        /// and scalar (non-vector) staging. One axis at a time rather than the full cross product —
         /// that is both tractable and how the axes were attributed in the first
         /// place (docs/ARCHITECTURE.md §Matmul throughput).
         case full
@@ -146,6 +152,9 @@ public enum GEMMBenchmark {
                     var buffered = base
                     buffered.doubleBuffer = true
                     configurations.append(buffered)
+                    var scalarStaging = base
+                    scalarStaging.vectorStaging = false
+                    configurations.append(scalarStaging)
                 }
             }
         }

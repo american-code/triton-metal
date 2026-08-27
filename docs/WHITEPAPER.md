@@ -24,15 +24,16 @@ Python package is a ctypes shim with no logic in it, present only because
 Triton's backend discovery imports a Python module.
 
 The evaluation is deliberately unflattering where the results are. The test suite
-is 127 Swift cases and 14 Python cases, at ~83% region / ~85% function / ~90%
-line coverage of the Swift core. The lowered matmul reaches roughly **50% of
-`MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (3.06
-TFLOP/s f32 at 2048), and ~50% on an M1 Pro — up from ~33%, which clears the >50%
-milestone target but not the 60–80% band the optimisation round aimed at. We give
-a per-change attribution, including the two techniques from the CUDA playbook that
-did **not** transfer to Apple silicon. Two named blockers stand between
-this backend and a FlashAttention-2 forward pass, and the Triton release it
-should be pinned to has not been pinned.
+is 131 Swift cases and 14 Python cases, at ~83% region / ~86% function / ~91%
+line coverage of the Swift core. The lowered matmul reaches **76% of
+`MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.66
+TFLOP/s f32 at 2048), and 69–82% on an M1 Pro depending on its thermal state — up
+from ~33% at the first working version, which clears both the >50% milestone and the 60–80% band the second
+optimisation round aimed at. We give a per-change attribution, including the two
+techniques from the CUDA playbook that did **not** transfer to Apple silicon and
+the one with no CUDA analogue that was worth more than either of them. Two named
+blockers stand between this backend and a FlashAttention-2 forward pass, and the
+Triton release it should be pinned to has not been pinned.
 
 ---
 
@@ -334,7 +335,7 @@ the code that looks like it does the arithmetic.
 
 ## 5. Test strategy
 
-127 Swift cases across ten suites (one, the benchmark, is opt-in and skipped by
+131 Swift cases across ten suites (one, the benchmark, is opt-in and skipped by
 default), plus 14 Python cases. Everything that can run on the real GPU does.
 
 | Suite | Cases | What it covers |
@@ -345,7 +346,7 @@ default), plus 14 Python cases. Everything that can run on the real GPU does.
 | `ControlFlowTests` | 9 | strided `scf.for` accumulation with tensor `iter_args`, a zero-trip loop, multi-result loops, a tensor-yielding `scf.if` |
 | `Rank2Tests` | 9 | tiled add and copy at sizes dividing neither block dimension, a padded-stride guard proving masks protect inter-row gaps, assertions that row-uniform work is hoisted |
 | `ReductionTests` | 15 | add/max/min swept across `num_warps` 1..32, row-wise rank-2 reduction, fused softmax at four shapes, a rows-sum-to-one check on inputs large enough to overflow a naive `exp`, and an online softmax with both reductions inside an `scf.for` |
-| `DotTests` | 19 | single-tile products at six shapes including `5x3x7` and `12x20x12`; the matmul tutorial at six shapes including `129x257x65`; f16-in/f32-out; `num_warps` 1..32; a sentinel test proving masked stores leave inter-row padding alone; assertions on tile sizes, barrier placement, accumulator residency and pointer strength reduction; and eight error paths |
+| `DotTests` | 27 | single-tile products at six shapes including `5x3x7` and `12x20x12`; the matmul tutorial at six shapes including `129x257x65`; f16-in/f32-out; `num_warps` 1..32; a sentinel test proving masked stores leave inter-row padding alone; the vector staging path taken and refused — padded tiles, misaligned rows, a non-unit innermost stride; assertions on tile sizes, barrier placement, accumulator residency, the shared-column mapping and pointer strength reduction; and eight error paths |
 | `EndToEndTests` | 16 | copy/add/mul/scale-bias/integer kernels vs CPU references at non-multiple-of-BLOCK sizes; guard-region tests; `num_warps` 1..32; the offline `xcrun metal` path and its diagnostics; runtime geometry validation; handle-table type safety |
 | `CABITests` | 18 | the whole spine through `tm_*` only, plus NULL-argument handling, handle validity, copy bounds, metallib loading, f32 launch arguments, and leak checks via `tm_live_handle_count` |
 | `MatmulBenchmark` | 1 | opt-in (`TM_BENCH=1`); measures a machine, not a contract |
@@ -373,14 +374,14 @@ Regenerated with `swift test --enable-code-coverage`, then
 
 | File | Region | Function | Line |
 | --- | --- | --- | --- |
-| `Compiler.swift` | 97.58% | 97.22% | 99.01% |
+| `Compiler.swift` | 97.58% | 97.22% | 99.03% |
 | `IR/Lexer.swift` | 84.13% | 95.35% | 91.86% |
 | `IR/Parser.swift` | 80.44% | 87.69% | 85.45% |
 | `IR/TritonIR.swift` | 80.28% | 71.43% | 90.76% |
 | `Layout.swift` | 84.31% | 70.37% | 90.12% |
-| `MSLEmitter.swift` | 83.47% | 84.85% | 91.10% |
+| `MSLEmitter.swift` | 83.59% | 85.78% | 92.23% |
 | `Runtime.swift` | 85.92% | 100.00% | 92.21% |
-| **Total** | **83.43%** | **85.58%** | **90.32%** |
+| **Total** | **83.49%** | **85.99%** | **91.01%** |
 
 Over ~5,000 lines of Swift core and ~3,600 lines of tests. The 282-line Python
 package is the shim. `TritonMetalBench` — the GEMM sweep shared by `tmbench` and
@@ -412,23 +413,30 @@ On an **Apple M1 Max** (Mac Studio; measured peaks 6.2 TFLOP/s f32, 371.5 GB/s),
 which is the machine to believe — it is not thermally constrained and its MPS
 readings are stable:
 
-| size | best configuration | triton-metal | MPS | ratio | was |
-| --- | --- | --- | --- | --- | --- |
-| 512 | 64x64x16, `num_warps=8` | 2.01 TFLOP/s | ~2.18 TFLOP/s | 92% | 62% |
-| 1024 | 64x64x16, `num_warps=8` | 2.75 TFLOP/s | ~5.54 TFLOP/s | **50%** | 33% |
-| 2048 | 64x128x16, `num_warps=16` | 3.06 TFLOP/s | ~6.10 TFLOP/s | **50%** | 33% |
-| 4096 | 64x128x16, `num_warps=16` | 3.21 TFLOP/s | ~6.13 TFLOP/s | **52%** | 32% |
+| size | best configuration | triton-metal | MPS | ratio | round 1 | baseline |
+| --- | --- | --- | --- | --- | --- | --- |
+| 512 | 64x64x16, `num_warps=8` | 3.21 TFLOP/s | ~1.85 TFLOP/s | — | 92% | 62% |
+| 1024 | 64x64x16, `num_warps=8` | 4.33 TFLOP/s | ~5.70 TFLOP/s | **76%** | 50% | 33% |
+| 2048 | 64x64x16, `num_warps=8` | 4.66 TFLOP/s | ~6.10 TFLOP/s | **76%** | 50% | 33% |
+| 4096 | 64x64x16, `num_warps=8` | 4.64 TFLOP/s | ~6.10 TFLOP/s | **76%** | 52% | 32% |
 
 On an **Apple M1 Pro** (laptop), where MPS readings move with thermal state:
 
-| size | best configuration | triton-metal | MPS | ratio | was |
-| --- | --- | --- | --- | --- | --- |
-| 1024 | 64x128x16, `num_warps=16` | 1.57 TFLOP/s | ~3.17 TFLOP/s | **50%** | 34% |
-| 2048 | 64x128x16, `num_warps=16` | 1.69 TFLOP/s | ~3.37 TFLOP/s | **50%** | 33% |
+| size | best configuration | triton-metal | MPS | ratio | round 1 | baseline |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1024 | 64x64x16, `num_warps=8` | 2.27 TFLOP/s | ~2.77 TFLOP/s | **82%** | 50% | 34% |
+| 2048 | 64x64x16, `num_warps=8` | 2.33 TFLOP/s | ~2.83 TFLOP/s | **82%** | 50% | 33% |
 
-**About 1.55x throughput on both chips, and ~33% of MPS becomes ~50%.** The >50%
-milestone is met at the sizes where the measurement is trustworthy; the 60–80%
-band the optimisation round aimed at is not reached.
+**A second optimisation round took ~50% of MPS to 76% on the M1 Max** (1.52x on top
+of round 1's 1.55x, so 2.3x over the original kernel), which puts the backend inside
+the 62–82% band published Triton reaches against cuBLAS on its native target. The
+60% this round aimed at is cleared at every size where the measurement means
+anything, and the winning shape moved to `64x64x16` at `num_warps=8` everywhere.
+The laptop's 82% is flattered by a warm MPS reading — the same MPS configuration
+read 3.38 TFLOP/s earlier in the session, which would make it 69% — which is why
+the M1 Max is the machine to believe. Run-to-run variation there is about ±2%, once
+a configuration has been measured twice: the *first* measurement at a size runs
+cold and can read 20% low, which is a trap this round fell into before noticing.
 
 The 512 row deserves its own sentence, because it would be easy to quote it
 misleadingly. At 512 the GEMM is under a millisecond and MPS's own timing swings
@@ -455,6 +463,45 @@ pinning a configuration with `tmbench --config`:
 | + literal (compile-time) staging trip counts | 2902 | +6% |
 | + accumulator tile doubling as the operand arena, enabling 64x128 | 3062 | +6% |
 | + bank-conflict padding | ~+2%, size-dependent | |
+| **round 2** | | |
+| + zero accumulator born in registers, no prologue at all | 3025 | +0.1% |
+| + 2-D-distributed epilogue (all 512 threads participate, not 128) | 3094 | +2% |
+| + shared-column wave mapping, collapsing identical operand loads | 3551 | **+15%** |
+| + `float4` staging runs behind a runtime contiguity/alignment check | 4271 | **+20%** |
+| + two fragment rows per simdgroup where the score ties (at 64x64) | 4640 | **+8%** |
+
+#### What round 2 found
+
+The round-1 discussion below ends by saying an instruction-slot account ranks
+fixes in the wrong order. Round 2 is the same lesson twice more, in both
+directions.
+
+**The prologue and epilogue were named as the largest suspected remaining cost.
+They were worth 2%.** Both are real inefficiencies — a zero accumulator written to
+threadgroup memory and read straight back, an epilogue in which 128 of 512 threads
+did all the work — and both are now gone, and together they moved 1993→3094, i.e.
+almost nothing. They are once-per-program costs against a contraction loop of 128
+steps, which the estimate had not weighed.
+
+**The largest single change was not on the list at all.** With one output fragment
+per simdgroup per wave, the emitter used to give wave `w` of simdgroup `s` the flat
+block `s + wS` of the output grid and recover its coordinates by division. Those
+coordinates are not independent: when the grid's width divides the simdgroup count,
+every wave of a simdgroup sits in the *same column*, and so wants the same B
+fragment. Making that structural — emitting the column index once, then
+deduplicating operand loads by address — turned a contraction step's 16
+`simdgroup_load`s into 9 and was worth **15%**, with the mapping, the arithmetic
+and the results bit-identical. It went unexamined because the loads it removes are
+the same loads register blocking had already been measured not to care about; what
+register blocking changes as well, and what evidently costs more, is the mapping.
+
+**Vector staging was worth 20%, but mostly not for the reason it is usually done.**
+Replacing four scalar loads with one `float4` inside the element loop measured
+**+2%**. Putting the same vector load behind a branch around the *whole run* —
+so the fast path skips the per-element address arithmetic too — measured **+20%**.
+An intermediate version whose guard re-derived both endpoints of the run in full
+measured **-30%**. The load count was never the point; the address arithmetic, and
+how cheaply the guard can be computed, were.
 
 #### Two techniques that did not transfer
 
@@ -473,7 +520,11 @@ which is roughly what cancels the gain. Kept as an off-by-default knob.
 was worth 10% when we added it. After the staging work the full sweep separated
 1x1 from 2x2 by under 1% at 64x64 — and at 64x128, 1x1 runs **28% faster** than
 2x2 (3066 vs 2391 GFLOP/s), with the *same* number of accumulator fragments per
-simdgroup, so this is not register pressure. The operand loads a bigger block
+simdgroup, so this is not register pressure. Round 2 gave us a reason to re-measure
+— deduplicating operand loads hands 1x1 blocking most of the traffic a bigger block
+was supposed to save — and the full sweep was re-run at the new operating point:
+1x1 now measures 3617 GFLOP/s against 2494 for 2x2, 2500 for 4x2 and 1747 for 4x4.
+The inversion widened from 28% to 45%. The operand loads a bigger block
 saves were never the binding constraint on this chip, and the coarser
 fragment-to-simdgroup mapping it produces costs more than the loads it removes. We
 changed the emitter's default to the smallest blocking that fits the register
@@ -501,25 +552,31 @@ operand loads, and once staging got cheaper the operand-load fix that had been
 worth 10% became worth under 1% (§6.2). An issue-slot count tells you what the
 slots are spent on; it does not tell you which spend is on the critical path.
 
-What the measurement says now is that the kernel is short of neither arithmetic
-slots nor bandwidth. At 3.06 TFLOP/s a 2048-cube GEMM takes 5.6ms and moves about
-0.8 GB, roughly 145 GB/s against a 371 GB/s part. Three candidates remain, in the
-order we would try them:
+Two of the three candidates that account produced are now done, and the ordering it
+gave them was again wrong: the prologue and epilogue it ranked first were worth 2%,
+and vector staging it ranked second was worth 20%.
 
-1. **The prologue and epilogue.** Every dot still stages a zero accumulator into
-   threadgroup memory and reads its result back per lane through the tile, and the
-   per-lane block loops that do it spread over the innermost dimension only. For a
-   64x128 tile that is a lot of badly-distributed work either side of a contraction
-   loop that is itself only ~128 steps.
-2. **Vector (`float4`) staging.** Staging in runs amortised the address
-   arithmetic; each element is still its own device load. A real vector load needs
-   an affine analysis of the staging subgraph — which is small and closed
-   (`tt.make_range`, `tt.splat`, `arith.muli`, `arith.addi`, `tt.addptr`) — plus a
-   runtime check that the innermost stride is 1.
-3. **Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
-   would halve staging traffic again; its f32 accumulator alone is 64KB, twice the
-   budget. The route is an epilogue that streams register fragments out in panels
-   instead of through one full-size tile — much the largest of the three.
+At 4.66 TFLOP/s a 2048-cube GEMM takes 3.7ms, and at the 64x64 tile that now wins
+its 1024 programs read 1 MiB of operands each — about 1.1 GB through the memory
+system, roughly **290 GB/s against a 371 GB/s part**, where the same calculation
+gave 145 GB/s at the end of round 1. (Some of that is L2 rather than DRAM, so it is
+an upper bound.) At ~75% of the measured 6.2 TFLOP/s compute peak and that close to
+the bandwidth wall, what is left to buy is arithmetic intensity, not latency. What
+we would try next:
+
+1. **Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
+   halves the operand traffic of the 64x64 one that now wins, and that traffic is
+   now the binding constraint; its f32 accumulator alone is 64KB, twice the budget.
+   The route is an epilogue that streams register fragments out in panels instead
+   of through one full-size tile. Untried — the target was reached without it, and
+   it remains much the largest of the three.
+2. **Vector staging for the A tile as well.** Only B is vectorised at the winning
+   shape: a run of four columns of a 64x16 A tile would leave three quarters of the
+   threadgroup idle, and forcing it measures 3069 against 4223 GFLOP/s. The fix is a
+   staging distribution that lets a narrow tile hand out runs of four without
+   idling threads, not a longer run.
+3. **Specialising the run mask away.** The vector guard re-checks the mask at the
+   run's last column every K step; when `BLOCK_N` divides `N` it is statically true.
 
 None of the three is a layout redesign, and two of them are local to `emitDot`.
 
@@ -601,10 +658,11 @@ without kernel-level annotation.
 
 Two results deserve restating plainly. The numerics are good: fast math off,
 `precise::` where Metal has it, and a softmax that agrees with a CPU reference to
-about one ULP. The performance is now adequate rather than good: ~50% of MPS on a
-GEMM, which clears the >50% milestone and falls short of the 60–80% band, with the
-remaining gap traced to the epilogue, scalar staging loads and the accumulator's
-occupancy of threadgroup memory rather than to the arithmetic.
+about one ULP. The performance is now good rather than adequate: 76% of MPS on
+a GEMM, inside the band published Triton reaches against cuBLAS on its own target,
+with the remaining third traced to latency and issue slots — not to bandwidth, not
+to arithmetic, and not to any of the three things the previous round predicted in
+the order it predicted them.
 What stands between this and being *used*, though, is not a research problem — it
 is pinning a Triton release, and then the two named blockers on the way to
 FlashAttention-2 forward.

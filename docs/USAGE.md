@@ -868,48 +868,50 @@ that fetch operand fragments are in `multiplyAccumulate` (~line 1508), inside th
 
 ### 3–5. The matmul performance gap
 
-The kernel reaches ~50% of `MPSMatrixMultiplication` at 1024, 2048 and 4096 square
-(3.06 TFLOP/s f32 at 2048 on an M1 Max; 1.69 TFLOP/s on an M1 Pro), up from ~33%.
-That clears the >50% milestone; the 60–80% band is still open. The per-change
+The kernel reaches 76% of `MPSMatrixMultiplication` at 1024, 2048 and 4096
+square (4.66 TFLOP/s f32 at 2048 on an M1 Max; 2.33 TFLOP/s on an M1 Pro), up from
+~33% at the first working version. That clears the >50% milestone and lands inside
+the 62–82% band published Triton reaches on its own target. The per-change
 attribution — and, more usefully, the two CUDA-playbook techniques that did *not*
-transfer to Apple silicon — is in
+transfer to Apple silicon, plus the one with no CUDA analogue that beat both — is in
 [ARCHITECTURE.md §Matmul throughput](ARCHITECTURE.md#matmul-throughput).
 
 What landed, all local to `emitDot` and its helpers: register blocking of the
 output fragments, accumulators resident in simdgroup registers across the whole K
 loop, the accumulator's tile doubling as the arena its operand tiles stage into
 (which is what lets a 64x128 block shape exist at all), staging in runs of
-consecutive columns, and compile-time staging trip counts.
+consecutive columns, compile-time staging trip counts, a zero accumulator that
+never enters threadgroup memory, a 2-D-distributed epilogue, a wave-to-fragment
+mapping that lets every wave of a simdgroup share one B fragment (+15%), and
+`float4` staging runs behind a runtime contiguity check (+20%), and two fragment
+rows per simdgroup where the blocking score ties (+8%).
 
 What is left, in the order to try it:
 
-**A. The prologue and epilogue.** Every dot still stages a zero accumulator into
-threadgroup memory and reads its result back per lane through the tile, and the
-per-lane block loops that do it spread over the innermost dimension only. For a
-64x128 tile that is a lot of poorly-distributed work either side of a loop that is
-itself only ~128 steps. Fixing the elementwise nest to spread over both dimensions
-(§Hard parts 6 in ARCHITECTURE.md) helps here and everywhere else.
-
-**B. Vector (`float4`) staging.** Staging in runs amortised the *address
-arithmetic*, but each element is still its own device load. A real `float4` load
-needs the emitter to prove a run is contiguous. The staging subgraph is small and
-closed — `tt.make_range`, `tt.splat`, `arith.muli`, `arith.addi`, `tt.addptr` —
-so an affine analysis giving each value its derivative with respect to the column
-index is tractable; the fast path then needs a runtime check that the derivative
-is 1 and that the run is inside the mask, with the existing scalar loop as the
-fallback. Note the precedent: spreading staging over both tile dimensions was
-worth **~4.7x** on this kernel, and staging in runs was worth another 10%, so
-staging is a proven place to look.
-
-**C. Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
+**A. Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
 would halve staging traffic again, and its f32 accumulator alone is 64KB — twice
 the whole budget. The only route is an epilogue that streams register fragments
 out in panels instead of through one full-size tile, which means giving the
-epilogue its own loop over panels. Much the largest of the three.
+epilogue its own loop over panels. Much the largest of the three, and untried: the
+throughput target was reached without it.
+
+**B. Vector staging for narrow tiles.** A tile is only vectorised when a run of
+four columns leaves no thread idle. At the winning `64x64x16` on 8 simdgroups both
+operand tiles clear that bar; at `64x128x16` on 16 the `64x16` A tile does not and
+stages scalar. Forcing runs of four there measures 3069 GFLOP/s against 4223 — the
+occupancy loss dwarfs the vector win. What is needed is a staging distribution that
+lets a *narrow* tile hand out runs of four without idling threads (one thread
+taking several rows), not a longer run.
+
+**C. Specialising the run mask away.** The vector fast path re-checks the mask at
+the run's last column on every K step. When `BLOCK_N` divides `N` — which the
+launcher knows and the emitter does not — it is statically true, and so is most of
+the masking in the scalar path behind it.
 
 Measure with `swift run -c release tmbench` (works without Xcode), or
 `TM_BENCH=1 swift test --filter MatmulBenchmark`. `tmbench --sweep full` sweeps
 block shapes, `num_warps`, register blocking, tile padding and double buffering;
+`tmbench --config 64,128,16,16,0,0,0,-1,0,0` turns vector staging off;
 `tmbench --config 64,128,16,16` pins one configuration, which is how a change
 should be attributed — one axis at a time. `tmbench --emit 64,64,16,16` prints the
 kernel. Ignore the 512 row when judging a change: that GEMM is under a millisecond

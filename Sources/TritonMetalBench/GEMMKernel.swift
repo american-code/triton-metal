@@ -19,9 +19,14 @@ public enum GEMMKernel {
     ///
     /// The f16 form loads half operands and accumulates in f32 — the shape that
     /// matters for ML — and truncates on the way out.
-    public static func tutorial(blockM: Int, blockN: Int, blockK: Int, element: String = "f32")
-        -> String
-    {
+    /// `seed` is the accumulator's initial value. Triton always writes `0.0`, and
+    /// the emitter has a fast path for exactly that (the fragments start zero in
+    /// registers instead of being staged through the tile); the parameter exists
+    /// so the slow path stays covered.
+    public static func tutorial(
+        blockM: Int, blockN: Int, blockK: Int, element: String = "f32",
+        seed: String = "0.000000e+00"
+    ) -> String {
         let isHalf = element == "f16"
         let store = isHalf
             ? """
@@ -36,7 +41,7 @@ public enum GEMMKernel {
                   %arg0: !tt.ptr<\(element)>, %arg1: !tt.ptr<\(element)>, %arg2: !tt.ptr<\(element)>,
                   %arg3: i32, %arg4: i32, %arg5: i32,
                   %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32, %arg10: i32, %arg11: i32) {
-                %cst = arith.constant dense<0.000000e+00> : tensor<\(blockM)x\(blockN)xf32>
+                %cst = arith.constant dense<\(seed)> : tensor<\(blockM)x\(blockN)xf32>
                 %cone = arith.constant dense<1.000000e+00> : tensor<\(blockM)x\(blockN)xf32>
                 %zeroA = arith.constant dense<0.000000e+00> : tensor<\(blockM)x\(blockK)x\(element)>
                 %zeroB = arith.constant dense<0.000000e+00> : tensor<\(blockK)x\(blockN)x\(element)>

@@ -84,14 +84,16 @@ final class DotTests: XCTestCase {
         // The padding lanes take a zero without evaluating any pointer arithmetic.
         XCTAssertTrue(source.contains("float tm_staged = 0.0f;  // 8x8 fragment padding"), source)
         XCTAssertTrue(source.contains("if (tm_i0 < 12u && tm_i2 < 12u) {"), source)
-        // 2x3 fragments over 4 simdgroups, one fragment per simdgroup per wave —
-        // the smallest blocking, which is what measures fastest on Apple silicon.
+        // 2x3 fragments over 4 simdgroups: two rows of fragments per simdgroup and
+        // one column, which is the blocking that measures fastest on Apple silicon
+        // — the shared column is what lets the step's three loads (two A, one B)
+        // feed two multiply-accumulates.
         XCTAssertTrue(
             source.contains(
-                "// tt.dot accumulator: 2x3 blocks of 1x1 fragments over 4 simdgroups, 2 waves"),
+                "// tt.dot accumulator: 1x3 blocks of 2x1 fragments over 4 simdgroups"),
             source)
         XCTAssertTrue(source.contains("// tt.dot: 2 contraction steps, each 2 "
-            + "multiply-accumulates off 4 operand loads"), source)
+            + "multiply-accumulates off 3 operand loads"), source)
     }
 
     func testStagingIsFencedByBarriersOnBothSides() throws {
@@ -107,17 +109,36 @@ final class DotTests: XCTestCase {
     }
 
     /// The accumulator is the one tensor that survives the K loop, and it lives in
-    /// threadgroup memory rather than in per-lane registers.
+    /// threadgroup memory rather than in per-lane registers — but a `dense<0.0>`
+    /// seed never passes *through* that memory: the fragments are born zero in
+    /// registers, so the prologue is empty and the tile is only written at the end.
     func testAccumulatorLivesInThreadgroupMemoryAcrossTheLoop() throws {
         let source = try MetalCompiler.emitMSL(
             ttir: DotFixtures.tutorial(blockM: 32, blockN: 32, blockK: 16), options: .init())
         XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[1024];  // 32x32"), source)
         let loop = try XCTUnwrap(source.range(of: "for (int varg12 ="))
         let prologue = String(source[source.startIndex..<loop.lowerBound])
-        XCTAssertTrue(prologue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] = vcst;"), prologue)
+        XCTAssertFalse(prologue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] = vcst;"), prologue)
+        XCTAssertTrue(
+            prologue.contains(
+                "simdgroup_float8x8 tm_dot_c0_r_0_0_0 = "
+                    + "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"), prologue)
         // Read back per lane after the loop, by indexing the tile.
         let epilogue = String(source[loop.upperBound...])
-        XCTAssertTrue(epilogue.contains("float v51 = tm_dot_c0[tm_i0 * 32u + tm_i1] * vcone;"), epilogue)
+        XCTAssertTrue(epilogue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] * vcone;"), epilogue)
+    }
+
+    /// A non-zero seed still has to be staged in and loaded, because the value has
+    /// to reach the fragments somehow.
+    func testNonZeroAccumulatorSeedIsStillStagedThroughTheTile() throws {
+        let source = try MetalCompiler.emitMSL(
+            ttir: DotFixtures.tutorial(blockM: 32, blockN: 32, blockK: 16, seed: "1.000000e+00"),
+            options: .init())
+        let loop = try XCTUnwrap(source.range(of: "for (int varg12 ="))
+        let prologue = String(source[source.startIndex..<loop.lowerBound])
+        XCTAssertTrue(prologue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] = vcst;"), prologue)
+        XCTAssertTrue(prologue.contains("simdgroup_load(tm_dot_c0_r_"), prologue)
+        XCTAssertFalse(prologue.contains("make_filled_simdgroup_matrix"), prologue)
     }
 
     /// ...but it does not make a round trip through that memory on every K step:
@@ -133,20 +154,60 @@ final class DotTests: XCTestCase {
         let body = String(source[loop.upperBound..<close.lowerBound])
         let epilogue = String(source[close.lowerBound...])
 
-        // 8x8 fragments over 16 simdgroups, one each per wave: four accumulator
-        // registers, loaded before the loop and stored after it.
+        // 8x8 fragments over 16 simdgroups in 2x1 blocks: two waves of two
+        // accumulator registers, zero-filled before the loop and stored after it.
         XCTAssertTrue(
             prologue.contains(
-                "// tt.dot accumulator: 8x8 blocks of 1x1 fragments over 16 simdgroups, 4 waves"),
+                "// tt.dot accumulator: 4x8 blocks of 2x1 fragments over 16 simdgroups, 2 waves"),
             prologue)
-        XCTAssertEqual(occurrences(of: "simdgroup_load(tm_dot_c0_r_", in: prologue), 4)
+        XCTAssertEqual(occurrences(of: "make_filled_simdgroup_matrix", in: prologue), 4)
+        XCTAssertEqual(occurrences(of: "simdgroup_load(tm_dot_c0_r_", in: prologue), 0)
         XCTAssertEqual(occurrences(of: "simdgroup_store(tm_dot_c0_r_", in: epilogue), 4)
 
         // Nothing touches the accumulator tile inside the loop.
         XCTAssertEqual(occurrences(of: "simdgroup_load(tm_dot_c0_r_", in: body), 0)
         XCTAssertEqual(occurrences(of: "simdgroup_store(", in: body), 0)
         XCTAssertEqual(occurrences(of: "simdgroup_multiply_accumulate(", in: body), 4)
-        XCTAssertEqual(occurrences(of: "simdgroup_load(", in: body), 8)
+        // Four A fragments and *one* B fragment feed those four: both waves of a
+        // simdgroup sit in the same column of the block grid, and a 2x1 block is
+        // one column wide, so the B fragment is loaded once rather than per wave.
+        XCTAssertEqual(occurrences(of: "simdgroup_load(", in: body), 5)
+        XCTAssertEqual(occurrences(of: "simdgroup_load(tm_b0_", in: body), 1)
+    }
+
+    /// A run of four consecutive columns is one vector load when the addresses
+    /// turn out to be contiguous, aligned and inside the mask — and the scalar
+    /// run is still there for when they are not, because all three facts are
+    /// about the kernel's arguments rather than its shape.
+    func testStagingRunsAreReadWithOneVectorLoadWhenTheyCan() throws {
+        let source = try MetalCompiler.emitMSL(
+            ttir: DotFixtures.tutorial(blockM: 64, blockN: 128, blockK: 16),
+            options: .init(numSimdgroups: 16))
+        // The stride check names the kernel's own `stride_bn` argument, which the
+        // affine walk over the staging subgraph identified as the column stride.
+        XCTAssertTrue(
+            source.contains(
+                "tm_dot_b2_vok = tm_dot_b2_vok && (1 * v26) == 1 && "
+                    + "(((uintptr_t)tm_dot_b2_vbase & 15u) == 0u);"), source)
+        XCTAssertTrue(
+            source.contains(
+                "float4 tm_dot_b2_vec = *(device const float4 *)(tm_dot_b2_vbase);"), source)
+        XCTAssertTrue(
+            source.contains("tm_dot_b2[tm_i2 * 128u + tm_i1_run + 3u] = tm_dot_b2_vec[3u];"),
+            source)
+        // Both paths are emitted, and the scalar one still does its own masking.
+        XCTAssertTrue(source.contains("float v73 = v72 ? *varg15 : vzeroB;"), source)
+
+        // The mask is checked at the run's *last* column only, which is sound
+        // because it is monotone in the column index.
+        XCTAssertTrue(source.contains("uint tm_i1 = tm_i1_run + 3u;"), source)
+
+        // Off by request, nothing of it survives.
+        let scalar = try MetalCompiler.emitMSL(
+            ttir: DotFixtures.tutorial(blockM: 64, blockN: 128, blockK: 16),
+            options: .init(numSimdgroups: 16, dotVectorStaging: false))
+        XCTAssertFalse(scalar.contains("float4 tm_dot_b2_vec"), scalar)
+        XCTAssertFalse(scalar.contains("uintptr_t"), scalar)
     }
 
     /// The register blocking is a knob the autotuner sweeps, so an explicit
@@ -159,8 +220,10 @@ final class DotTests: XCTestCase {
         XCTAssertTrue(
             source.contains("// tt.dot accumulator: 2x4 blocks of 4x2 fragments over 4 simdgroups"),
             source)
+        // 12 operand loads spelled out, 10 issued: the two waves share a column of
+        // the block grid and therefore their two B fragments.
         XCTAssertTrue(source.contains("// tt.dot: 4 contraction steps, each 16 "
-            + "multiply-accumulates off 12 operand loads"), source)
+            + "multiply-accumulates off 10 operand loads"), source)
     }
 
     /// A register-resident accumulator's tile is dead for exactly as long as the
@@ -176,12 +239,13 @@ final class DotTests: XCTestCase {
         XCTAssertTrue(source.contains("threadgroup float *tm_dot_b2 = tm_dot_c0 + 4096;"), source)
         XCTAssertEqual(occurrences(of: "threadgroup float tm_dot", in: source), 1)
 
-        // The sharing is only safe because a barrier separates the last read of
-        // the accumulator tile (into registers) from the first write of the
-        // operand tiles over the top of it.
-        let load = try XCTUnwrap(source.range(of: "simdgroup_load(tm_dot_c0_r_"))
-        let stage = try XCTUnwrap(source.range(of: "// tt.dot: stage A"))
-        let between = String(source[load.upperBound..<stage.lowerBound])
+        // The sharing is only safe because a barrier separates the operand tiles'
+        // last read from the accumulator's write back over the top of them. (In
+        // the other direction there is nothing to order: a zero accumulator is
+        // never in the tile in the first place.)
+        let arithmetic = try XCTUnwrap(source.range(of: "simdgroup_multiply_accumulate"))
+        let store = try XCTUnwrap(source.range(of: "simdgroup_store(tm_dot_c0_r_"))
+        let between = String(source[arithmetic.upperBound..<store.lowerBound])
         XCTAssertTrue(between.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"), between)
     }
 
@@ -239,6 +303,71 @@ final class DotTests: XCTestCase {
         }
     }
 
+    /// The vector staging path decides *at runtime* whether a run of four columns
+    /// is contiguous, aligned and unmasked, so the cases that matter are the ones
+    /// where it is not: row strides that put every other row out of alignment,
+    /// and block shapes whose tiles are padded out to whole fragments (which is
+    /// where the fast path must not so much as form an address).
+    func testVectorStagingFallsBackOnAwkwardStridesAndPaddedTiles() throws {
+        try skipWithoutMetal()
+        for (m, n, k, blockM, blockN, blockK, lda, ldb) in [
+            (70, 36, 40, 128, 36, 20, 40, 36),  // padded tiles: 36 -> 40, 20 -> 24
+            (33, 40, 27, 32, 40, 20, 30, 43),  // rows misaligned for a float4 read
+            (64, 64, 64, 32, 64, 32, 65, 67),  // odd strides, unpadded tiles
+        ] {
+            let a = matrix(m * lda, seed: 5)
+            let b = matrix(k * ldb, seed: 7)
+            let run = try GPU.run(
+                ir: DotFixtures.tutorial(blockM: blockM, blockN: blockN, blockK: blockK),
+                grid: (GPU.cdiv(m, blockM), GPU.cdiv(n, blockN), 1),
+                args: [
+                    .floats(a), .floats(b), .output(count: m * n),
+                    .int32(Int32(m)), .int32(Int32(n)), .int32(Int32(k)),
+                    .int32(Int32(lda)), .int32(1),  // stride_am, stride_ak
+                    .int32(Int32(ldb)), .int32(1),  // stride_bk, stride_bn
+                    .int32(Int32(n)), .int32(1),  // stride_cm, stride_cn
+                ])
+            assertClose(
+                GPU.read(run.outputs[0], Float.self, m * n),
+                reference(a, b, m: m, n: n, k: k, lda: lda, ldb: ldb),
+                tolerance: 1e-5,
+                "\(m)x\(n)x\(k) BLOCK=\(blockM)x\(blockN)x\(blockK) lda=\(lda) ldb=\(ldb)")
+        }
+    }
+
+    /// ...and the case the runtime check exists for: a *non-unit* innermost
+    /// stride, where a run of four columns is four strided elements and the
+    /// vector path must not be taken at all.
+    func testVectorStagingRefusesANonUnitInnermostStride() throws {
+        try skipWithoutMetal()
+        let (m, n, k) = (40, 40, 40)
+        let (columnStride, lda, ldb) = (3, 40 * 3, 40 * 3)
+        let a = matrix(m * lda, seed: 5)
+        let b = matrix(k * ldb, seed: 7)
+        var expected = [Float](repeating: 0, count: m * n)
+        for row in 0..<m {
+            for step in 0..<k {
+                let left = a[row * lda + step * columnStride]
+                for column in 0..<n {
+                    expected[row * n + column] += left * b[step * ldb + column * columnStride]
+                }
+            }
+        }
+        let run = try GPU.run(
+            ir: DotFixtures.tutorial(blockM: 32, blockN: 40, blockK: 20),
+            grid: (GPU.cdiv(m, 32), GPU.cdiv(n, 40), 1),
+            args: [
+                .floats(a), .floats(b), .output(count: m * n),
+                .int32(Int32(m)), .int32(Int32(n)), .int32(Int32(k)),
+                .int32(Int32(lda)), .int32(Int32(columnStride)),  // stride_am, stride_ak
+                .int32(Int32(ldb)), .int32(Int32(columnStride)),  // stride_bk, stride_bn
+                .int32(Int32(n)), .int32(1),  // stride_cm, stride_cn
+            ])
+        assertClose(
+            GPU.read(run.outputs[0], Float.self, m * n), expected, tolerance: 1e-5,
+            "\(m)x\(n)x\(k) with an innermost stride of \(columnStride)")
+    }
+
     /// f16 operands accumulated in f32 — the shape that matters for ML, and the
     /// one that makes the emitter mix `simdgroup_half8x8` with a float
     /// accumulator fragment.
@@ -256,9 +385,14 @@ final class DotTests: XCTestCase {
         XCTAssertTrue(
             source.contains(
                 "threadgroup half *tm_dot_b2 = (threadgroup half *)(tm_dot_c0 + 512);"), source)
-        // Half operand fragments feeding a float accumulator, 2x2 per simdgroup.
-        XCTAssertTrue(source.contains("simdgroup_half8x8 tm_a0_0_0, tm_b0_0_0;"), source)
-        XCTAssertTrue(source.contains("simdgroup_float8x8 tm_dot_c0_r_0_0_0;"), source)
+        // Half operand fragments feeding a float accumulator: a 2x1 block, so two
+        // A fragments and the one B fragment they share.
+        XCTAssertTrue(
+            source.contains("simdgroup_half8x8 tm_a0_0_0, tm_a0_0_1, tm_b0_0_0;"), source)
+        XCTAssertTrue(
+            source.contains(
+                "simdgroup_float8x8 tm_dot_c0_r_0_0_0 = "
+                    + "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"), source)
 
         let (m, n, k) = (70, 66, 34)
         let a = (0..<(m * k)).map { Float16(Float($0 % 11) * 0.125 - 0.5) }

@@ -82,20 +82,23 @@ neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` among them)
   Xcode tools needed); `xcrun metal` for offline `.metallib` bytes. Never xcodebuild.
 - **Runtime**: handle-based C ABI — `tm_compile_msl`, `tm_load_kernel`,
   `tm_alloc_buffer`, `tm_launch`, with `tm_last_error` for diagnostics.
-- **Performance**: the matmul tutorial reaches **~50% of `MPSMatrixMultiplication`**
-  at 1024, 2048 and 4096 square — 3.06 TFLOP/s f32 at 2048 on an **M1 Max**, 1.69
-  TFLOP/s on an **M1 Pro** — up from ~33%, which clears the >50% milestone and
-  falls short of the 60–80% band. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-  §Matmul throughput has the per-machine numbers, what each optimisation was
-  worth measured one at a time, and the two CUDA-playbook techniques (double
-  buffering, and register blocking past 1x1) that did **not** transfer to Apple
-  silicon. Sweep it yourself with `swift run -c release tmbench`, which needs no
-  Xcode.
-- **Tests**: 127 Swift cases (parser, emitter, layout, casts/math, control flow,
+- **Performance**: the matmul tutorial reaches **76% of
+  `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square — 4.66 TFLOP/s f32 at
+  2048 on an **M1 Max**, 2.33 TFLOP/s on an **M1 Pro** — up from ~33% at the first
+  working version, which clears the >50% milestone and lands inside the 62–82% band
+  published Triton reaches against cuBLAS on its own target.
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Matmul throughput has the
+  per-machine numbers, what each optimisation was worth measured one at a time, the
+  two CUDA-playbook techniques (double buffering, and register blocking past 1x1)
+  that did **not** transfer to Apple silicon, and the one with no CUDA analogue —
+  a wave-to-fragment mapping that makes every wave of a simdgroup share its B
+  fragment — that was worth more than either. Sweep it yourself with
+  `swift run -c release tmbench`, which needs no Xcode.
+- **Tests**: 131 Swift cases (parser, emitter, layout, casts/math, control flow,
   rank-2, reductions, `tt.dot`, error paths, and GPU runs verified against CPU
   references on an M1 Pro) + 14 Python cases including vector-add and softmax
-  round trips, plus an opt-in MPS benchmark. 83.43% region / 85.58% function /
-  90.32% line coverage of the Swift core — see
+  round trips, plus an opt-in MPS benchmark. 83.49% region / 85.99% function /
+  91.01% line coverage of the Swift core — see
   [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the breakdown and for
   what the uncovered fraction is made of.
 
