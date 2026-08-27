@@ -197,10 +197,14 @@ public final class MetalPipeline {
     ///
     /// Worth hoisting out of a loop whenever the tensors do not change between
     /// launches — an SAE's dictionary and bias are fixed for every batch it ever
-    /// encodes. `MTLDevice.makeBuffer(bytesNoCopy:length:)` has to wire the pages
-    /// it is handed, so its cost grows with the buffer, and re-binding a 4 MB
-    /// weight matrix on every launch is measurably worse than binding it once
-    /// (docs/USAGE.md §Dispatch overhead has the numbers).
+    /// encodes.
+    ///
+    /// The saving is not the binding call. `asMTLBuffer` costs about 3 µs and is
+    /// flat in the size of the array (measured from 4 KB to 16 MB). It is that a
+    /// command buffer charges more for a resource it has not seen before than for
+    /// one it has: same kernel, same grid, same arrays, fresh `MTLBuffer` objects
+    /// against reused ones, +40 µs for four 16 KB buffers and +195 µs for three
+    /// 4 MB ones on an M1 Max. docs/USAGE.md §Dispatch overhead has the table.
     ///
     /// Holding one keeps its arrays alive, which is the point: a `bytesNoCopy`
     /// buffer does not own its memory.
