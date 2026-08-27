@@ -2,7 +2,10 @@
 
 *2026-08-27 (three optimisation rounds plus the backward pass). Local numbers from
 tmbench on a Mac Studio M1 Max (measured peaks 6.2 TF fp32 / 371.5 GB/s) and a
-MacBook M1 Pro (3.45 TF / 166.4 GB/s), each side timed twice per size with the
+MacBook M1 Pro (3.45 TF / 166.4 GB/s) — both peaks measured on those machines by
+metalscope's `calibrate`, not read off a spec sheet, which is why the
+of-measured-peak column is a fraction of something reachable rather than of the
+10.4 TF the M1 Max is advertised at. Each side is timed twice per size with the
 faster taken; CUDA numbers cited. The comparison is efficiency fractions against
 each platform's vendor library.*
 
@@ -120,8 +123,8 @@ hierarchy would move the crossover, plausibly in the fused kernel's favour if
 DRAM traffic becomes relatively more expensive, or against it if the composite's
 score matrix starts fitting in cache. [ARCHITECTURE.md](ARCHITECTURE.md)
 §Attention throughput has the M1 Pro numbers, the run-to-run variance on the
-composite side, and a note that a better-written composite (metalscope measured
-~744 GF for the same shape on an M1 Pro) would narrow the `s512` margin.
+composite side, and a note that a better-written composite (metalscope measures
+716.6 GF for the same shape on an M1 Pro) would narrow the `s512` margin.
 
 ## Attention backward: the same comparison, one step harder
 

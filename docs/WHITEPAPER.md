@@ -168,7 +168,9 @@ nothing, present only because Triton's backend discovery imports a Python module
 computed in the core and read out as JSON, so nothing about the lowered kernel is
 reimplemented on the Python side. The backend is therefore callable from Swift,
 from C, or from any language with an FFI, and the Python dependency is confined to
-the frontend.
+the frontend. The heading is an architectural claim and not a performance one: the
+measured worth of removing the interpreter from a dispatch is 3–18%, and the
+paragraph after next gives the numbers.
 
 **A Swift-native frontend, which the CUDA path cannot offer.** Because the
 compiler is a Swift library rather than a Python extension, the Python frontend
@@ -177,12 +179,15 @@ and the launcher a Python object. `TritonMetalMLX` — a separate target and
 product, so the core acquires no dependency — takes Triton IR and runs the
 emitted kernel directly on [MLX](https://github.com/ml-explore/mlx-swift)
 tensors, checking each argument's dtype against the kernel's own emitted
-metadata. An `MLXArray` reaches a kernel with **no copy at all**: its storage came
-from MLX's Metal allocator, so `makeBuffer(bytesNoCopy:)` returns the array's own
-address and the kernel's stores land in the array — verified by writing through
-the buffer and reading back through MLX at every size down to 12 bytes, rather
-than inferred from pointer equality, which Foundation's 14-byte inline-`Data`
-threshold makes unreliable at exactly the sizes where it would matter. The
+metadata. A contiguous `MLXArray` reaches a kernel with **no copy at all**: its
+storage came from MLX's Metal allocator, so `makeBuffer(bytesNoCopy:)` returns the
+array's own address and the kernel's stores land in the array — verified by writing
+through the buffer and reading back through MLX at every size down to 12 bytes,
+rather than inferred from pointer equality, which Foundation's 14-byte
+inline-`Data` threshold makes unreliable at exactly the sizes where it would
+matter. A strided or broadcast array is the one case that copies, because there is
+no contiguous run of bytes for a kernel to address, and the binding reports which
+it did rather than leaving the caller to guess. The
 demonstration is an interpretability op rather than a toy: a sparse-autoencoder
 encoder, `relu(x @ W_enc + b_enc)`, fused into one kernel and agreeing with MLX's
 own ops to a worst relative error of 8.3e-07 over shapes ragged in all three
@@ -235,7 +240,7 @@ built by someone with a Mac and a Swift toolchain first. Every performance numbe
 inversion above is **single-generation**, M1 Max and M1 Pro. And Triton-on-CUDA is
 simply more mature: a ttgir layout system, a conformance suite this project has
 not yet ported a subset of, per-architecture pipelining, and a vendor library this
-backend still trails by roughly a third on GEMM. The claim is that the
+backend still trails by roughly a quarter on GEMM. The claim is that the
 portable-kernel moat is crossable, and that a Triton attention layer now trains on
 a Mac — not that the crossing is finished.
 
@@ -842,9 +847,10 @@ Two caveats we would rather state than have found. The composite's `s512` readin
 move a lot run to run — 478, 513 and 588 GF in one M1 Pro session — because 24
 small dispatches are mostly submission overhead, so read those ratios as "clearly
 ahead" rather than as a number. And ours is not the only possible composite:
-metalscope's bench measured MPS-composite SDPA at ~744 GF on an M1 Pro for the same
-shape, faster than the 513–588 GF we measure, so a better-written composite exists
-and the `s512` margin against *it* would be nearer 1.2x than 1.7x.
+metalscope's bench measures MPS-composite SDPA at 716.6 GF on an M1 Pro for the same
+shape — median of five repeats, and it publishes the spread — faster than the
+513–588 GF we measure, so a better-written composite exists and the `s512` margin
+against *it* would be nearer 1.2x than 1.7x.
 
 ### 7.2c Attention backward throughput
 

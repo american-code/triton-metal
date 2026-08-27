@@ -94,7 +94,7 @@ cd /path/to/triton-metal
 python python/examples/vector_add.py
 python python/examples/fused_softmax.py
 python python/examples/matmul.py
-PYTHONPATH=python python -m pytest python/tests -q    # 21 cases once Triton is present
+PYTHONPATH=python python -m pytest python/tests -q    # 23 cases once Triton is present
 ```
 
 Two caveats worth knowing before you start:
@@ -496,7 +496,10 @@ Everything above allocates its own `MTLBuffer`s and fills them by hand, which is
 the right shape for a compiler test and the wrong shape for doing work. The
 `TritonMetalMLX` target is the other end: a Triton kernel launched directly on
 [MLX](https://github.com/ml-explore/mlx-swift) tensors, from Swift, with no
-Python involved at any point.
+Python involved at any point. What that is worth in *latency* is measured under
+§Dispatch overhead below and it is 3–18%; what it is worth unconditionally is that
+a contiguous `MLXArray` becomes a kernel argument without a copy, which a `numpy`
+array cannot.
 
 It is a separate target and a separate product from `TritonMetalCore`, and the
 dependency arrow only points one way — linking `tritonmetal` still drags nothing
@@ -1275,7 +1278,9 @@ the cost of one more `BLOCK_M x BLOCK_N` tile.
 
 The kernel reaches 76% of `MPSMatrixMultiplication` at 1024, 2048 and 4096
 square on an M1 Max (4.64 TFLOP/s f32 at 2048) and 75% at 1024 and 2048 on an M1
-Pro (2.43 TFLOP/s), up from ~33% at the first working version. That is inside the
+Pro (2.43 TFLOP/s), with both sides timed twice at each size and the faster taken —
+MPS included, since it is the denominator — up from ~33% at the first working
+version. That is inside the
 62–82% band published Triton reaches end-to-end on its own target, and below the
 80–100% band it reaches on GEMM specifically. In absolute terms it is 75% of the
 machine's measured f32 peak against MPS's 99%. The per-change attribution — and,

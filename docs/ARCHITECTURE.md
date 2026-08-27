@@ -48,7 +48,8 @@ includes the AMD dialect, and `examples/plugins` hard-codes
 only their *runtime* dependencies can be skipped. The prebuilt LLVM does exist for
 this platform (`llvm-1f126a6d-macos-arm64`), which is what makes the build short.
 
-`setup.py bdist_wheel` produces
+`setup.py bdist_wheel` on a checkout that has not been staged by
+`Tools/bundle-wheel.sh` produces
 `triton-3.7.1+gitf797708c-cp311-cp311-macosx_26_0_arm64.whl`, **69.4 MB**, whose
 `entry_points.txt` carries `metal = triton.backends.metal` next to `amd` and
 `nvidia`, and which contains `triton/backends/metal/{compiler,driver}.py`.
@@ -809,8 +810,9 @@ TritonMetalCore ───┤
 `TritonMetalMLX` and `tmsae` only and the arrow points one way: linking
 `tritonmetal` drags nothing in behind it, and `swift build --product tritonmetal`
 does not compile the MLX C++ core at all. The tests are a separate bundle for the
-same reason — the core's 191 cases must keep running on a machine with no
-`mlx.metallib`, and must not acquire an MLX dependency by association. The
+same reason — the core's 191 of the suite's 228 cases must keep running on a
+machine with no `mlx.metallib`, and must not acquire an MLX dependency by
+association. The
 structure mirrors `MCCLMLX` in mccl, which drew the same line for the same reason.
 
 ### The seam
@@ -1206,10 +1208,10 @@ Two caveats on the composite side. Its readings move a lot run to run at `s512` 
 the same M1 Pro configuration read 478, 513 and 588 GF in one session — because
 24 small dispatches are mostly submission overhead, so treat the `s512` ratios as
 "clearly ahead" rather than as a number. And this composite is not the only one
-possible: metalscope's bench measured MPS-composite SDPA at ~744 GF on an M1 Pro
-for `b1 h8 s512 d64`, which is faster than the 513–588 GF measured here for the
-same shape, so a better-written composite exists and the `s512` margin against it
-would be nearer 1.2x than 1.7x.
+possible: metalscope's bench measures MPS-composite SDPA at 716.6 GF on an M1 Pro
+for `b1 h8 s512 d64` — the median of five repeats, spread 745.5–751.7 µs — which is
+faster than the 513–588 GF measured here for the same shape, so a better-written
+composite exists and the `s512` margin against it would be nearer 1.2x than 1.7x.
 
 ### What the kernel is spending its time on
 
@@ -1274,7 +1276,7 @@ GPU work, median of three after a warm-up, best configuration per shape out of
 
 **The crossover is earlier than the forward's**, and that is what the extra
 recomputation buys the composite. The forward crosses near `s1024` on an M1 Max
-(106% there); the backward is already at 69% by `s1024` and 47% at `s2048`. Two
+(107% there); the backward is already at 69% by `s1024` and 47% at `s2048`. Two
 reasons, in the order they matter: the fused side runs seven GEMMs' worth of
 arithmetic against the composite's five, so at large `S` — where the composite's
 GEMMs reach MPS's own peak and the score-matrix traffic stops deciding — it is

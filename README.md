@@ -5,7 +5,8 @@ with a **Swift core** and a deliberately thin Python shim.
 
 Triton is how the ecosystem writes custom fused kernels (FlashAttention variants, MoE
 routing, quantization kernels) without hand-rolling CUDA — and Triton targets only
-CUDA/ROCm, which is CUDA's single biggest portable-code moat. This backend runs that
+CUDA/ROCm, which is one of the more durable pieces of CUDA's portable-code moat.
+This backend runs that
 same research code unmodified on hardware a team already owns: real `@triton.jit`
 through the pinned Triton 3.7.1, exact results, no patch to Triton — with the matmul
 tutorial at **75–76% of Apple's own `MPSMatrixMultiplication`** on two machines,
@@ -105,12 +106,14 @@ let h = try encoder(activations, dictionary, bias)
 ```
 
 `TritonMetalMLX` is a separate target and product, so the core stays
-dependency-free. An `MLXArray` is handed to a kernel with **no copy** — its
-storage came from MLX's own Metal allocator, so `makeBuffer(bytesNoCopy:)`
-returns the array's own address and the kernel's stores land in the array, at
-every size down to 12 bytes (proved by writing through the buffer and reading
-back through MLX, not by comparing pointers). A `numpy` array on the Python path
-cannot avoid that copy: 141–216 µs at `[64, 512] @ [512, 2048]`.
+dependency-free. A **contiguous** `MLXArray` is handed to a kernel with **no
+copy** — its storage came from MLX's own Metal allocator, so
+`makeBuffer(bytesNoCopy:)` returns the array's own address and the kernel's stores
+land in the array, at every size down to 12 bytes (proved by writing through the
+buffer and reading back through MLX, not by comparing pointers). A strided or
+broadcast array has no contiguous run of bytes to hand a kernel, so that one
+copies, and says so: `MLXBinding.mode` reports `.copied`. A `numpy` array on the
+Python path cannot avoid the copy at all: 141–216 µs at `[64, 512] @ [512, 2048]`.
 
 The latency difference is smaller and is stated as measured rather than as a
 slogan. With arguments already bound, the same kernel from byte-identical IR
@@ -234,9 +237,9 @@ finite differences of the forward as well as against an analytic reference.
   rather than a second spelling of `f16` — neither converts to the other directly.
 - **Tests**: 228 Swift cases (parser, emitter, layout, casts/math, control flow,
   rank-2, reductions, `tt.dot`, atomics, FlashAttention-2 forward *and* backward,
-  axis cloning, error paths, and GPU runs verified against CPU references — plus
-  37 for the MLX frontend, in their own bundle so the core's suite keeps running
-  on a machine with no `mlx.metallib`) + 16
+  axis cloning, error paths, and GPU runs verified against CPU references — of
+  which 37 are the MLX frontend's, in their own bundle so the core's other 191 keep
+  running on a machine with no `mlx.metallib`) + 16
   Python cases including vector-add and softmax round trips, plus 7 more that drive
   **real** `@triton.jit` kernels — including a forward+backward gradient check —
   and skip with an actionable message when Triton is not installed, plus opt-in MPS
