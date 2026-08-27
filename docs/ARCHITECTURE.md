@@ -21,7 +21,7 @@ assumed.
 
 Triton publishes **no macOS wheel**: `pip install triton` fails on macOS arm64 at
 resolution. The backend is therefore reached by building Triton from source with
-this repository passed as an out-of-tree plugin. On lab-02 (M1 Max, 10 cores,
+this repository passed as an out-of-tree plugin. On studio-b (M1 Max, 10 cores,
 Command Line Tools only — no Xcode) that is **≈9 minutes** and needs no CUDA
 toolchain:
 
@@ -632,12 +632,12 @@ The matmul tutorial kernel, lowered by this backend, against
 sample is ~25ms of GPU work, so submission overhead is not most of what either
 side is measured doing; median of three samples after a warm-up.
 
-Two machines, because the ratio depends on both. **lab-02** is a Mac Studio
+Two machines, because the ratio depends on both. **studio-b** is a Mac Studio
 **M1 Max** (measured peaks 6.2 TFLOP/s f32, 371.5 GB/s) and is the machine to
 believe: it has no Xcode, which is why `tmbench` exists at all. The **M1 Pro** is
 a laptop and its MPS readings move with its thermal state.
 
-### Apple M1 Max (lab-02)
+### Apple M1 Max (studio-b)
 
 | size | best configuration | round 1 | round 2 | MPS | round 1 | round 2 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -679,7 +679,7 @@ Reproduce with `.build/release/tmbench --sweep full`, or
 
 ### What each change was worth
 
-Measured one at a time on lab-02 at 2048, each on top of the one before it, by
+Measured one at a time on studio-b at 2048, each on top of the one before it, by
 pinning a configuration with `tmbench --config`.
 
 | change | GFLOP/s | delta |
@@ -750,7 +750,7 @@ None of these defaults should be assumed correct on M2, M3 or M4 silicon until
 
 **Double buffering is still a wash, re-measured.** With two operand buffers a
 contraction step stages into the half the previous step is not reading, so the
-trailing barrier can go and the staging need not wait on the arithmetic. On lab-02
+trailing barrier can go and the staging need not wait on the arithmetic. On studio-b
 at 2048 this measured 2863 GFLOP/s against 2900 without it — inside the noise, and
 if anything negative. Re-measured twice in the second round: after the mapping
 change, 3633 against 3627, still inside the noise; after vector staging, **3205
@@ -861,7 +861,7 @@ warm-up. FLOPs are counted the way attention papers count them, `4 * S^2 * D` pe
 head, and the softmax is not counted on either side. Best configuration per shape
 out of `tmbench --attn`.
 
-### Apple M1 Max (lab-02)
+### Apple M1 Max (studio-b)
 
 | shape | best config | fused | MPS composite | ratio |
 | --- | --- | --- | --- | --- |
