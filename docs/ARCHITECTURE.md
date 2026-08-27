@@ -10,11 +10,119 @@ project. Any new functionality goes in the Swift core and gets a `tm_*` export.
 
 ## Compatibility
 
-Triton's backend plugin interface has churned across releases. First real task:
-pin a Triton release (whatever ships with current PyTorch), vendor its
-`BaseBackend`/`GPUDriver` signatures into the stubs, and add a CI check against
-that pin. Everything below assumes the ~3.x layout (`triton.backends` discovery,
-stage-dict compiler, driver with `load_binary`/`launch`).
+**Pinned: `triton-lang/triton` v3.7.1** (commit `f797708c`), the release
+`pytorch/pytorch` release/2.12 and release/2.13 pin in `.ci/docker/triton_version.txt`
+(main is on 3.8.0, which has no tag yet). Everything below — the stage dict, the
+vendored `BaseBackend`/`DriverBase` signatures in `python/plugin/backend/`, the
+launcher's argument order — is that tag's interface, read off the tag rather than
+assumed.
+
+### Building it
+
+Triton publishes **no macOS wheel**: `pip install triton` fails on macOS arm64 at
+resolution. The backend is therefore reached by building Triton from source with
+this repository passed as an out-of-tree plugin. On lab-02 (M1 Max, 10 cores,
+Command Line Tools only — no Xcode) that is **≈9 minutes** and needs no CUDA
+toolchain:
+
+```
+git clone https://github.com/triton-lang/triton.git && cd triton && git checkout v3.7.1
+export TRITON_PLUGIN_DIRS=/path/to/triton-metal/python/plugin
+export TRITON_BUILD_PROTON=OFF          # no CUPTI / roctracer
+export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
+export TRITON_PTXAS_PATH=/nonexistent   # ... and the other six TRITON_CUDA*/CUPTI vars:
+                                        # download_and_copy() skips a download whose
+                                        # destination variable is already set, which keeps
+                                        # ~1 GB of Linux CUDA redistributables out of a
+                                        # macOS build (setup.py maps Darwin -> "linux")
+pip install -e .                        # or: python setup.py bdist_wheel
+```
+
+**No patch to Triton is required.** Two things were tried and are worth recording
+as dead ends: building with `TRITON_CODEGEN_BACKENDS=""` (plugin only, no NVIDIA
+or AMD) fails, because 3.7.1's *core* sources include the in-tree backends'
+tablegen'd headers — `lib/Conversion/TritonInstrumentToLLVM/InstrumentationToLLVM.cpp`
+includes `nvidia/include/Dialect/NVGPU/IR/Dialect.h.inc`, `python/src/gluon_ir.cc`
+includes the AMD dialect, and `examples/plugins` hard-codes
+`TritonNVIDIAGPUConversionPassIncGen`. The NVIDIA and AMD backends must be built;
+only their *runtime* dependencies can be skipped. The prebuilt LLVM does exist for
+this platform (`llvm-1f126a6d-macos-arm64`), which is what makes the build short.
+
+`setup.py bdist_wheel` produces
+`triton-3.7.1+gitf797708c-cp311-cp311-macosx_26_0_arm64.whl`, **69.4 MB**, whose
+`entry_points.txt` carries `metal = triton.backends.metal` next to `amd` and
+`nvidia`, and which contains `triton/backends/metal/{compiler,driver}.py`.
+
+### How the plugin attaches
+
+`TRITON_PLUGIN_DIRS` is a semicolon-separated list of directories; each must
+contain `backend/name.conf` (the backend name — ours says `metal`),
+`backend/compiler.py` and `backend/driver.py`, plus a `CMakeLists.txt`, because
+the plugin is also a CMake subproject. That last part is not optional: CMake joins
+the plugin names into `TRITON_BACKENDS_TUPLE`, and `python/src/main.cc` expands
+that tuple into one `void init_triton_<name>(pybind11::module &&)` **declaration
+and call** per backend. A plugin that provides no such symbol does not link. So
+`python/plugin/metal.cc` exists and is the entire C++ surface of this project:
+a registration stub that reports `linked()`. Everything else is Swift.
+
+Discovery at import time is by entry point (`triton.backends` group), which
+`setup.py` generates from the same list; `triton/backends/__init__.py` then
+imports `<pkg>.compiler` and `<pkg>.driver` and requires **exactly one** concrete
+`BaseBackend` and one concrete `DriverBase` in each.
+
+### What the adapter does and does not do
+
+| Piece | 3.7.1 expects | Ours |
+| --- | --- | --- |
+| stages | ordered dict `ext -> f(module, metadata)`, last returns `bytes` | `ttir` (Triton's own passes) then `msl` (`tm_emit_msl` + `tm_kernel_info`) |
+| `binary_ext` | names the cached payload | `msl` — Metal compiles from source in-process (`MTLDevice.makeLibrary(source:)`); `xcrun metal` is absent from Command Line Tools, so there are no offline `.metallib` bytes to cache |
+| driver base | `GPUDriver` | `DriverBase` — `GPUDriver.__init__` reaches straight into `torch.cuda` |
+| target | `GPUTarget(backend, arch, warp_size)` | `("metal", <device name>, 32)`; a simdgroup is 32 lanes |
+| launcher | `launcher_cls(src, metadata)`, called as `(gx, gy, gz, stream, function, packed_metadata, launch_metadata, enter_hook, exit_hook, *args)` | marshals to `tm_launch`; the kind/index table comes from `tm_kernel_info`, computed in Swift |
+| tensors | any object with `data_ptr()` and `dtype` (`python/src/specialize.cc`) | `triton_metal.buffer.MetalBuffer` over `tm_alloc_buffer`; a CPU torch tensor is **copied** in, since `makeBuffer(bytesNoCopy:)` needs page-aligned memory |
+
+There is no `ttgir` stage: Triton's TritonGPU passes lower toward LLVM with a
+target profile this backend does not have, and the Swift emitter does its own
+layout inference from `ttir` (§Execution model). That is a deliberate fork point,
+not an omission — it is also why `num_warps` reaches the emitter as a simdgroup
+count rather than through a `ttg` encoding.
+
+### What real Triton IR looked like, versus the fixtures
+
+The fixtures in `Tests/` were hand-written from Triton's documentation. Real
+3.7.1 output differs in exactly two ways, one cosmetic and one that mattered:
+
+1. **Locations everywhere.** Triton's `MLIRModule.__str__` prints with debug info
+   on, so the module is bracketed by `#loc` alias definitions *before and after*
+   it, every operation carries a trailing `loc(#locN)`, and — the part the parser
+   had not seen — every function argument does too:
+   `%x_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc("x_ptr"(#loc))`.
+   The parser already skipped trailing locations on operations, module and
+   function; it now skips them on function arguments as well (`Parser.swift`,
+   one call to `skipTrailingLocation`). That was the only parse failure in the
+   entire exercise.
+2. **Named SSA values.** Real output is `%pid`, `%offsets_1`, `%accumulator_31`,
+   not `%0`, `%1`, `%arg0`. The lexer already accepted those; nothing keys on
+   argument *names*, only positions, so nothing broke.
+
+Two *emitter* gaps did show up, both in the matmul tutorial, and both are cases
+where Triton's canonicalizer rewrites a source-level `ptrs += BLOCK_K * stride`
+into a shape the `tt.dot` pointer-advance check had not anticipated:
+
+* the advance folded into a **dense splat constant** (`dense<16> : tensor<64x16xi32>`)
+  rather than a `tt.splat` — uniform by construction, now accepted;
+* the advance recomputed **inside** the loop body as a scalar product of
+  loop-invariant operands (`arith.muli %stride_bk, %c16_i32` then `tt.splat`) —
+  now folded into an inline uniform expression (`uniformExpression` in
+  `MSLEmitter.swift`), which also covers `+ - * / % << >>` over such operands.
+
+One real constraint survives, and the matmul tutorial hits it: the emitter
+identifies a block axis **by its extent**, so `BLOCK_M == BLOCK_N` (or either
+equal to `BLOCK_K`) makes a row index indistinguishable from a column index. The
+kernel is refused by name and line rather than mis-compiled. Pairwise-distinct
+block sizes work: `(128, 64, 32)` runs and matches numpy; `(64, 64, 32)` is
+rejected. Lifting this means carrying axis identity independently of extent
+through `LayoutInference` — the next real piece of work in the layout model.
 
 ## Lowering pipeline
 

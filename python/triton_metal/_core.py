@@ -7,6 +7,7 @@ RuntimeError carrying `tm_last_error`. Nothing is computed on this side.
 
 import ctypes
 import os
+import struct
 from pathlib import Path
 
 _SEARCH = [
@@ -180,6 +181,12 @@ def free_buffer(handle: int) -> None:
 ARG_BUFFER = 0
 ARG_I32 = 1
 ARG_F32 = 2
+
+
+def float_bits(value: float) -> int:
+    """`f32` scalars travel in the low 32 bits of a `values[i]` slot (see the
+    `tm_launch` table in docs/ARCHITECTURE.md)."""
+    return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
 def launch(kernel, grid, threads_per_threadgroup, kinds, values) -> None:

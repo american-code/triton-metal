@@ -12,12 +12,14 @@ import ctypes
 import json
 import math
 import platform
+from pathlib import Path
 
 import pytest
 
-from triton_metal import _core, backend
-from triton_metal.compiler import MetalBackend, MetalOptions
-from triton_metal.driver import MetalDriver
+from triton_metal import _core
+from triton_metal.buffer import MetalBuffer
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1] / "plugin"
 
 VECTOR_ADD_TTIR = """
 module {
@@ -95,24 +97,24 @@ requires_metal = pytest.mark.skipif(
 # --- Shim shape -------------------------------------------------------------
 
 
-def test_backend_module_exposes_compiler_and_driver():
-    assert backend.compiler is MetalBackend
-    assert backend.driver is MetalDriver
-
-
-def test_stage_chain_is_complete():
-    stages = {}
-    MetalBackend().add_stages(stages, MetalOptions())
-    assert list(stages) == ["ttir", "ttgir", "msl", "metallib"]
+def test_plugin_directory_is_what_triton_discovers():
+    """`TRITON_PLUGIN_DIRS` points at `python/plugin`; Triton's setup.py asserts
+    `backend/compiler.py` and `backend/driver.py` exist and reads the backend's
+    name out of `backend/name.conf` (Triton 3.7.1, setup.py:BackendInstaller)."""
+    assert (PLUGIN_DIR / "backend" / "name.conf").read_text().strip() == "metal"
+    assert (PLUGIN_DIR / "backend" / "compiler.py").exists()
+    assert (PLUGIN_DIR / "backend" / "driver.py").exists()
+    # Triton's main.cc expands the backend name into `init_triton_metal`.
+    assert "void init_triton_metal(" in (PLUGIN_DIR / "metal.cc").read_text()
 
 
 def test_core_version_round_trips_through_c_abi():
     assert _core.version() == "0.0.1"
 
 
-def test_driver_is_active_on_apple_silicon_mac():
+def test_core_is_active_on_apple_silicon_mac():
     expected = platform.system() == "Darwin" and platform.machine() == "arm64"
-    assert MetalDriver.is_active() == expected
+    assert bool(_core.is_active()) == expected
 
 
 # --- Compiler bridge --------------------------------------------------------
@@ -269,14 +271,40 @@ def test_buffer_contents_exposes_unified_memory():
 
 
 @requires_metal
-def test_driver_load_binary_delegates_to_the_core():
-    library = MetalBackend()._make_metallib(_core.emit_msl(VECTOR_ADD_TTIR, 4), {})
-    kernel = MetalDriver().load_binary("add_kernel", library, 0, None)
+def test_load_binary_path_delegates_to_the_core():
+    """What `MetalUtils.load_binary` does when Triton hands it the compiled
+    payload: MSL source bytes -> library -> compute pipeline."""
+    library = _core.compile_msl(_core.emit_msl(VECTOR_ADD_TTIR, 4))
+    kernel = _core.load_kernel(library, "add_kernel")
     try:
         assert kernel != 0
+        assert _core.kernel_max_threads(kernel) >= 32
     finally:
         _core.release_kernel(kernel)
         _core.release_library(library)
+
+
+@requires_metal
+def test_metal_buffer_exposes_data_ptr_for_triton():
+    """Triton decides an argument is a pointer by looking for `data_ptr`
+    (`triton/python/src/specialize.cc`), and specializes on 16-byte alignment."""
+    live_before = _core.live_handle_count()
+    buffer = MetalBuffer((4, 8), "float32")
+    try:
+        assert buffer.nbytes == 4 * 8 * 4
+        assert buffer.data_ptr() % 16 == 0
+        assert str(buffer.dtype) == "float32"
+        source = array.array("f", [1.5] * 32)
+        buffer.copy_from(source.buffer_info()[0])
+        assert buffer.tolist()[:3] == [1.5, 1.5, 1.5]
+    finally:
+        buffer.free()
+    assert _core.live_handle_count() == live_before
+
+
+def test_metal_buffer_rejects_a_dtype_the_emitter_has_no_type_for():
+    with pytest.raises(TypeError, match="unsupported dtype"):
+        MetalBuffer(4, "float64")
 
 
 def test_invalid_handles_raise_with_the_core_message():

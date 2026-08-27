@@ -26,6 +26,10 @@ Sources/TritonMetalCore/   Swift: MSL emission, metallib compilation, Metal runt
                            kernel launch — exported as tm_* symbols in libtritonmetal.dylib
 python/triton_metal/       ctypes shim only. Exists because Triton's backend discovery
                            imports a Python module; contains no logic and never will.
+python/plugin/             What Triton's TRITON_PLUGIN_DIRS points at: the vendored
+                           BaseBackend/DriverBase adapters, plus metal.cc — a ~10-line
+                           registration stub, the entire C++ surface of the project,
+                           required because Triton's main.cc calls init_triton_metal().
 ```
 
 Rebuilding Triton's Python frontend itself is the one dependency that justifies the shim.
@@ -33,21 +37,45 @@ Rebuilding Triton's Python frontend itself is the one dependency that justifies 
 ## Pipeline
 
 ```
-@triton.jit  →  ttir  →  ttgir (Triton's own passes)  →  MSL  →  metallib
-                                    │                     └────────┴─ Swift core
-                                    └─ Metal target profile: 32-wide simdgroups
+@triton.jit  →  ttir  →  MSL  →  MTLLibrary  →  compute pipeline  →  dispatch
+     │           │        └──────────┴──────────────┴───────────────────┴─ Swift core
+     │           └─ Triton's own passes (inliner, canonicalizer, CSE, loop unroll)
+     └─ Triton's own frontend, from the pinned release
 ```
+
+Note what is *not* there: no `ttgir`. Triton's TritonGPU passes lower toward LLVM
+with a target profile Metal does not have, so the Swift core does its own layout
+inference straight from `ttir` — see
+[docs/ARCHITECTURE.md §Compatibility](docs/ARCHITECTURE.md#compatibility).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the lowering plan and the known
 hard parts (barrier semantics, layout conversions, spilling a loop-carried tensor).
 
 ## Status
 
+**Plugged into real Triton.** `import triton`, `@triton.jit`, `kernel[grid](...)`
+— Triton 3.7.1's own frontend and MLIR passes, this backend, a Mac GPU. The
+[vector-add](python/examples/vector_add.py), [fused-softmax](python/examples/fused_softmax.py)
+and [matmul](python/examples/matmul.py) tutorials are run as **Python source**, not
+as pre-baked IR, and checked against numpy on an M1 Max:
+
+```
+triton 3.7.1 on Apple M1 Max
+vector add, n=98432:              max |triton - numpy| = 0
+fused softmax, (1823, 781):       max |triton - numpy| = 1.49012e-08
+matmul 256x256x256 (tl.dot):      max |triton - numpy| = 0
+```
+
+Triton ships no macOS wheel, so this means building Triton from source with
+`TRITON_PLUGIN_DIRS` pointing at `python/plugin/` — about **9 minutes**, no CUDA
+toolchain, no Xcode, no patch to Triton. Recipe:
+[docs/USAGE.md §Building Triton with the Metal backend](docs/USAGE.md#building-triton-with-the-metal-backend).
+
 **Working end-to-end spine, with real kernels on it.** Triton IR text -> MSL ->
 `MTLLibrary` -> compute pipeline -> unified-memory buffers -> dispatch -> results,
-driven either from Swift or from Python over the `tm_*` C ABI. Triton's fused
-**softmax**, **matmul** and **FlashAttention-2 forward** kernels all run on the
-GPU and match CPU references — at f32 and at f16-in/f32-accumulate, at sizes that
+driven from Swift, from Python over the `tm_*` C ABI, or now from Triton itself.
+Triton's fused **softmax**, **matmul** and **FlashAttention-2 forward** kernels all
+run on the GPU and match CPU references — at f32 and at f16-in/f32-accumulate, at sizes that
 divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
 `h2 s127 d64` among them), and, for attention, on scores large enough that a naive
 `exp` overflows.
@@ -121,16 +149,21 @@ divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
   was worth 3.9x. Sweep it with `swift run -c release tmbench --attn`.
 - **Tests**: 144 Swift cases (parser, emitter, layout, casts/math, control flow,
   rank-2, reductions, `tt.dot`, FlashAttention-2, error paths, and GPU runs
-  verified against CPU references on an M1 Pro) + 14 Python cases including
-  vector-add and softmax round trips, plus opt-in MPS benchmarks. 84.49% region /
+  verified against CPU references on an M1 Pro) + 15 Python cases including
+  vector-add and softmax round trips, plus 6 more that drive **real** `@triton.jit`
+  kernels and skip with an actionable message when Triton is not installed, plus
+  opt-in MPS benchmarks. 84.49% region /
   85.77% function / 91.24% line coverage of the Swift core — see
   [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the breakdown and for
   what the uncovered fraction is made of.
 
 Not yet: `tt.atomic_*`, the FlashAttention-2 **backward** pass (which needs them),
-`bf16`, and block pointers. Not yet pinned to a Triton release — now the most
-important open task, because it gates the plugin being *loadable* rather than
-merely correct.
+`bf16`, and block pointers. Two narrower gaps the Triton integration exposed, both
+now documented precisely rather than hypothesised: a kernel whose block sizes are
+not **pairwise distinct** is refused (the emitter identifies a block axis by its
+extent — `BLOCK_M == BLOCK_N` reads as a diagonal), and a kernel argument must be
+backed by Metal memory (`MetalBuffer`), since a CPU torch tensor's allocation is
+not an `MTLBuffer` and cannot be wrapped without a copy.
 [docs/USAGE.md §Implementing what's missing](docs/USAGE.md#implementing-whats-missing)
 has concrete starting points for each of these.
 
@@ -139,6 +172,13 @@ has concrete starting points for each of these.
 ```
 swift build && swift test
 cd python && PYTHONPATH=. python3 -m pytest tests/ -q
+```
+
+To run the `@triton.jit` tutorials you also need Triton built against this plugin
+(≈9 minutes, once) — [docs/USAGE.md §Building Triton with the Metal backend](docs/USAGE.md#building-triton-with-the-metal-backend):
+
+```
+python python/examples/vector_add.py
 ```
 
 Never `xcodebuild`. GEMM throughput against MPS:

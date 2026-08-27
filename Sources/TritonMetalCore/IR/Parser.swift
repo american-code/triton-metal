@@ -174,6 +174,9 @@ public struct TritonIRParser {
                 if peek().isPunct("{") {
                     _ = try parseAttrDict()
                 }
+                // Real Triton output names its arguments:
+                // `%x_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32} loc("x_ptr"(#loc))`.
+                try skipTrailingLocation()
                 arguments.append(
                     FunctionArgument(name: argName, type: type, index: arguments.count, loc: argLoc))
             } while consume(punct: ",")

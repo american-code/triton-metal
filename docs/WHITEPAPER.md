@@ -26,8 +26,8 @@ Swift, exposed as a C ABI; the Python package is a ctypes shim with no logic in
 it, present only because Triton's backend discovery imports a Python module.
 
 The evaluation is deliberately unflattering where the results are. The test suite
-is 144 Swift cases and 14 Python cases, at ~84% region / ~86% function / ~91%
-line coverage of the Swift core. The lowered matmul reaches **76% of
+is 144 Swift cases and 21 Python cases (15 of which need no Triton install), at
+~84% region / ~86% function / ~91% line coverage of the Swift core. The lowered matmul reaches **76% of
 `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.66
 TFLOP/s f32 at 2048), and 69–82% on an M1 Pro depending on its thermal state — up
 from ~33% at the first working version, which clears both the >50% milestone and
@@ -45,8 +45,14 @@ a loop-carried tensor was one of them, and it was the smaller half: the layout
 model also had to stop assuming that a kernel's tensors share one loop nest, and
 axis assignment had to become unification rather than seeding, because
 FlashAttention's two `tt.dot`s share their axes crosswise and no fixed
-(M, N, fresh-K) assignment can describe that. The backward pass, `tt.atomic_*`
-and the Triton release this backend should be pinned to all remain open.
+(M, N, fresh-K) assignment can describe that.
+
+The backend is now **pinned to Triton v3.7.1 and driven by it**: real
+`@triton.jit` source, Triton's own frontend and MLIR passes, this backend, a Mac
+GPU (§7.1). Real IR cost the parser one line and the emitter two small
+generalisations, which is the most useful thing that section reports — the gap
+between IR written from documentation and IR a release actually prints is small
+but not empty. The backward pass and `tt.atomic_*` remain open.
 
 ---
 
@@ -107,7 +113,8 @@ implemented, which is why fused custom kernels exist at all.
 **Other Triton backend efforts.** Triton's plugin interface has attracted
 out-of-tree backends for other accelerators and for CPU. Their common lesson,
 taken seriously here, is that the interface churns between releases and that
-pinning is not optional (§7).
+pinning is not optional; this backend is pinned to v3.7.1 and vendors that tag's
+signatures (§7.1).
 
 ---
 
@@ -348,8 +355,8 @@ the code that looks like it does the arithmetic.
 
 ## 5. Test strategy
 
-131 Swift cases across ten suites (one, the benchmark, is opt-in and skipped by
-default), plus 14 Python cases. Everything that can run on the real GPU does.
+144 Swift cases across ten suites (one, the benchmark, is opt-in and skipped by
+default), plus 21 Python cases. Everything that can run on the real GPU does.
 
 | Suite | Cases | What it covers |
 | --- | --- | --- |
@@ -364,10 +371,14 @@ default), plus 14 Python cases. Everything that can run on the real GPU does.
 | `CABITests` | 18 | the whole spine through `tm_*` only, plus NULL-argument handling, handle validity, copy bounds, metallib loading, f32 launch arguments, and leak checks via `tm_live_handle_count` |
 | `MatmulBenchmark` | 1 | opt-in (`TM_BENCH=1`); measures a machine, not a contract |
 
-The Python suite's 14 cases assert the shim's *shape* (stage chain, backend
-exports, driver delegation) and run vector-add and softmax round trips over the
+The Python suite splits in two. Fifteen cases assert the shim's *shape* (the
+plugin directory Triton discovers, the registration symbol its `main.cc` calls,
+buffer alignment and dtypes) and run vector-add and softmax round trips over the
 C ABI — moving bytes and comparing numbers, while every compile, allocation and
-launch happens inside the dylib.
+launch happens inside the dylib. Six more drive **real** `@triton.jit` kernels
+through the pinned Triton and skip, with an actionable message, on any machine
+that has not built it (§7.1) — so the suite states the dependency without
+acquiring it.
 
 Two strategy choices are worth stating. Sizes divide *nothing*: `129x257x65`
 divides neither a block dimension nor the 8x8 fragment, softmax rows are 100
@@ -649,6 +660,51 @@ None of the three is a layout redesign, and two of them are local to `emitDot`.
 ---
 
 ## 7. Limitations and future work
+
+### 7.1 The Triton pin, and what real IR cost
+
+Until this milestone the backend consumed Triton IR *text* and was tested against
+fixtures written from Triton's documentation. It is now pinned to **v3.7.1** — the
+release `pytorch/pytorch` release/2.12 pins — and driven by Triton itself: the
+vector-add, fused-softmax and matmul tutorials run as Python source and match
+numpy on an M1 Max.
+
+Two practical findings, both about the distance between an interface you read and
+an interface you run.
+
+*The build is the barrier, and it is smaller than it looks.* Triton publishes no
+macOS wheel, so a plugin backend on a Mac means building Triton from source. That
+sounds like the expensive part and is not: the prebuilt `macos-arm64` LLVM Triton's
+CI publishes exists, and the whole build is ~9 minutes on an M1 Max with **no
+patch to Triton**. The one thing that does not work is the obvious economy —
+building *only* the plugin backend. 3.7.1's core sources include the in-tree NVIDIA
+and AMD dialects' tablegen'd headers (`InstrumentationToLLVM.cpp`, `gluon_ir.cc`),
+so a `TRITON_CODEGEN_BACKENDS=""` build does not compile. Skipping their runtime
+downloads is fine; skipping the backends is not. Also non-obvious: a plugin must
+supply a C++ `init_triton_<name>` symbol, because Triton's `main.cc` expands the
+backend-name tuple into declarations and calls. Ten lines of C++ are unavoidable
+for a backend that is otherwise entirely Swift.
+
+*Real IR differs from documented IR in small, specific ways.* Triton prints with
+debug info enabled, so every operation, the module, the function **and every
+function argument** carry a trailing `loc(...)`, and SSA values are named after
+the Python variables that produced them (`%offsets_1`, not `%3`). Only the
+argument locations were unhandled: one call to `skipTrailingLocation` in the
+parser, and the entire fixture corpus was otherwise accurate. The emitter needed
+two generalisations, both from the same source-level line —
+`ptrs += BLOCK_K * stride` inside a `tt.dot` loop — which the canonicalizer
+rewrites into shapes the pointer-advance check had not anticipated: a dense splat
+constant, and a scalar product recomputed inside the loop from loop-invariant
+operands. Neither is exotic; both were invisible without a real release.
+
+What the tutorials also did was confirm a limitation §3.3 predicted from the other
+direction: because a block axis is identified by its *extent*, `BLOCK_M == BLOCK_N`
+makes a row index and a column index indistinguishable, and the matmul tutorial is
+refused at those sizes rather than mis-compiled. `(128, 64, 32)` runs; `(64, 64, 32)`
+does not. Carrying axis identity independently of extent is now the highest-value
+correctness item in the layout model.
+
+### 7.2 FlashAttention-2, and what it took
 
 **FlashAttention-2 forward now runs**, and what it took is the most transferable
 result in this paper, because what it took was not what we had written down.

@@ -9,7 +9,8 @@ and [WHITEPAPER.md](WHITEPAPER.md).
 
 **Contents**
 
-1. [Building](#building)
+1. [Building](#building) — including
+   [Triton with the Metal backend](#building-triton-with-the-metal-backend)
 2. [The Swift API](#the-swift-api)
 3. [The emitted MSL](#the-emitted-msl)
 4. [A second kernel: softmax](#a-second-kernel-softmax)
@@ -25,8 +26,8 @@ and [WHITEPAPER.md](WHITEPAPER.md).
 
 ```
 swift build                                     # builds .build/debug/libtritonmetal.dylib
-swift test                                      # 122 cases, on the real GPU where relevant
-cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 14 cases; needs the dylib above
+swift test                                      # 144 cases, on the real GPU where relevant
+cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 15 cases; needs the dylib above
 ```
 
 `swift build -c release` puts the dylib in `.build/release/`. **Never
@@ -35,6 +36,61 @@ cd python && PYTHONPATH=. python3 -m pytest tests/ -q   # 14 cases; needs the dy
 Requirements: macOS 14+, an Apple-silicon Metal device. Nothing else — the
 primary compile path is `MTLDevice.makeLibrary(source:)`, which needs no Xcode
 command-line tools.
+
+### Building Triton with the Metal backend
+
+Everything above works without Triton. To run actual `@triton.jit` kernels you
+need Triton itself, and **there is no macOS wheel** — `pip install triton` fails
+on macOS arm64. Triton has to be built from source, with this repository handed to
+it as an out-of-tree plugin. It is less painful than it sounds: the prebuilt
+`macos-arm64` LLVM that Triton's CI publishes is downloaded automatically, and the
+whole build is **about 9 minutes** on an M1 Max with 10 cores (allow ~25 on a
+4-performance-core laptop). No Xcode, no CUDA toolchain, no patch to Triton.
+
+```
+# 1. This repo's dylib and shim.
+swift build -c release
+pip install -e python/                       # the ctypes shim, `triton_metal`
+
+# 2. Triton, pinned, with the plugin.
+git clone https://github.com/triton-lang/triton.git
+cd triton && git checkout v3.7.1
+pip install cmake ninja wheel setuptools pybind11
+
+export TRITON_PLUGIN_DIRS=/abs/path/to/triton-metal/python/plugin
+export TRITON_BUILD_PROTON=OFF
+export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
+# Skip the CUDA redistributables: setup.py maps Darwin -> "linux" downloads, and
+# download_and_copy() short-circuits when the destination variable is already set.
+for v in PTXAS CUOBJDUMP NVDISASM CUDACRT CUDART; do export TRITON_${v}_PATH=/nonexistent; done
+export TRITON_CUPTI_INCLUDE_PATH=/nonexistent TRITON_CUPTI_LIB_PATH=/nonexistent
+
+pip install -e .                             # or `python setup.py bdist_wheel` for a wheel
+```
+
+Python 3.10+ is required (3.11 is what this was built and tested on; macOS's
+system 3.9 is too old). Then:
+
+```
+cd /path/to/triton-metal
+python python/examples/vector_add.py
+python python/examples/fused_softmax.py
+python python/examples/matmul.py
+PYTHONPATH=python python -m pytest python/tests -q    # 21 cases once Triton is present
+```
+
+Two caveats worth knowing before you start:
+
+* The NVIDIA and AMD in-tree backends **are** built, and cannot be turned off:
+  3.7.1's core sources include their tablegen'd headers. Only their runtime
+  downloads are skipped. This costs build time, nothing else — neither driver is
+  active on a Mac, so `triton.runtime.driver.active` resolves to Metal.
+* `python setup.py bdist_wheel` yields
+  `triton-3.7.1+gitf797708c-cp311-cp311-macosx_26_0_arm64.whl` (69.4 MB) with
+  `metal = triton.backends.metal` in its entry points. It is a normal wheel: it
+  can be installed on another Mac with the same Python minor version, but it does
+  **not** contain `libtritonmetal.dylib` — the shim finds that through
+  `TRITON_METAL_CORE_LIB` or a repo-relative `swift build` output.
 
 ---
 
@@ -615,44 +671,62 @@ lists; `ARG_BUFFER`, `ARG_I32`, `ARG_F32` mirror the table above.
 
 ### The plugin surface
 
-Three modules make up what Triton's backend discovery expects to import:
+`python/plugin/` is what `TRITON_PLUGIN_DIRS` points at. Triton reads the backend
+name out of `backend/name.conf`, links `backend/` in as `triton.backends.metal`,
+and builds the directory as a CMake subproject:
 
-| Module | What it is |
+| File | What it is |
 | --- | --- |
-| `backend.py` | The entry point. Exposes `compiler = MetalBackend` and `driver = MetalDriver` — seven lines, no logic. |
-| `compiler.py` | `MetalBackend.add_stages(stages, options)` fills a stage dict: `ttir`, `ttgir`, `msl`, `metallib`. `binary_ext = "metallib"`. `supports_target` matches `target.backend == "metal"`. |
-| `driver.py` | `MetalDriver.is_active()`, `get_current_target()`, `load_binary(name, library, shared, device)`. |
+| `backend/name.conf` | The single word `metal`. Read by both `setup.py` and `CMakeLists.txt`. |
+| `backend/compiler.py` | `MetalBackend(BaseBackend)` for the pinned release: `add_stages` fills `ttir` (Triton's own passes) then `msl` (`tm_emit_msl` + `tm_kernel_info`); `binary_ext = "msl"`; `supports_target` matches `target.backend == "metal"`. |
+| `backend/driver.py` | `MetalDriver(DriverBase)`, `MetalUtils.load_binary` (MSL bytes -> `MTLLibrary` -> pipeline), `MetalLauncher` (marshals to `tm_launch`), and a wall-clock `do_bench`. |
+| `metal.cc` | Ten lines of C++ defining `init_triton_metal`, which Triton's `main.cc` declares and calls for every backend name. Without it libtriton does not link. |
+| `CMakeLists.txt` | Registers that one file as a Triton plugin object. |
 
-The Metal-specific stages are one-liners:
+The Metal-specific stage is a one-liner over the Swift core:
 
 ```python
-stages["msl"] = lambda mod, metadata: _core.emit_msl(mod, options.num_simdgroups)
-stages["metallib"] = self._make_metallib      # -> _core.compile_msl(src)
+stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
+# make_msl: ttir = str(mod); tm_kernel_info(ttir) -> launch metadata;
+#           tm_emit_msl(ttir) -> MSL source bytes.
 ```
 
-The `ttir` and `ttgir` stages deliberately `raise NotImplementedError`. They are
-**Triton's** MLIR passes, which run inside Triton's compiled pass pipeline, not
-in Python — this backend has no business reimplementing canonicalization. What
-belongs here is the Metal target profile handed to the TritonGPU passes:
-warp size 32 (== simdgroup size, conveniently), no cross-threadgroup barrier,
-threadgroup memory in place of CUDA shared memory.
-
-**This is not yet pinned to a Triton release, and it must be.** Triton's plugin
-interface has churned across 3.x, so the stage-dict signature, the `GPUTarget`
-shape and `load_binary`'s argument list are all written against the *approximate*
-3.x layout rather than a version whose signatures were read off a tag. Until that
-pin lands, treat the three modules above as an interface sketch that compiles and
-tests green against the Swift core, not as a plugin you can drop into a PyTorch
-install. See [Implementing what's missing](#implementing-whats-missing) for the
-task.
+The `ttir` stage is **Triton's** MLIR pass pipeline, run in Triton's compiled pass
+manager — this backend has no business reimplementing canonicalization. There is
+no `ttgir` stage at all; see
+[ARCHITECTURE.md §Compatibility](ARCHITECTURE.md#compatibility) for why that fork
+point is deliberate.
 
 **The language policy is a hard rule.** The shim exists only because Triton's
 discovery imports a Python module. Any new functionality goes in
-`Sources/TritonMetalCore` behind a `tm_*` export, never here. The Python tests
-enforce the visible half of this: `test_stage_chain_is_complete` asserts the
-stage names, `test_kernel_info_is_computed_in_the_core` asserts that block size
-and threadgroup size arrive as JSON from Swift rather than being derived in
-Python.
+`Sources/TritonMetalCore` behind a `tm_*` export, never here — including anything
+the *real* release's IR turned out to spell differently, which is why the two
+gaps the tutorials exposed were fixed in the Swift parser and emitter rather than
+worked around in Python. The Python tests enforce the visible half of this:
+`test_jit_kernel_compiles_through_the_swift_core` asserts the stage names, and
+`test_kernel_info_is_computed_in_the_core` asserts that block size and threadgroup
+size arrive as JSON from Swift rather than being derived in Python.
+
+### Passing tensors
+
+Triton decides an argument is a pointer by looking for `data_ptr()`
+(`python/src/specialize.cc`), and reads `dtype` to type the pointee. Torch is the
+usual provider, but macOS torch wheels are CPU-only and a CPU allocation is not an
+`MTLBuffer`, so kernel arguments come from `triton_metal.buffer.MetalBuffer`:
+
+```python
+from triton_metal.buffer import MetalBuffer
+
+x = MetalBuffer.from_numpy(a)          # or MetalBuffer.from_torch(t) — copies
+out = MetalBuffer(a.shape, "float32")
+add_kernel[grid](x, y, out, n, BLOCK_SIZE=1024)
+print(out.numpy())
+```
+
+`from_torch`/`to_torch` **copy**. `MTLDevice.makeBuffer(bytesNoCopy:)` requires
+page-aligned memory and torch does not guarantee it; a zero-copy path would have
+to allocate the tensor's storage through Metal in the first place. For v1 the copy
+is explicit and cheap enough that it is not the thing to optimise first.
 
 ---
 
@@ -918,22 +992,32 @@ should be attributed — one axis at a time. `tmbench --emit 64,64,16,16` prints
 kernel. Ignore the 512 row when judging a change: that GEMM is under a millisecond
 and MPS's own timing swings by 1.5x run to run.
 
-### 6. Pinning a Triton release
+### 6. ~~Pinning a Triton release~~ — done
 
-The one dependency task, and it gates the plugin actually being loadable.
+Pinned at **v3.7.1**; `python/plugin/backend/` carries that tag's
+`BaseBackend`/`DriverBase` signatures, and the three tutorials above run through
+it. The recipe is [Building Triton with the Metal backend](#building-triton-with-the-metal-backend);
+the findings are [ARCHITECTURE.md §Compatibility](ARCHITECTURE.md#compatibility).
+What is left of this task:
 
-1. Pin whatever Triton ships with the current PyTorch. Do **not** vendor Triton
-   source (`CLAUDE.md`); pin a release and code against its published interface.
-2. Read the real signatures off that tag — `BaseBackend`, the stage-dict
-   contract, `GPUDriver`/`GPUTarget`, `load_binary` — and correct
-   `compiler.py`/`driver.py` to match. They are written against the approximate
-   3.x layout today.
-3. Decide what a `metallib` stage payload must be at that version. Right now
-   `_make_metallib` returns an opaque library **handle**, which is fine for the
-   tests but is not a cacheable artifact; serialized `.metallib` bytes via
-   `tm_load_metallib` are the alternative, and which one is correct is a property
-   of the pinned release's caching contract.
-4. Add a CI check against the pin, so the next interface churn is a test failure
-   rather than a mystery.
-5. Then port a subset of Triton's own `test_core.py` against numpy references —
-   that is the conformance signal this backend does not yet have.
+1. **CI against the pin.** `python/tests/test_triton_roundtrip.py` asserts
+   `triton.__version__ == 3.7.1` and drives a real kernel, but skips when Triton
+   is absent — which is every machine that has not spent the 9 minutes. A CI job
+   that does spend them turns the next interface churn into a test failure rather
+   than a mystery.
+2. **Axis identity independent of extent.** The one constraint the matmul
+   tutorial exposed: block sizes must be pairwise distinct, because
+   `LayoutInference` identifies a block axis by its extent. `(64, 64, 32)` is
+   refused. This is the highest-value correctness item now.
+3. **Zero-copy tensors.** `MetalBuffer.from_torch` copies. Either allocate torch
+   storage through Metal, or accept a page-aligned external allocation via
+   `makeBuffer(bytesNoCopy:)` and add the `tm_*` export for it.
+4. **Cacheable binaries.** `binary_ext` is `msl`, so every process re-runs
+   `MTLDevice.makeLibrary(source:)`. `tm_load_metallib` already exists; what is
+   missing is a way to *produce* the bytes without `xcrun metal`, which Command
+   Line Tools do not ship.
+5. **Conformance.** Port a subset of Triton's own `test_core.py` against numpy
+   references — the signal this backend still does not have. Now that real Triton
+   drives the backend, that suite is runnable rather than hypothetical.
+6. **i64 and f64 kernel arguments.** `tm_launch` carries `i32`/`f32` scalars only;
+   a 64-bit scalar argument is refused by the launcher with a clear message.

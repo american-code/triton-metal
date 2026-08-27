@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "triton-metal"
 version = "0.0.1"
 description = "Thin Triton plugin shim over the Swift TritonMetalCore (libtritonmetal.dylib)"
-readme = "../README.md"
-license = { file = "../LICENSE" }
 requires-python = ">=3.10"
-# Triton intentionally not pinned yet — see docs/ARCHITECTURE.md §Compatibility.
+# Triton is pinned at 3.7.1 (docs/ARCHITECTURE.md §Compatibility) but deliberately
+# NOT a dependency: there is no Triton wheel for macOS, so `pip install triton`
+# cannot satisfy it. Triton is built from source with this repo's `plugin/`
+# directory passed as TRITON_PLUGIN_DIRS, and that build installs Triton itself.
 dependencies = []
 
 [project.optional-dependencies]

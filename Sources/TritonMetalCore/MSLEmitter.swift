@@ -3592,21 +3592,59 @@ private struct FunctionEmitter {
     private func uniformScalar(_ ssa: String, in body: [Instruction], _ loc: SourceLoc) throws
         -> String
     {
-        var current = ssa
-        for _ in 0..<8 {
-            if let name = names[current], (levels[current] ?? []).isEmpty, tiles[current] == nil {
-                return name
-            }
-            guard
-                let instruction = definitions[current]
-                    ?? FunctionEmitter.findDefinition(current, in: body),
-                case .splat(_, _, let source) = instruction.kind
-            else { break }
-            current = source
-        }
+        if let expression = uniformExpression(ssa, in: body, depth: 0, loc) { return expression }
         throw CoreError.lowering(
             "the pointer advance '%\(ssa)' inside a tt.dot loop is not uniform across the "
                 + "threadgroup; it has to be a splat of a value computed outside the loop", loc)
+    }
+
+    /// Resolves `ssa` to a threadgroup-uniform MSL scalar expression, or nil.
+    ///
+    /// Three shapes turn up in real Triton output for the same source-level
+    /// `ptrs += BLOCK_K * stride`: a `tt.splat` of a scalar the loop hoisted out,
+    /// a dense splat constant the canonicalizer folded (`dense<16> : tensor<64x16xi32>`),
+    /// and — when the stride is a kernel argument — the scalar product recomputed
+    /// *inside* the loop body, whose operands are still loop-invariant. All three
+    /// name one value per threadgroup, which is all the staging loops need.
+    private func uniformExpression(_ ssa: String, in body: [Instruction], depth: Int, _ loc: SourceLoc)
+        -> String?
+    {
+        if depth > 8 { return nil }
+        if let name = names[ssa], (levels[ssa] ?? []).isEmpty, tiles[ssa] == nil {
+            return name
+        }
+        guard let instruction = definitions[ssa] ?? FunctionEmitter.findDefinition(ssa, in: body)
+        else { return nil }
+        switch instruction.kind {
+        case .constant(_, let type, let value):
+            return literal(value, type, loc)
+        case .splat(_, _, let source):
+            return uniformExpression(source, in: body, depth: depth + 1, loc)
+        case .intBinary(_, let op, let lhs, let rhs):
+            guard let symbol = FunctionEmitter.uniformIntOperator(op),
+                let l = uniformExpression(lhs, in: body, depth: depth + 1, loc),
+                let r = uniformExpression(rhs, in: body, depth: depth + 1, loc)
+            else { return nil }
+            return "(\(l) \(symbol) \(r))"
+        default:
+            return nil
+        }
+    }
+
+    /// The signed integer operators that mean the same thing in MSL, spelled
+    /// inline. Anything needing a cast (unsigned, min/max) is left to the general
+    /// path, which refuses rather than guessing.
+    private static func uniformIntOperator(_ op: IntBinaryOp) -> String? {
+        switch op {
+        case .add: return "+"
+        case .sub: return "-"
+        case .mul: return "*"
+        case .divs: return "/"
+        case .rems: return "%"
+        case .shl: return "<<"
+        case .shrs: return ">>"
+        default: return nil
+        }
     }
 
     private mutating func emitIf(_ branch: IfOp, loc: SourceLoc) throws {
