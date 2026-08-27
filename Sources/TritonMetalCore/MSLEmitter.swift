@@ -141,7 +141,8 @@ private struct Frame {
     }
 
     var statements: [Stmt] = []
-    var level: Int
+    /// The block axes whose loops are open around this frame, outermost first.
+    var path: [Int]
     var kind: Kind
     var open: String = ""
     var close: String = "}"
@@ -158,6 +159,11 @@ private enum YieldTarget {
     /// A `tt.dot` accumulator living in this threadgroup tile; the dot already
     /// updated it in place, so the yield is a no-op that only has to be checked.
     case tile(String)
+    /// A per-lane tensor spilled into a threadgroup tile for the duration of a
+    /// cross-lane loop. The new value went into `shadow` where it was defined
+    /// (the old one is still being read at that point); the copy back happens
+    /// once, at the end of the body. See `emitUniformLoop`.
+    case spilled(tile: Tile, shadow: Tile, value: String)
     /// A contraction-space value rebuilt from the induction variable instead of
     /// being carried (see `strengthReduce`). Nothing to assign.
     case deferred
@@ -188,6 +194,9 @@ private struct Tile {
     /// Block dimensions the two tile dimensions correspond to.
     var rowAxis: Int
     var columnAxis: Int
+    /// False for a tile that stands in for a rank-1 value — a spilled `m_i` or
+    /// `l_i` — which is one element per row and indexed by the row axis alone.
+    var hasColumns: Bool = true
 
     /// The distance between one row and the next, which is also the leading
     /// dimension every `simdgroup_load` and `simdgroup_store` is given.
@@ -195,10 +204,31 @@ private struct Tile {
     var elementCount: Int { paddedRows * stride }
     var needsPadding: Bool { paddedRows != rows || paddedColumns != columns }
 
+    /// The block axes a reader of this tile must have loops open for. A tile
+    /// dimension of extent 1 is a broadcast and needs none.
+    var axes: [Int] {
+        var result: [Int] = []
+        if rows > 1 { result.append(rowAxis) }
+        if hasColumns, columns > 1 { result.append(columnAxis) }
+        return result
+    }
+
+    /// The slot the staging loops write, always in terms of *their* loop
+    /// variables — which walk the fragment padding as well, where `expression`'s
+    /// broadcast shortcut would fold every padding lane onto slot zero.
+    var slot: String {
+        hasColumns
+            ? "\(name)[tm_i\(rowAxis) * \(stride)u + tm_i\(columnAxis)]"
+            : "\(name)[tm_i\(rowAxis)]"
+    }
+
     /// How the tile reads as an ordinary per-lane value, once the emitter is back
     /// inside the block loops.
     var expression: String {
-        "\(name)[tm_i\(rowAxis) * \(stride)u + tm_i\(columnAxis)]"
+        let row = rows > 1 ? "tm_i\(rowAxis)" : "0u"
+        guard hasColumns else { return "\(name)[\(row)]" }
+        let column = columns > 1 ? "tm_i\(columnAxis)" : "0u"
+        return "\(name)[\(row) * \(stride)u + \(column)]"
     }
 }
 
@@ -296,18 +326,22 @@ private struct FunctionEmitter {
 
     private var types: [String: TMType] = [:]
     private var names: [String: String] = [:]
-    private var levels: [String: Int] = [:]
+    /// The loop nest each value is emitted in, outermost axis first.
+    private var levels: [String: [Int]] = [:]
 
     private var frames: [Frame] = []
     private var preamble: [Stmt] = []
     /// Pure definitions, in order, so a reopened loop can recompute them.
-    private var history: [(level: Int, statement: Stmt)] = []
-    /// Levels whose loop has been closed once; reopening them needs `history`.
-    private var closedLevels: Set<Int> = []
-    /// Why a level cannot be recomputed (a store, a region, a reduction epilogue).
-    private var notRecomputable: [Int: String] = [:]
+    private var history: [(path: [Int], statement: Stmt)] = []
+    /// Nests that have been closed once; reopening them needs `history`.
+    private var closedLevels: Set<[Int]> = []
+    /// Why a nest cannot be recomputed (a store, a region, a reduction epilogue).
+    private var notRecomputable: [[Int]: String] = [:]
     /// Where `scf.yield` writes, innermost region last.
     private var yieldTargets: [[YieldTarget]] = []
+    /// Shadow-to-carried tile copies the current cross-lane loop body owes at its
+    /// end, collected when its `scf.yield` is reached.
+    private var spillCopies: [(from: Tile, to: Tile)] = []
 
     /// Cleared by the first side effect: after a store, nothing may be hoisted
     /// above it.
@@ -349,6 +383,29 @@ private struct FunctionEmitter {
     /// Values that exist only to feed a `tt.dot` and are therefore never emitted
     /// where they appear (see `DotDeferral`).
     private let materialised: Set<String>
+    /// Reduction results a `tt.dot`'s staging loops read. A `tt.reduce` is the one
+    /// thing `recomputationOrder` cannot rebuild, so these are written into a
+    /// small threadgroup array where they are computed and read out of it there.
+    private let spilledReductions: Set<String>
+    /// Tiles a `tt.dot`'s accumulator must be staged into rather than allocating
+    /// one, keyed by the dot's result: the tile a cross-lane loop carries.
+    private var boundAccumulators: [String: Tile] = [:]
+    /// Where the value yielded into a spilled carried tensor is written, keyed by
+    /// the yielded value. Written where it is *defined*, because by the time the
+    /// `scf.yield` is reached the nest that computed it is closed.
+    private var shadowWrites: [String: Tile] = [:]
+    /// One arena every `tt.dot`'s operand tiles are carved out of, for kernels
+    /// with more than one dot: two dots' operands are never live at the same time
+    /// (a barrier separates them), and FA-2 does not fit otherwise.
+    private var sharedArena: (name: String, element: TMType, capacity: Int)?
+    private var sharedArenaCursor = 0
+    private var sharedArenaDeclared = false
+    /// True once any tile is written by ordinary per-lane code, which is what
+    /// makes a `tt.dot`'s staging loops need a barrier in front of them.
+    private var hasSpilledTiles = false
+    /// How many `tt.dot`s this kernel contains, which decides whether their
+    /// operand tiles share one arena.
+    private let dotTotal: Int
     /// True when some `scf.for` in this kernel is hoisted out of the block loops
     /// to a threadgroup-uniform level, which is what makes closing a loop early
     /// and rebuilding it later the normal case rather than the exception.
@@ -371,8 +428,11 @@ private struct FunctionEmitter {
         self.function = function
         self.options = options
         self.layout = layout
-        self.materialised =
-            layout.contractions.isEmpty ? [] : DotDeferral.materialised(in: function)
+        let live = layout.hasDot ? DotDeferral.materialised(in: function) : []
+        self.materialised = live
+        self.spilledReductions = layout.hasDot
+            ? FunctionEmitter.reductionsReadByADot(in: function, layout: layout) : []
+        self.dotTotal = FunctionEmitter.countDots(function.body)
         self.hoistsUniformRegions = function.body.contains {
             if case .forLoop(let loop) = $0.kind {
                 return FunctionEmitter.containsCrossLane(loop.body)
@@ -386,12 +446,12 @@ private struct FunctionEmitter {
     /// True for kernels with a `tt.dot`, which changes two policies: the
     /// threadgroup is sized for simdgroup-matrix work rather than for the
     /// innermost block dimension, and values that only feed a dot are deferred.
-    private var usesDot: Bool { !layout.contractions.isEmpty }
+    private var usesDot: Bool { layout.hasDot }
 
-    /// The depth at which every thread of the threadgroup runs the same
+    /// The nest at which every thread of the threadgroup runs the same
     /// statement — where a `tt.dot`'s barriers have to sit.
-    private var uniformLevel: Int {
-        frames.last { $0.kind == .region || $0.kind == .uniformRegion }?.level ?? 0
+    private var uniformLevel: [Int] {
+        frames.last { $0.kind == .region || $0.kind == .uniformRegion }?.path ?? []
     }
 
     /// True when `ssa` is an all-zero splat constant — the seed every Triton
@@ -426,7 +486,7 @@ private struct FunctionEmitter {
 
         for argument in function.arguments {
             let name = register(argument.name, type: argument.type)
-            levels[argument.name] = 0
+            levels[argument.name] = []
             switch argument.type {
             case .pointer(let pointee):
                 if case .tensor = pointee {
@@ -450,11 +510,11 @@ private struct FunctionEmitter {
             }
         }
 
-        frames = [Frame(level: 0, kind: .function)]
+        frames = [Frame(path: [], kind: .function)]
         for instruction in function.body {
             try emit(instruction)
         }
-        try ensureLevel(0, function.loc)
+        try ensureLevel([], function.loc)
 
         if usesProgramID {
             parameters.append("uint3 tm_program_id [[threadgroup_position_in_grid]]")
@@ -462,7 +522,9 @@ private struct FunctionEmitter {
         if usesGridSize {
             parameters.append("uint3 tm_grid_size [[threadgroups_per_grid]]")
         }
-        if rank > 0 {
+        // A tt.dot stages its tiles with the whole threadgroup even when every
+        // block dimension is a broadcast (a 1x1x1 product still has an 8x8 tile).
+        if rank > 0 || usesDot {
             parameters.append("uint3 tm_thread_id [[thread_position_in_threadgroup]]")
             parameters.append("uint3 tm_threadgroup_size [[threads_per_threadgroup]]")
         }
@@ -494,17 +556,20 @@ private struct FunctionEmitter {
         return (lines.joined(separator: "\n"), kernel)
     }
 
-    /// Threads stride over the innermost block dimension. Always a whole number of
-    /// simdgroups so that `simd_shuffle_down` reductions see 32 live lanes.
+    /// Threads stride over the innermost block dimension of each nest. Always a
+    /// whole number of simdgroups so that `simd_shuffle_down` reductions see 32
+    /// live lanes.
     private var threadsPerThreadgroup: Int {
-        guard let innermost = layout.shape.last else { return 1 }
         let requested = max(1, options.numSimdgroups) * 32
         // A tt.dot hands 8x8 output fragments out one per simdgroup and stages its
         // tiles with the whole threadgroup, so clamping to the innermost block
         // dimension — an occupancy heuristic for elementwise kernels — would only
-        // starve it.
-        let wanted = usesDot ? requested : max(1, min(innermost, requested))
-        return min(1024, max(32, (wanted + 31) / 32 * 32))
+        // starve it, and a simdgroup matrix operation needs 32 live lanes even
+        // when every block dimension is a broadcast.
+        if usesDot { return min(1024, max(32, (requested + 31) / 32 * 32)) }
+        let distributed = (0..<rank).filter { !layout.isUniform($0) }.map { layout.shape[$0] }
+        guard let innermost = distributed.max() ?? layout.shape.max() else { return 1 }
+        return min(1024, max(32, (max(1, min(innermost, requested)) + 31) / 32 * 32))
     }
 
     /// True when the per-lane block loops spread the threadgroup over the two
@@ -526,25 +591,53 @@ private struct FunctionEmitter {
     /// `tt.reduce` anywhere, because a reduction closes the innermost loop and
     /// then folds across the whole threadgroup, which requires every thread to be
     /// in the same row (§Cross-lane regions).
+    /// Restricted to rank 2, which is every kernel the two-dimensional split was
+    /// measured on: with three block axes a value's nest is over *its* axes
+    /// (§Execution model), and which two of them a lane index should be split
+    /// across is no longer a property of the kernel.
     private var distributesRows: Bool {
-        usesDot && rank >= 2 && !FunctionEmitter.containsReduce(function.body)
+        guard rank >= 2 else { return false }
+        // A `tt.reduce` used to force the innermost-only split, because its fold
+        // runs across the whole threadgroup and so needs every thread in the same
+        // row. Splitting the lane index gives each row a *group* of lanes and the
+        // fold runs inside that group instead (`emitReduce`), which is what makes
+        // an attention kernel's 2 x BLOCK_M row reductions per iteration parallel
+        // rather than a queue of threadgroup barriers.
+        if FunctionEmitter.containsReduce(function.body) { return usesDot || rank == 2 }
+        return usesDot && rank == 2
     }
 
     /// How many threads stride the innermost block dimension when the loops
     /// spread over two of them. A power of two that divides the threadgroup, so
     /// that `tid / lanes` and `tid % lanes` between them cover every point of the
     /// two-dimensional index space exactly once.
+    ///
+    /// A kernel with a reduction caps this at the 32-lane simdgroup, so that the
+    /// lanes sharing a row always share a simdgroup and the fold is `simd_shuffle`
+    /// with no threadgroup memory and no barrier at all.
     private var laneWidth: Int {
-        guard distributesRows, let innermost = layout.shape.last else {
-            return threadsPerThreadgroup
+        guard distributesRows else { return threadsPerThreadgroup }
+        let reduces = FunctionEmitter.containsReduce(function.body)
+        // Every nest splits the same threadgroup the same way, or the shared outer
+        // loop could not be shared: take the narrowest innermost extent there is.
+        var innermost = layout.shape.last ?? threadsPerThreadgroup
+        if rank > 2 || reduces {
+            let distributed = (0..<rank).filter { !layout.isUniform($0) }.map { layout.shape[$0] }
+            innermost = distributed.min() ?? innermost
         }
+        let ceiling = reduces ? min(32, threadsPerThreadgroup) : threadsPerThreadgroup
         var lanes = 1
-        while lanes * 2 <= min(innermost, threadsPerThreadgroup),
-            threadsPerThreadgroup % (lanes * 2) == 0
-        {
+        while lanes * 2 <= min(innermost, ceiling), threadsPerThreadgroup % (lanes * 2) == 0 {
             lanes *= 2
         }
         return lanes
+    }
+
+    /// True when a row's lanes are a contiguous group inside one simdgroup, so a
+    /// reduction along that row folds with shuffles alone.
+    private var foldsWithinARow: Bool {
+        distributesRows && laneWidth <= 32 && 32 % laneWidth == 0
+            && laneWidth < threadsPerThreadgroup
     }
 
     /// Simdgroups per threadgroup — a compile-time constant, which is what lets a
@@ -563,18 +656,31 @@ private struct FunctionEmitter {
             .group(open: frame.open, body: frame.statements, close: frame.close))
     }
 
-    /// Opens or closes block-dimension loops until statements land at `target`.
-    private mutating func ensureLevel(_ target: Int, _ loc: SourceLoc) throws {
-        while frames[frames.count - 1].level > target {
+    /// The nest currently open.
+    private var currentPath: [Int] { frames[frames.count - 1].path }
+
+    private static func isPrefix(_ a: [Int], of b: [Int]) -> Bool {
+        a.count <= b.count && Array(b[0..<a.count]) == a
+    }
+
+    /// Opens or closes block-axis loops until statements land in the nest `target`.
+    ///
+    /// Nests form a tree rather than a chain: `p` lives under (M, N) and `acc`
+    /// under (M, HEAD_DIM), and moving between them closes the inner loop and
+    /// opens the other while the shared M loop stays put — which is what keeps a
+    /// value defined in the M loop (an online softmax's running maximum) in scope
+    /// across both.
+    private mutating func ensureLevel(_ target: [Int], _ loc: SourceLoc) throws {
+        while !FunctionEmitter.isPrefix(currentPath, of: target) {
             guard frames[frames.count - 1].kind == .laneLoop else {
                 throw CoreError.lowering(
                     "a cross-lane operation (tt.reduce) inside an scf region is not lowered yet: "
                         + "it would have to split the region's lane loop", loc)
             }
-            closedLevels.insert(frames[frames.count - 1].level)
+            closedLevels.insert(currentPath)
             // A loop that only holds pure definitions is already fully described by
             // `history`, so dropping it here costs nothing: any later use reopens
-            // the level and replays them. Without this, a kernel that hoists a
+            // the nest and replays them. Without this, a kernel that hoists a
             // loop to a threadgroup-uniform level emits an empty-looking block
             // loop for every index value it computes before that point and
             // rebuilds afterwards.
@@ -584,22 +690,22 @@ private struct FunctionEmitter {
                 closeTopFrame()
             }
         }
-        while frames[frames.count - 1].level < target {
-            let level = frames[frames.count - 1].level + 1
-            let axis = level - 1
+        while currentPath.count < target.count {
+            let path = Array(target[0...currentPath.count])
+            let axis = path[path.count - 1]
             let extent = layout.shape[axis]
             let variable = "tm_i\(axis)"
             let lanes = laneWidth
             let open: String
-            if level == rank, lanes < threadsPerThreadgroup {
+            if !layout.isUniform(axis), lanes < threadsPerThreadgroup {
                 open =
                     "for (uint \(variable) = tm_thread_id.x % \(lanes)u; "
                     + "\(variable) < \(extent)u; \(variable) += \(lanes)u) {"
-            } else if level == rank {
+            } else if !layout.isUniform(axis) {
                 open =
                     "for (uint \(variable) = tm_thread_id.x; \(variable) < \(extent)u; "
                     + "\(variable) += tm_threadgroup_size.x) {"
-            } else if level == rank - 1, lanes < threadsPerThreadgroup {
+            } else if distributesRows, layout.isUniform(axis), lanes < threadsPerThreadgroup {
                 let rows = threadsPerThreadgroup / lanes
                 open =
                     "for (uint \(variable) = tm_thread_id.x / \(lanes)u; "
@@ -607,15 +713,15 @@ private struct FunctionEmitter {
             } else {
                 open = "for (uint \(variable) = 0u; \(variable) < \(extent)u; ++\(variable)) {"
             }
-            frames.append(Frame(level: level, kind: .laneLoop, open: open))
+            frames.append(Frame(path: path, kind: .laneLoop, open: open))
 
-            if closedLevels.contains(level) {
-                if let reason = notRecomputable[level] {
+            if closedLevels.contains(path) {
+                if let reason = notRecomputable[path] {
                     throw CoreError.lowering(
                         "cannot reopen block dimension \(axis) to continue after a cross-lane "
                             + "operation: \(reason)", loc)
                 }
-                for entry in history where entry.level == level {
+                for entry in history where entry.path == path {
                     frames[frames.count - 1].statements.append(entry.statement)
                 }
             }
@@ -630,16 +736,23 @@ private struct FunctionEmitter {
     /// SSA order, interleaved with tensor values, and closing a loop for each one
     /// would litter the output with empty loops. Finally, recomputable statements
     /// are remembered, so a loop reopened after a `tt.reduce` can rebuild them.
+    /// `poisons` is what stops the nest being reopened later. It is the default
+    /// because a non-recomputable statement usually *defines* something a
+    /// reopened nest would have to rebuild (a `tt.reduce`'s fold). A write into a
+    /// threadgroup tile defines nothing — the tile holds the value and a reopened
+    /// nest simply reads it — so those pass `poisons: false`.
     private mutating func append(
-        _ statement: Stmt, level: Int, recomputable: Bool, sideEffecting: Bool = false,
-        reason: String = "", _ loc: SourceLoc
+        _ statement: Stmt, level: [Int], recomputable: Bool, sideEffecting: Bool = false,
+        poisons: Bool = true, reason: String = "", _ loc: SourceLoc
     ) throws {
         func remember() {
             if recomputable {
-                history.append((level: level, statement: statement))
+                history.append((path: level, statement: statement))
             } else {
                 frames[frames.count - 1].discardable = false
-                notRecomputable[level] = reason.isEmpty ? "it has already been emitted" : reason
+                if poisons {
+                    notRecomputable[level] = reason.isEmpty ? "it has already been emitted" : reason
+                }
             }
             if sideEffecting { frames[frames.count - 1].discardable = false }
         }
@@ -653,12 +766,13 @@ private struct FunctionEmitter {
         if frames.contains(where: { $0.kind == .region }) {
             frames[frames.count - 1].statements.append(statement)
             frames[frames.count - 1].discardable = false
-            notRecomputable[frames[frames.count - 1].level] =
+            notRecomputable[frames[frames.count - 1].path] =
                 "values defined inside an scf region cannot be recomputed"
             return
         }
-        if recomputable, canHoist, level < frames[frames.count - 1].level,
-            let index = frames.lastIndex(where: { $0.level == level })
+        if recomputable, canHoist, level.count < currentPath.count,
+            FunctionEmitter.isPrefix(level, of: currentPath),
+            let index = frames.lastIndex(where: { $0.path == level })
         {
             frames[index].statements.append(statement)
             remember()
@@ -699,24 +813,29 @@ private struct FunctionEmitter {
         return type
     }
 
-    private func level(of ssa: String) -> Int { levels[ssa] ?? 0 }
+    private func level(of ssa: String) -> [Int] { levels[ssa] ?? [] }
 
-    /// The shallowest loop depth at which a value of this type can be computed:
-    /// one past the deepest block dimension it actually varies along.
-    private func shapeLevel(_ ssa: String, _ type: TMType) -> Int {
-        guard let shape = type.shape else { return 0 }
-        return layout.varyingAxes(of: ssa, shape: shape).map { $0 + 1 }.max() ?? 0
+    /// The nest a value of this type belongs in: the axes it varies along, plus
+    /// whatever its consumers nest outside them (`BlockLayout.paths`).
+    private func shapeLevel(_ ssa: String, _ type: TMType) -> [Int] {
+        guard type.shape != nil else { return [] }
+        return layout.path(of: ssa)
     }
 
-    private func placement(_ ssa: String, _ type: TMType, operands: [String]) -> Int {
-        max(shapeLevel(ssa, type), operands.map(level(of:)).max() ?? 0)
+    /// The nest deep enough for the value and every operand it reads. The axis
+    /// sets nest (`BlockLayout` makes each a prefix of its consumers'), so the
+    /// union is the deepest of them.
+    private func placement(_ ssa: String, _ type: TMType, operands: [String]) -> [Int] {
+        var axes = Set(shapeLevel(ssa, type))
+        for operand in operands { axes.formUnion(level(of: operand)) }
+        return axes.sorted()
     }
 
     /// Emits `<decl> = <expr>;` at the depth the value needs.
     @discardableResult
     private mutating func define(
         _ ssa: String, type: TMType, expression: String, operands: [String], loc: SourceLoc,
-        level forced: Int? = nil
+        level forced: [Int]? = nil
     ) throws -> String {
         if stagingDepth == 0, let shape = type.shape, layout.spansContraction(ssa, shape: shape) {
             throw CoreError.lowering(
@@ -730,7 +849,28 @@ private struct FunctionEmitter {
         try append(
             .line("\(try declaration(type, name, loc)) = \(expression);"), level: level,
             recomputable: true, loc)
+        // Only the value's real definition updates the shadow: a `tt.dot`'s
+        // staging loops rebuild the same subgraph and must not write it again.
+        if stagingDepth == 0, let shadow = shadowWrites[ssa] {
+            try spillWrite(name, into: shadow, at: level, loc)
+        }
         return name
+    }
+
+    /// Writes a per-lane value into a threadgroup tile at the lane's block index.
+    ///
+    /// The nest this happens in decides who writes. When the tile's innermost
+    /// axis is the distributed one every element has exactly one owner, so the
+    /// write needs no guard; when the nest is threadgroup-uniform every thread
+    /// computes the same value for the same slot and writing it redundantly is
+    /// how the rest of this emitter already behaves at that depth.
+    private mutating func spillWrite(
+        _ value: String, into tile: Tile, at level: [Int], _ loc: SourceLoc
+    ) throws {
+        hasSpilledTiles = true
+        try append(
+            .line("\(tile.expression) = \(value);"), level: level, recomputable: false,
+            sideEffecting: true, poisons: false, loc)
     }
 
     /// `tt.splat`-like ops that only relabel a value's shape share its variable.
@@ -884,6 +1024,27 @@ private struct FunctionEmitter {
                     "tt.expand_dims axis \(axis) cannot turn \(sourceType) into \(resultType)", loc)
             }
             // Pure relabelling: the value per lane is unchanged.
+            try alias(result, to: source, type: resultType, loc)
+
+        case .trans(let result, let resultType, let source, let order):
+            let sourceType = try type(of: source, loc)
+            guard let sourceShape = sourceType.shape, let resultShape = resultType.shape,
+                order.count == sourceShape.count, resultShape.count == sourceShape.count,
+                resultShape == order.map({ sourceShape[$0] })
+            else {
+                throw CoreError.lowering(
+                    "tt.trans with order \(order) cannot turn \(sourceType) into \(resultType)", loc)
+            }
+            // A transpose is a relabelling of which block axis each dimension
+            // indexes, and `Layout.swift` has already done it: the two values are
+            // the same per-lane scalar at the same block *point*, so no code is
+            // emitted at all. What it costs is a nesting constraint — the source
+            // says one axis is outside the other and the result says the reverse
+            // — which only a value that never enters an elementwise nest can
+            // avoid. A `tt.dot` operand is exactly that (it is rebuilt inside the
+            // dot's own staging loops, which walk the tile's axes in whichever
+            // order the tile wants); anything materialised is refused by
+            // `LayoutInference`, by name, before this runs.
             try alias(result, to: source, type: resultType, loc)
 
         case .broadcast(let result, let resultType, let source):
@@ -1089,11 +1250,17 @@ private struct FunctionEmitter {
                 operands.append(mask)
                 conditions.append(try name(of: mask, loc))
             }
-            let level = operands.map(level(of:)).max() ?? 0
-            // Only the innermost loop is distributed over threads; anything shallower
-            // runs identically in every thread, so one thread does the writing.
-            if rank > 0 && level < rank {
-                conditions.insert("tm_thread_id.x == 0u", at: 0)
+            var axes: Set<Int> = []
+            for operand in operands { axes.formUnion(level(of: operand)) }
+            let level = axes.sorted()
+            // Only a nest's innermost loop is distributed over threads; a store
+            // whose own nest ends on a uniform axis runs identically in every
+            // thread, so one thread does the writing.
+            if rank > 0, level.last.map({ layout.isUniform($0) }) ?? true {
+                conditions.insert(
+                    distributesRows && laneWidth < threadsPerThreadgroup
+                        ? "tm_thread_id.x % \(laneWidth)u == 0u" : "tm_thread_id.x == 0u",
+                    at: 0)
             }
             if !conditions.isEmpty {
                 line = "if (\(conditions.joined(separator: " && "))) { \(line) }"
@@ -1128,6 +1295,16 @@ private struct FunctionEmitter {
                                 + "result of the tt.dot that updates it; the accumulator lives in "
                                 + "threadgroup memory and is updated in place", loc)
                     }
+                case .spilled(let tile, let shadow, let expected):
+                    guard value == expected else {
+                        throw CoreError.lowering(
+                            "scf.yield returns '%\(value)' where '%\(expected)' was expected for "
+                                + "the spilled carried tensor in '\(tile.name)'", loc)
+                    }
+                    // The new value is already in the shadow — written where it was
+                    // defined, or, when it is itself a tile (another dot's result),
+                    // copied straight from there.
+                    spillCopies.append((from: tiles[value] ?? shadow, to: tile))
                 case .variable(let variable):
                     frames[frames.count - 1].statements.append(
                         .line("\(variable) = \(try name(of: value, loc));"))
@@ -1287,9 +1464,17 @@ private struct FunctionEmitter {
                 "tt.reduce over axis \(axis) of a \(shape.count)-D tensor (only the last axis, "
                     + "which is the axis distributed across threads, is lowered)", loc)
         }
-        guard let map = layout.axes[source], map[axis] == rank - 1 else {
+        let sourcePath = layout.path(of: source)
+        guard let map = layout.axes[source], axis < map.count else {
             throw CoreError.lowering(
-                "tt.reduce must reduce the innermost block dimension (dimension \(rank - 1))", loc)
+                "tt.reduce's operand '%\(source)' has no block layout", loc)
+        }
+        guard sourcePath.last == map[axis], !layout.isUniform(map[axis]) else {
+            throw CoreError.lowering(
+                "tt.reduce must reduce the innermost block dimension of its operand's loop nest "
+                    + "(the one strided across the threadgroup); '%\(source)' is nested over "
+                    + "block dimensions \(sourcePath) and is being reduced along \(map[axis])",
+                loc)
         }
         let element = sourceType.scalarized
         guard element.isFloatLike || element.isIntegerLike else {
@@ -1310,21 +1495,52 @@ private struct FunctionEmitter {
             }
         }
 
-        requireSimdCount()
-        preamble.append(.line("threadgroup \(elementName) \(scratch)[32];"))
-        threadgroupBytes += 32 * (element.scalarByteWidth ?? 4)
+        // Two folds. A row that owns a *group* of lanes inside one simdgroup
+        // folds with shuffles alone; a row that owns the whole threadgroup has to
+        // go through threadgroup memory and two barriers, which is the only
+        // shape a rank-1 kernel has.
+        let lanes = laneWidth
+        let withinARow = foldsWithinARow && sourcePath.count >= 2
+        if !withinARow {
+            requireSimdCount()
+            preamble.append(.line("threadgroup \(elementName) \(scratch)[32];"))
+            threadgroupBytes += 32 * (element.scalarByteWidth ?? 4)
+        }
 
         // Accumulate inside the innermost loop, one partial per thread.
-        try ensureLevel(rank, loc)
+        try ensureLevel(sourcePath, loc)
         frames[frames.count - 2].statements.append(
             .line("\(elementName) \(accumulator) = \(identity(op, element, loc));"))
         frames[frames.count - 2].discardable = false
         frames[frames.count - 1].statements.append(
             .line("\(accumulator) = \(combine(accumulator, try name(of: source, loc)));"))
         frames[frames.count - 1].discardable = false
-        try ensureLevel(rank - 1, loc)
+        let outer = Array(sourcePath.dropLast())
+        try ensureLevel(outer, loc)
+        let resultType = sourceType.reducingLastDimension()
+        let reason = "a tt.reduce cannot be recomputed"
 
-        let outer = rank - 1
+        if withinARow {
+            try append(
+                .line(
+                    "// tt.reduce (\(op.rawValue)): fold within the \(lanes) lanes of this row"),
+                level: outer, recomputable: false, reason: reason, loc)
+            try append(
+                .line(
+                    "for (ushort tm_delta = \(lanes / 2); tm_delta > 0; tm_delta >>= 1) { "
+                        + "\(accumulator) = "
+                        + "\(combine(accumulator, "simd_shuffle_down(\(accumulator), tm_delta)")); }"),
+                level: outer, recomputable: false, reason: reason, loc)
+            let origin = lanes == 32
+                ? "0" : "(tm_simd_lane / \(lanes)u) * \(lanes)u"
+            let reduced = try define(
+                result, type: resultType,
+                expression: "simd_shuffle(\(accumulator), \(origin))", operands: [], loc: loc,
+                level: outer)
+            try spillReduction(result, named: reduced, type: resultType, at: outer, loc)
+            return
+        }
+
         let lines: [Stmt] = [
             .line(
                 "// tt.reduce (\(op.rawValue)): fold within each simdgroup, then across them"),
@@ -1336,19 +1552,69 @@ private struct FunctionEmitter {
             .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
         ]
         for line in lines {
-            try append(
-                line, level: outer, recomputable: false,
-                reason: "a tt.reduce cannot be recomputed", loc)
+            try append(line, level: outer, recomputable: false, reason: reason, loc)
         }
 
         let reduced = try define(
-            result, type: sourceType.reducingLastDimension(), expression: "\(scratch)[0]",
+            result, type: resultType, expression: "\(scratch)[0]",
             operands: [], loc: loc, level: outer)
         try append(
             .line(
                 "for (uint tm_k = 1; tm_k < tm_simd_count; ++tm_k) { "
                     + "\(reduced) = \(combine(reduced, "\(scratch)[tm_k]")); }"),
-            level: outer, recomputable: false, reason: "a tt.reduce cannot be recomputed", loc)
+            level: outer, recomputable: false, reason: reason, loc)
+
+        try spillReduction(result, named: reduced, type: resultType, at: outer, loc)
+    }
+
+    /// A reduction is the one thing a `tt.dot`'s staging loops cannot rebuild, so
+    /// a result some dot operand depends on is written into a small threadgroup
+    /// array where it is computed and read out of it there —
+    /// FlashAttention-2's running row maximum, which its
+    /// `p = exp2(qk - m_ij)` needs inside the staging nest of the second dot.
+    private mutating func spillReduction(
+        _ result: String, named variable: String, type: TMType, at level: [Int], _ loc: SourceLoc
+    ) throws {
+        guard spilledReductions.contains(result), let shape = type.shape, !shape.isEmpty else {
+            return
+        }
+        let tile = try spillTile("reduce", for: result, type: type, loc)
+        try spillWrite(variable, into: tile, at: level, loc)
+        registerTile(result, tile, type: type)
+    }
+
+    /// A threadgroup array shaped like the block axes a per-lane value spans, for
+    /// values that have to survive outside the nest that computes them.
+    private mutating func spillTile(
+        _ prefix: String, for ssa: String, type: TMType, _ loc: SourceLoc
+    ) throws -> Tile {
+        guard let shape = type.shape, let map = layout.axes[ssa] else {
+            throw CoreError.lowering("cannot spill the scalar '%\(ssa)' into threadgroup memory", loc)
+        }
+        var dimensions: [(axis: Int, extent: Int)] = []
+        for (index, size) in shape.enumerated() where size > 1 {
+            dimensions.append((axis: map[index], extent: size))
+        }
+        dimensions.sort { $0.axis < $1.axis }
+        hasSpilledTiles = true
+        switch dimensions.count {
+        case 1:
+            var tile = try allocateTile(
+                prefix, element: type.scalarized, rows: dimensions[0].extent, columns: 1,
+                rowAxis: dimensions[0].axis, columnAxis: dimensions[0].axis,
+                rowGranularity: 1, columnGranularity: 1, loc)
+            tile.hasColumns = false
+            return tile
+        case 2:
+            return try allocateTile(
+                prefix, element: type.scalarized, rows: dimensions[0].extent,
+                columns: dimensions[1].extent, rowAxis: dimensions[0].axis,
+                columnAxis: dimensions[1].axis, loc)
+        default:
+            throw CoreError.lowering(
+                "'%\(ssa)' spans \(dimensions.count) block dimensions; only rank-1 and rank-2 "
+                    + "values can be spilled into threadgroup memory", loc)
+        }
     }
 
     private func identity(_ op: ReduceOp, _ element: TMType, _ loc: SourceLoc) -> String {
@@ -1400,7 +1666,7 @@ private struct FunctionEmitter {
     private mutating func allocateTile(
         _ prefix: String, element: TMType, rows: Int, columns: Int, rowAxis: Int, columnAxis: Int,
         rowGranularity: Int = fragment, columnGranularity: Int = fragment, capacity: Int = 0,
-        intoArena: Bool = false, _ loc: SourceLoc
+        intoArena: Bool = false, intoSharedArena: Bool = false, _ loc: SourceLoc
     ) throws -> Tile {
         let paddedColumns = FunctionEmitter.padded(columns, to: columnGranularity)
         let tile = Tile(
@@ -1443,6 +1709,40 @@ private struct FunctionEmitter {
                 pingPongTiles.append((name: tile.name, element: elementName))
             }
             stagingArena?.cursor += slots * buffers
+            return tile
+        }
+
+        // The kernel-wide operand arena: two dots' operand tiles are separated by
+        // a barrier and never live at once, so they share storage. FlashAttention
+        // stages four operand tiles (Q, K^T, P, V) per iteration and does not fit
+        // in Metal's 32KB otherwise.
+        if intoSharedArena, let arena = sharedArena {
+            let slots = FunctionEmitter.arenaSlots(tile.elementCount, of: element, in: arena.element)
+            guard sharedArenaCursor + slots <= arena.capacity else {
+                throw CoreError.lowering(
+                    "kernel '\(function.name)' cannot stage its tt.dot operand tiles inside the "
+                        + "shared \(arena.capacity)-slot arena", loc)
+            }
+            if !sharedArenaDeclared {
+                sharedArenaDeclared = true
+                threadgroupBytes += arena.capacity * (arena.element.scalarByteWidth ?? 4)
+                guard threadgroupBytes <= FunctionEmitter.threadgroupMemoryLimit else {
+                    throw CoreError.lowering(
+                        "kernel '\(function.name)' needs \(threadgroupBytes) bytes of threadgroup "
+                            + "memory to stage its tt.dot tiles, over Metal's "
+                            + "\(FunctionEmitter.threadgroupMemoryLimit)-byte limit; reduce "
+                            + "BLOCK_M, BLOCK_N or HEAD_DIM", loc)
+                }
+                preamble.append(
+                    .line(
+                        "threadgroup \(try scalarTypeName(arena.element, loc)) "
+                            + "\(arena.name)[\(arena.capacity)];  // shared tt.dot operand arena"))
+            }
+            let base = sharedArenaCursor == 0 ? arena.name : "\(arena.name) + \(sharedArenaCursor)"
+            let pointer = element == arena.element ? base : "(threadgroup \(elementName) *)(\(base))"
+            preamble.append(
+                .line("threadgroup \(elementName) *\(tile.name) = \(pointer);  // \(shape)"))
+            sharedArenaCursor += slots
             return tile
         }
 
@@ -1498,25 +1798,38 @@ private struct FunctionEmitter {
         tiles[ssa] = tile
         names[ssa] = tile.expression
         types[ssa] = type
-        levels[ssa] = rank
+        // A tile reads as an ordinary per-lane value wherever its own axes' loops
+        // are open, which is the nest the layout put the value in.
+        let path = layout.path(of: ssa)
+        levels[ssa] = path.isEmpty ? tile.axes.sorted() : path
     }
 
     /// The instructions needed to rebuild `ssa` inside a staging loop, in program
     /// order. Values that are already in scope at the uniform level stop the walk.
-    private func recomputationOrder(for ssa: String, _ loc: SourceLoc) throws -> [Instruction] {
+    private func recomputationOrder(
+        for ssa: String, available: Set<Int> = [], _ loc: SourceLoc
+    ) throws -> [Instruction] {
         func inScope(_ value: String) -> Bool {
-            names[value] != nil && (levels[value] ?? 0) == 0 && tiles[value] == nil
+            names[value] != nil && (levels[value] ?? []).isEmpty && tiles[value] == nil
         }
 
         var needed: Set<String> = []
         var stack = [ssa]
         while let value = stack.popLast() {
             if needed.contains(value) || inScope(value) { continue }
-            if tiles[value] != nil {
-                throw CoreError.lowering(
-                    "'%\(value)' is a tt.dot accumulator tile and cannot be staged as a tt.dot "
-                        + "operand; chaining two dots needs a round trip through device memory",
-                    loc)
+            // A value already in a threadgroup tile is *read* here rather than
+            // rebuilt — which is what lets a dot take another dot's result (or a
+            // spilled reduction, or a loop-carried tensor) as an operand, as long
+            // as this nest has the loops its index expression needs.
+            if let tile = tiles[value] {
+                guard Set(tile.axes).isSubset(of: available) else {
+                    throw CoreError.lowering(
+                        "'%\(value)' lives in threadgroup memory indexed by block dimensions "
+                            + "\(tile.axes), which this tt.dot's staging loops (\(available.sorted())) "
+                            + "do not walk; a dot operand can only read a tile whose axes its own "
+                            + "tile shares", loc)
+                }
+                continue
             }
             guard let instruction = definitions[value] else {
                 throw CoreError.lowering(
@@ -1551,6 +1864,14 @@ private struct FunctionEmitter {
     /// of being redone for every element.
     private func stagingVariance(_ producers: [Instruction]) -> [String: Set<Int>] {
         var varying: [String: Set<Int>] = [:]
+        // A value the walk stopped at because it is already in a tile varies
+        // along that tile's axes — `acc * alpha[:, None]` reads the accumulator
+        // tile, which varies along the column the staging loop strides.
+        for instruction in producers {
+            for operand in instruction.kind.operandNames where varying[operand] == nil {
+                if let tile = tiles[operand] { varying[operand] = Set(tile.axes) }
+            }
+        }
         for instruction in producers {
             guard let result = FunctionEmitter.soleResult(instruction.kind) else { continue }
             var axes: Set<Int> = []
@@ -1642,7 +1963,8 @@ private struct FunctionEmitter {
             if let recorded = affinity[value] { return recorded }
             // Anything outside the subgraph is already in scope at the uniform
             // level, so it cannot vary with the column.
-            return (varying[value] ?? []).contains(column) ? nil : .literal(0)
+            let axes = varying[value] ?? Set(tiles[value]?.axes ?? [])
+            return axes.contains(column) ? nil : .literal(0)
         }
         for instruction in producers {
             guard let result = FunctionEmitter.soleResult(instruction.kind) else { continue }
@@ -1709,7 +2031,7 @@ private struct FunctionEmitter {
         }
         if let mask, !monotone(mask) { return nil }
 
-        let slice = (try? mask.map { try recomputationOrder(for: $0, loc) })
+        let slice = (try? mask.map { try recomputationOrder(for: $0, available: Set(tile.axes), loc) })
         return VectorStagingPlan(
             pointer: pointer, mask: mask, maskSlice: slice.flatMap { $0 } ?? [], stride: stride)
     }
@@ -1739,7 +2061,7 @@ private struct FunctionEmitter {
     /// lanes take a zero without evaluating any pointer arithmetic, so an edge
     /// tile never forms an out-of-range address.
     private mutating func stage(_ ssa: String, into tile: Tile, _ loc: SourceLoc) throws -> Stmt {
-        let producers = try recomputationOrder(for: ssa, loc)
+        let producers = try recomputationOrder(for: ssa, available: Set(tile.axes), loc)
         let varying = stagingVariance(producers)
         let elementName = try scalarTypeName(tile.element, loc)
         let zero = literal(
@@ -1792,14 +2114,14 @@ private struct FunctionEmitter {
         var vectorElse = false
         frames.append(
             Frame(
-                level: 0, kind: .staging,
+                path: [], kind: .staging,
                 open: "for (uint \(row) = tm_thread_id.x / \(lanes)u; \(row) < \(tile.paddedRows)u; "
                     + "\(row) += \(max(1, threadsPerThreadgroup / lanes))u) {"))
         if unroll > 1 {
             let group = "\(column)_run"
             frames.append(
                 Frame(
-                    level: 0, kind: .staging,
+                    path: [], kind: .staging,
                     open: "for (uint \(group) = (tm_thread_id.x % \(lanes)u) * \(unroll)u; "
                         + "\(group) < \(tile.paddedColumns)u; \(group) += \(lanes * unroll)u) {"))
             // The run's four loads become one, when the run turns out at runtime
@@ -1833,7 +2155,7 @@ private struct FunctionEmitter {
                 ) throws -> TMType? {
                     frames.append(
                         Frame(
-                            level: 0, kind: .staging,
+                            path: [], kind: .staging,
                             open: conditions.isEmpty ? "{" : "if (\(ok)) {"))
                     let scope = frames.count - 1
                     frames[scope].statements.append(
@@ -1862,7 +2184,7 @@ private struct FunctionEmitter {
                 // one element apart, and whether the address is aligned for a
                 // vector load.
                 var stride: String?
-                let addressSlice = try recomputationOrder(for: plan.pointer, loc)
+                let addressSlice = try recomputationOrder(for: plan.pointer, available: Set(tile.axes), loc)
                 let pointerType = try replay(addressSlice, at: 0, { address in
                     stride = render(plan.stride)
                     return .line("\(base) = \(address);")
@@ -1911,19 +2233,19 @@ private struct FunctionEmitter {
                         .group(
                             open: "if (\(ok)) {  // one vector load for the whole run",
                             body: fast, close: "}"))
-                    frames.append(Frame(level: 0, kind: .staging, open: "else {"))
+                    frames.append(Frame(path: [], kind: .staging, open: "else {"))
                     vectorElse = true
                 }
             }
             frames.append(
                 Frame(
-                    level: 0, kind: .staging,
+                    path: [], kind: .staging,
                     open: "for (uint \(column) = \(group); \(column) < \(group) + \(unroll)u; "
                         + "++\(column)) {"))
         } else {
             frames.append(
                 Frame(
-                    level: 0, kind: .staging,
+                    path: [], kind: .staging,
                     open: "for (uint \(column) = tm_thread_id.x % \(lanes)u; "
                         + "\(column) < \(tile.paddedColumns)u; \(column) += \(lanes)u) {"))
         }
@@ -1940,7 +2262,7 @@ private struct FunctionEmitter {
                 .line("\(elementName) \(temporary) = \(zero);  // 8x8 fragment padding"))
             frames.append(
                 Frame(
-                    level: 0, kind: .staging,
+                    path: [], kind: .staging,
                     open: "if (\(conditions.joined(separator: " && "))) {"))
             guarded = true
         }
@@ -1966,10 +2288,9 @@ private struct FunctionEmitter {
         if guarded {
             frames[frames.count - 1].statements.append(.line("\(temporary) = \(value);"))
             closeTopFrame()
-            frames[frames.count - 1].statements.append(
-                .line("\(tile.expression) = \(temporary);"))
+            frames[frames.count - 1].statements.append(.line("\(tile.slot) = \(temporary);"))
         } else {
-            frames[frames.count - 1].statements.append(.line("\(tile.expression) = \(value);"))
+            frames[frames.count - 1].statements.append(.line("\(tile.slot) = \(value);"))
         }
         closeTopFrame()
         if vectorElse { closeTopFrame() }
@@ -2043,7 +2364,13 @@ private struct FunctionEmitter {
             }
         }
 
-        let contraction = layout.axes[dot.lhs]?.last ?? rank
+        // Which block axis each of the six operand dimensions indexes. These are
+        // *not* (0, 1, contraction) in general: FA-2's second dot contracts over
+        // the same axis its softmax iterates and produces the head dimension its
+        // accumulator iterates, so all three come from the layout.
+        let lhsAxes = layout.axes[dot.lhs] ?? [0, rank]
+        let rhsAxes = layout.axes[dot.rhs] ?? [rank, 1]
+        let resultAxes = layout.axes[dot.result] ?? [0, 1]
         let level = uniformLevel
         guard frames.last(where: { $0.kind == .region }) == nil else {
             throw CoreError.lowering(
@@ -2075,11 +2402,25 @@ private struct FunctionEmitter {
                 registers = self.registers(index, for: existing, element: resultElement)
                 resident = false
             }
+        } else if let bound = boundAccumulators[dot.result] {
+            // A cross-lane loop carries this accumulator, but the loop does not
+            // yield the dot's result directly — FA-2 rescales `acc` by a per-row
+            // correction factor first. The carried tile *is* the dot's
+            // accumulator tile, and the rescale is lowered as the staging pass
+            // that fills it: each thread reads and writes the same element, so
+            // the read-modify-write needs no more ordering than staging already
+            // has (§Cross-lane regions).
+            accumulator = bound
+            registers = self.registers(index, for: bound, element: resultElement)
+            resident = false
+            statements.append(
+                .line("// tt.dot: the carried accumulator, rescaled in place"))
+            statements.append(try stage(dot.accumulator, into: bound, loc))
         } else {
             let blocking = self.blocking(rows: resultShape[0], columns: resultShape[1])
             accumulator = try allocateTile(
                 "dot_c", element: resultElement, rows: resultShape[0], columns: resultShape[1],
-                rowAxis: 0, columnAxis: 1,
+                rowAxis: resultAxes[0], columnAxis: resultAxes[1],
                 rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
                 columnGranularity: blocking.tilesN * FunctionEmitter.fragment, loc)
             registers = self.registers(index, for: accumulator, element: resultElement)
@@ -2092,17 +2433,32 @@ private struct FunctionEmitter {
         // that the last block's fragments address rows and columns the tiles
         // actually have.
         let blocking = registers.blocking
+        let shared = sharesOperandArena
+        if shared {
+            sharedArenaCursor = 0
+            if sharedArena == nil {
+                sharedArena = (
+                    name: "tm_dot_arena", element: .float(width: 32),
+                    capacity: sharedArenaSlots(function.body))
+            }
+        }
         let lhs = try allocateTile(
             "dot_a", element: lhsElement, rows: lhsShape[0], columns: lhsShape[1],
-            rowAxis: 0, columnAxis: contraction,
+            rowAxis: lhsAxes[0], columnAxis: lhsAxes[1],
             rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
-            intoArena: resident, loc)
+            intoArena: resident, intoSharedArena: shared, loc)
         let rhs = try allocateTile(
             "dot_b", element: rhsElement, rows: rhsShape[0], columns: rhsShape[1],
-            rowAxis: contraction, columnAxis: 1,
+            rowAxis: rhsAxes[0], columnAxis: rhsAxes[1],
             columnGranularity: blocking.tilesN * FunctionEmitter.fragment,
-            intoArena: resident, loc)
+            intoArena: resident, intoSharedArena: shared, loc)
 
+        // Everything staged below may read a tile ordinary per-lane code wrote
+        // (a spilled reduction, a carried accumulator), and those writes are in
+        // whatever nest computed them.
+        if hasSpilledTiles {
+            statements.insert(.line("threadgroup_barrier(mem_flags::mem_threadgroup);"), at: 0)
+        }
         statements.append(.line("// tt.dot: stage A (\(lhsShape[0])x\(lhsShape[1]))"))
         statements.append(try stage(dot.lhs, into: lhs, loc))
         statements.append(.line("// tt.dot: stage B (\(rhsShape[0])x\(rhsShape[1]))"))
@@ -2141,6 +2497,55 @@ private struct FunctionEmitter {
             columnFragments: FunctionEmitter.padded(columns) / FunctionEmitter.fragment,
             simdgroups: simdgroupCount,
             requestedM: options.dotRegisterM, requestedN: options.dotRegisterN)
+    }
+
+    /// True when this kernel's `tt.dot`s share one operand arena rather than each
+    /// declaring its own tiles.
+    ///
+    /// Only with more than one dot, and only when no accumulator is
+    /// register-resident (a resident accumulator's own tile is already the arena
+    /// and is the better deal — it costs nothing at all). Two dots' operand tiles
+    /// are never live at once: the barrier that ends one dot's arithmetic is
+    /// before the next one's staging.
+    private var sharesOperandArena: Bool { dotTotal >= 2 && stagingArena == nil }
+
+    /// The largest operand footprint of any single `tt.dot` in `body`, in f32
+    /// slots — what the shared arena has to be.
+    private func sharedArenaSlots(_ body: [Instruction]) -> Int {
+        var largest = 0
+        func walk(_ body: [Instruction]) {
+            for instruction in body {
+                switch instruction.kind {
+                case .forLoop(let loop): walk(loop.body)
+                case .ifOp(let branch):
+                    walk(branch.thenBody)
+                    walk(branch.elseBody)
+                case .dot(let dot):
+                    guard case .tensor(let lhsShape, let lhsElement) = dot.lhsType,
+                        case .tensor(let rhsShape, let rhsElement) = dot.rhsType,
+                        case .tensor(let resultShape, _) = dot.resultType, resultShape.count == 2
+                    else { continue }
+                    let size = FunctionEmitter.fragment
+                    let blocking = self.blocking(rows: resultShape[0], columns: resultShape[1])
+                    func count(_ rows: Int, _ columns: Int, _ element: TMType) -> Int {
+                        rows * (columns + FunctionEmitter.rowPadding(columns, element, options))
+                    }
+                    let lhs = count(
+                        FunctionEmitter.padded(lhsShape[0], to: blocking.tilesM * size),
+                        FunctionEmitter.padded(lhsShape[1]), lhsElement)
+                    let rhs = count(
+                        FunctionEmitter.padded(rhsShape[0]),
+                        FunctionEmitter.padded(rhsShape[1], to: blocking.tilesN * size), rhsElement)
+                    let slots =
+                        FunctionEmitter.arenaSlots(lhs, of: lhsElement, in: .float(width: 32))
+                        + FunctionEmitter.arenaSlots(rhs, of: rhsElement, in: .float(width: 32))
+                    largest = max(largest, slots)
+                default: continue
+                }
+            }
+        }
+        walk(body)
+        return largest
     }
 
     /// How much arena the operand tiles of every `tt.dot` in `body` need, in slots
@@ -2192,7 +2597,10 @@ private struct FunctionEmitter {
     ///
     /// The CUDA playbook says: as large as the registers allow, because
     /// `tilesM * tilesN` multiply-accumulates come off only `tilesM + tilesN`
-    /// operand loads. **On Apple silicon that is wrong**, and measurably so — at
+    /// operand loads. **On M1-generation Apple silicon that is wrong**, and
+    /// measurably so (M1 Max and M1 Pro; unmeasured on M2/M3/M4, whose memory
+    /// hierarchy differs — re-run `tmbench --sweep full` before trusting this
+    /// default there) — at
     /// `64x128` on 16 simdgroups, 1x1 blocking runs 28% faster than 2x2 with the
     /// same number of accumulator fragments per simdgroup, and at `64x64` the two
     /// are within noise (docs/ARCHITECTURE.md §Matmul throughput). The operand
@@ -2499,33 +2907,39 @@ private struct FunctionEmitter {
 
     // MARK: - Control flow
 
-    /// The depth at which a whole region has to sit: deep enough for every value
-    /// it reads and every tensor it computes.
-    private func regionLevel(_ body: [Instruction], seed: Int) -> Int {
-        var depth = seed
+    /// The nest a whole region has to sit in: deep enough for every value it
+    /// reads and every tensor it computes.
+    private func regionLevel(_ body: [Instruction], seed: [Int]) -> [Int] {
+        var axes = Set(seed)
+        func widen(_ ssa: String) { axes.formUnion(layout.path(of: ssa)) }
         for instruction in body {
             switch instruction.kind {
             case .forLoop(let loop):
                 for argument in loop.iterArguments {
-                    depth = max(depth, levels[argument.initial] ?? 0)
-                    depth = max(depth, argument.type.isTensor ? rank : 0)
+                    axes.formUnion(levels[argument.initial] ?? [])
+                    widen(argument.name)
                 }
-                depth = max(depth, levels[loop.lowerBound] ?? 0)
-                depth = max(depth, levels[loop.upperBound] ?? 0)
-                depth = max(depth, regionLevel(loop.body, seed: 0))
+                axes.formUnion(levels[loop.lowerBound] ?? [])
+                axes.formUnion(levels[loop.upperBound] ?? [])
+                axes.formUnion(regionLevel(loop.body, seed: []))
             case .ifOp(let branch):
-                depth = max(depth, levels[branch.condition] ?? 0)
-                for type in branch.resultTypes where type.isTensor { depth = max(depth, rank) }
-                depth = max(depth, regionLevel(branch.thenBody, seed: 0))
-                depth = max(depth, regionLevel(branch.elseBody, seed: 0))
+                axes.formUnion(levels[branch.condition] ?? [])
+                for (index, type) in branch.resultTypes.enumerated()
+                where type.isTensor && index < branch.results.count {
+                    widen(branch.results[index])
+                }
+                axes.formUnion(regionLevel(branch.thenBody, seed: []))
+                axes.formUnion(regionLevel(branch.elseBody, seed: []))
             default:
                 for operand in instruction.kind.operandNames {
-                    depth = max(depth, levels[operand] ?? 0)
+                    axes.formUnion(levels[operand] ?? [])
                 }
-                if FunctionEmitter.definesTensor(instruction.kind) { depth = max(depth, rank) }
+                if FunctionEmitter.definesTensor(instruction.kind) {
+                    for result in instruction.kind.resultNames { widen(result) }
+                }
             }
         }
-        return depth
+        return axes.sorted()
     }
 
     /// True when the op materialises a tensor value, which pins it to the
@@ -2538,6 +2952,80 @@ private struct FunctionEmitter {
         default:
             return false
         }
+    }
+
+    private static func countDots(_ body: [Instruction]) -> Int {
+        var total = 0
+        for instruction in body {
+            switch instruction.kind {
+            case .dot: total += 1
+            case .forLoop(let loop): total += countDots(loop.body)
+            case .ifOp(let branch):
+                total += countDots(branch.thenBody) + countDots(branch.elseBody)
+            default: break
+            }
+        }
+        return total
+    }
+
+    /// Reduction results some `tt.dot` operand depends on.
+    ///
+    /// A dot operand is rebuilt inside the dot's own staging loops, and a
+    /// `tt.reduce` is precisely what cannot be rebuilt there — its fold is
+    /// threadgroup-wide and has already happened. Those results are therefore
+    /// written into a small threadgroup array where they are computed and read
+    /// out of it in the staging loops. This is the second half of what
+    /// FlashAttention-2 needs: `p = exp2(qk * scale - m_ij)` is the second dot's
+    /// left operand, and `m_ij` is a row reduction.
+    static func reductionsReadByADot(in function: TritonFunction, layout: BlockLayout) -> Set<String>
+    {
+        var definitions: [String: Instruction] = [:]
+        var tileBacked: Set<String> = []
+        var operands: [String] = []
+
+        func collect(_ body: [Instruction]) {
+            for instruction in body {
+                for result in instruction.kind.resultNames where definitions[result] == nil {
+                    definitions[result] = instruction
+                }
+                switch instruction.kind {
+                case .dot(let dot):
+                    tileBacked.insert(dot.result)
+                    operands.append(contentsOf: [dot.lhs, dot.rhs, dot.accumulator])
+                case .forLoop(let loop):
+                    if containsCrossLane(loop.body) {
+                        for (index, argument) in loop.iterArguments.enumerated()
+                        where argument.type.isTensor {
+                            tileBacked.insert(argument.name)
+                            if index < loop.results.count { tileBacked.insert(loop.results[index]) }
+                        }
+                    }
+                    collect(loop.body)
+                case .ifOp(let branch):
+                    collect(branch.thenBody)
+                    collect(branch.elseBody)
+                default:
+                    break
+                }
+            }
+        }
+        collect(function.body)
+
+        var spilled: Set<String> = []
+        var seen: Set<String> = []
+        var stack = operands
+        while let value = stack.popLast() {
+            guard seen.insert(value).inserted, !tileBacked.contains(value) else { continue }
+            // A scalar is program-uniform and already in scope wherever a staging
+            // loop needs it, reduction or not.
+            guard layout.axes[value] != nil, let instruction = definitions[value] else { continue }
+            if case .reduce = instruction.kind {
+                spilled.insert(value)
+                continue
+            }
+            stack.append(contentsOf: instruction.kind.operandNames)
+        }
+        return spilled
     }
 
     /// True when `body` (or any region inside it) performs a `tt.dot`.
@@ -2589,8 +3077,8 @@ private struct FunctionEmitter {
             try emitUniformLoop(loop, loc: loc)
             return
         }
-        var level = regionLevel([Instruction(kind: .forLoop(loop), mnemonic: "scf.for", loc: loc)], seed: 0)
-        level = min(level, rank)
+        let level = regionLevel(
+            [Instruction(kind: .forLoop(loop), mnemonic: "scf.for", loc: loc)], seed: [])
         try ensureLevel(level, loc)
 
         guard try type(of: loop.lowerBound, loc).isIntegerLike else {
@@ -2622,7 +3110,7 @@ private struct FunctionEmitter {
             + "\(induction) < \(try name(of: loop.upperBound, loc)); "
             + "\(induction) += \(try name(of: loop.step, loc))) {"
 
-        frames.append(Frame(level: level, kind: .region, open: open))
+        frames.append(Frame(path: level, kind: .region, open: open))
         yieldTargets.append(targets)
         for instruction in loop.body { try emit(instruction) }
         yieldTargets.removeLast()
@@ -2659,9 +3147,14 @@ private struct FunctionEmitter {
     ///     which is not carried at all: it is strength-reduced back to
     ///     `init + trip_count * delta` so the dot can rebuild it from scratch.
     ///
-    /// Anything else — a per-lane tensor carried across the loop — is refused by
-    /// name, because there is nowhere for it to live (see docs/ARCHITECTURE.md
-    /// §Hard parts 3).
+    /// Anything else — an ordinary per-lane tensor — is **spilled**: it gets a
+    /// threadgroup tile of its own, seeded before the loop, read as a tile
+    /// everywhere inside it, and updated once per iteration through a shadow tile
+    /// (the new value is written where it is *computed*, because the nest that
+    /// computed it is closed by the time `scf.yield` is reached, and the old value
+    /// is usually still being read at that point — FlashAttention-2's
+    /// `alpha = exp2(m_i - m_ij)` is exactly that). See docs/ARCHITECTURE.md
+    /// §Hard parts 3.
     private mutating func emitUniformLoop(_ loop: ForLoop, loc: SourceLoc) throws {
         let level = uniformLevel
         try ensureLevel(level, loc)
@@ -2670,7 +3163,7 @@ private struct FunctionEmitter {
         }
         // The barriers inside make the trip count a threadgroup-wide contract.
         for bound in [loop.lowerBound, loop.upperBound, loop.step] {
-            guard (levels[bound] ?? 0) <= level else {
+            guard FunctionEmitter.isPrefix(levels[bound] ?? [], of: level) else {
                 throw CoreError.lowering(
                     "an scf.for containing a cross-lane operation must have a "
                         + "threadgroup-uniform trip count, but its bound '%\(bound)' varies per "
@@ -2706,25 +3199,27 @@ private struct FunctionEmitter {
             }
 
             if argument.type.isTensor {
-                guard let yieldValue, let dot = FunctionEmitter.findDot(yieldValue, in: loop.body),
-                    dot.accumulator == argument.name
-                else {
-                    throw CoreError.lowering(
-                        "scf.for carries the tensor '%\(argument.name)' across a cross-lane "
-                            + "operation, which forces the loop to be threadgroup-uniform; the "
-                            + "only tensor such a loop can carry is the accumulator a tt.dot "
-                            + "itself updates, because that one lives in threadgroup memory",
-                        loc)
+                let dot = yieldValue.flatMap { FunctionEmitter.findDot($0, in: loop.body) }
+                // The cheap case, and the one Triton's matmul tutorial writes: the
+                // loop yields the dot's result and the dot's accumulator *is* the
+                // carried value, so the tile never has to be touched by per-lane
+                // code and the fragments can stay in registers for the whole loop.
+                guard let dot, dot.accumulator == argument.name else {
+                    try spillCarriedTensor(
+                        argument, yieldValue: yieldValue, dot: dot, level: level,
+                        targets: &targets, loc: loc)
+                    continue
                 }
                 guard case .tensor(let shape, let element) = argument.type, shape.count == 2 else {
                     throw CoreError.lowering(
                         "a tt.dot accumulator must be a rank-2 tensor, found \(argument.type)", loc)
                 }
+                let accumulatorAxes = layout.axes[argument.name] ?? [0, 1]
                 let blocking = self.blocking(rows: shape[0], columns: shape[1])
                 let operands = operandArenaSlots(loop.body, blocking: blocking, arena: element)
                 let tile = try allocateTile(
                     "dot_c", element: element, rows: shape[0], columns: shape[1],
-                    rowAxis: 0, columnAxis: 1,
+                    rowAxis: accumulatorAxes[0], columnAxis: accumulatorAxes[1],
                     rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
                     columnGranularity: blocking.tilesN * FunctionEmitter.fragment,
                     capacity: operands, loc)
@@ -2812,7 +3307,7 @@ private struct FunctionEmitter {
             + "\(induction) < \(try name(of: loop.upperBound, loc)); "
             + "\(induction) += \(step)) {"
 
-        frames.append(Frame(level: level, kind: .uniformRegion, open: open))
+        frames.append(Frame(path: level, kind: .uniformRegion, open: open))
         frames[frames.count - 1].discardable = false
 
         // The body opens its own block loops, so it gets its own recompute
@@ -2821,8 +3316,17 @@ private struct FunctionEmitter {
         // around the loop) but must not leak its own statements back out.
         let savedHistory = history
         let savedClosedLevels = closedLevels
+        let savedNotRecomputable = notRecomputable
         let savedCanHoist = canHoist
-        closedLevels.formUnion((level + 1)...max(level + 1, rank))
+        // Every nest the body might open counts as already closed, so that the
+        // first lane loop inside it replays whatever was live when the loops
+        // closed around the loop.
+        for path in Set(layout.paths.values) where FunctionEmitter.isPrefix(level, of: path) {
+            for depth in (level.count + 1)...max(level.count + 1, path.count)
+            where depth <= path.count {
+                closedLevels.insert(Array(path[0..<depth]))
+            }
+        }
 
         // A carried pointer becomes `init + trip_count * delta`, computed once per
         // iteration and rebuilt by the dot from the induction variable.
@@ -2847,10 +3351,38 @@ private struct FunctionEmitter {
             nextValueOrder += 1
         }
 
+        let savedSpillCopies = spillCopies
+        spillCopies = []
         yieldTargets.append(targets)
         for instruction in loop.body { try emit(instruction) }
         yieldTargets.removeLast()
         try ensureLevel(level, loc)
+
+        // The iteration's new values are all in their shadows; copy them over the
+        // carried tiles now that nothing is reading the old ones. Both barriers
+        // are load-bearing: the first orders every read of the old value before
+        // the overwrite, the second makes the new value visible to the threads
+        // that did not write it.
+        if !spillCopies.isEmpty {
+            let reason = "a spilled loop-carried tensor cannot be recomputed"
+            try append(
+                .line("// scf.yield: the carried tensors take their new values"),
+                level: level, recomputable: false, reason: reason, loc)
+            try append(
+                .line("threadgroup_barrier(mem_flags::mem_threadgroup);"), level: level,
+                recomputable: false, reason: reason, loc)
+            for copy in spillCopies where copy.from.name != copy.to.name {
+                try append(
+                    tileNest(copy.to, [.line("\(copy.to.slot) = \(copy.from.slot);")]),
+                    level: level, recomputable: false, sideEffecting: true, poisons: false, loc)
+            }
+            try append(
+                .line("threadgroup_barrier(mem_flags::mem_threadgroup);"), level: level,
+                recomputable: false, reason: reason, loc)
+            spillCopies = []
+        }
+        spillCopies = savedSpillCopies
+
         guard frames[frames.count - 1].kind == .uniformRegion else {
             throw CoreError.lowering("scf.for body left an unbalanced scope", loc)
         }
@@ -2891,6 +3423,7 @@ private struct FunctionEmitter {
 
         history = savedHistory
         closedLevels = savedClosedLevels
+        notRecomputable = savedNotRecomputable
         canHoist = savedCanHoist
         notRecomputable[level] =
             "an scf.for containing a cross-lane operation cannot be recomputed"
@@ -2901,7 +3434,7 @@ private struct FunctionEmitter {
                 names[result] = variable
                 types[result] = loop.iterArguments[index].type
                 levels[result] = level
-            case .tile:
+            case .tile, .spilled:
                 registerTile(
                     result, tiles[loop.iterArguments[index].name]!,
                     type: loop.iterArguments[index].type)
@@ -2909,6 +3442,142 @@ private struct FunctionEmitter {
                 continue
             }
         }
+    }
+
+    /// A per-lane tensor carried across a cross-lane loop, spilled to a tile.
+    ///
+    /// Two shapes. When the loop yields a `tt.dot`'s **result** but the dot's
+    /// accumulator is some per-lane function of the carried value rather than the
+    /// carried value itself — FlashAttention-2's
+    /// `acc = tt.dot(p, v, acc * alpha[:, None])` — the carried tile *is* the
+    /// dot's accumulator tile and that function is lowered as the staging pass
+    /// that fills it. Each staging thread reads and writes the same element, so
+    /// the rescale needs no ordering staging does not already have, there is no
+    /// copy, and the tile exists once.
+    ///
+    /// Otherwise the value gets a tile and a shadow. The new value is written
+    /// into the shadow where it is *defined*, because by `scf.yield` the nest that
+    /// computed it has been closed (a `tt.reduce` result cannot be rebuilt) and
+    /// because the old value is usually still being read at that point; the shadow
+    /// is copied over the tile once, at the end of the body, between barriers.
+    private mutating func spillCarriedTensor(
+        _ argument: (name: String, initial: String, type: TMType), yieldValue: String?,
+        dot: DotOp?, level: [Int], targets: inout [YieldTarget], loc: SourceLoc
+    ) throws {
+        guard case .tensor(let shape, let element) = argument.type else {
+            throw CoreError.lowering("scf.for carries a non-tensor as a tensor", loc)
+        }
+        let path = layout.path(of: argument.name)
+        guard !path.isEmpty, path.count <= 2 else {
+            throw CoreError.lowering(
+                "scf.for carries '%\(argument.name)' across a cross-lane operation, but it spans "
+                    + "\(path.count) block dimensions; only rank-1 and rank-2 carried tensors are "
+                    + "spilled into threadgroup memory", loc)
+        }
+        let reason = "a spilled loop-carried tensor cannot be recomputed"
+
+        if let dot, yieldValue == dot.result {
+            guard shape.count == 2, let axes = layout.axes[argument.name], axes.count == 2 else {
+                throw CoreError.lowering(
+                    "a tt.dot accumulator must be a rank-2 tensor, found \(argument.type)", loc)
+            }
+            let blocking = self.blocking(rows: shape[0], columns: shape[1])
+            let tile = try allocateTile(
+                "dot_c", element: element, rows: shape[0], columns: shape[1],
+                rowAxis: axes[0], columnAxis: axes[1],
+                rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
+                columnGranularity: blocking.tilesN * FunctionEmitter.fragment, loc)
+            try append(
+                .line(
+                    "// scf.for carries a \(shape[0])x\(shape[1]) tt.dot accumulator that is "
+                        + "rescaled per iteration; it stays in threadgroup memory"),
+                level: level, recomputable: false, reason: reason, loc)
+            try seedTile(tile, from: argument.initial, at: level, loc)
+            hasSpilledTiles = true
+            registerTile(argument.name, tile, type: argument.type)
+            boundAccumulators[dot.result] = tile
+            targets.append(.tile(tile.name))
+            return
+        }
+
+        let tile = try spillTile("carry", for: argument.name, type: argument.type, loc)
+        try append(
+            .line(
+                "// scf.for carries '%\(argument.name)' across a cross-lane operation: spilled to "
+                    + "threadgroup memory, updated through a shadow tile"),
+            level: level, recomputable: false, reason: reason, loc)
+        try seedTile(tile, from: argument.initial, at: level, loc)
+        registerTile(argument.name, tile, type: argument.type)
+
+        guard let yieldValue, yieldValue != argument.name else {
+            targets.append(.tile(tile.name))
+            return
+        }
+        let shadow = try spillTile("carry_next", for: argument.name, type: argument.type, loc)
+        shadowWrites[yieldValue] = shadow
+        targets.append(.spilled(tile: tile, shadow: shadow, value: yieldValue))
+    }
+
+    /// A self-contained loop nest over one tile's own extents, spread over the
+    /// whole threadgroup.
+    ///
+    /// Deliberately *not* built with `ensureLevel`: a tile copy reads and writes
+    /// threadgroup memory and needs none of the per-lane values the block loops
+    /// exist to rebuild, so it must not be blocked by a nest that a `tt.reduce`
+    /// has made unrecomputable — which, inside an online softmax's loop, is every
+    /// nest there is.
+    private func tileNest(_ tile: Tile, _ body: [Stmt]) -> Stmt {
+        let threads = threadsPerThreadgroup
+        let row = "tm_i\(tile.rowAxis)"
+        guard tile.hasColumns, tile.columns > 1 else {
+            return .group(
+                open: "for (uint \(row) = tm_thread_id.x; \(row) < \(max(1, tile.rows))u; "
+                    + "\(row) += \(threads)u) {", body: body, close: "}")
+        }
+        var lanes = 1
+        while lanes * 2 <= min(tile.columns, threads), threads % (lanes * 2) == 0 { lanes *= 2 }
+        let column = "tm_i\(tile.columnAxis)"
+        let inner = Stmt.group(
+            open: "for (uint \(column) = tm_thread_id.x % \(lanes)u; "
+                + "\(column) < \(tile.columns)u; \(column) += \(lanes)u) {", body: body, close: "}")
+        return .group(
+            open: "for (uint \(row) = tm_thread_id.x / \(lanes)u; \(row) < \(tile.rows)u; "
+                + "\(row) += \(max(1, threads / lanes))u) {", body: [inner], close: "}")
+    }
+
+    /// Fills a carried tile with its `iter_args` initialiser, padding included.
+    ///
+    /// The flat pass is what covers the fragment padding, which no per-lane nest
+    /// walks and which a `simdgroup_load` of an edge fragment still reads.
+    private mutating func seedTile(
+        _ tile: Tile, from initial: String, at level: [Int], _ loc: SourceLoc
+    ) throws {
+        let reason = "a spilled loop-carried tensor cannot be recomputed"
+        var splat: String? = nil
+        if let instruction = definitions[initial], case .constant(_, let type, let value) = instruction.kind {
+            splat = literal(value, type.withElement(tile.element), loc)
+        }
+        let fill = splat ?? literal(
+            tile.element.isFloatLike ? .float(0) : .integer(0), tile.element, loc)
+        try append(
+            .line(
+                "for (uint tm_seed = tm_thread_id.x; tm_seed < \(tile.elementCount)u; "
+                    + "tm_seed += tm_threadgroup_size.x) { \(tile.name)[tm_seed] = \(fill); }"),
+            level: level, recomputable: false, sideEffecting: true, poisons: false, loc)
+        if splat == nil {
+            guard (levels[initial] ?? []).isEmpty else {
+                throw CoreError.lowering(
+                    "the initial value of the carried tensor in '\(tile.name)' is itself a "
+                        + "per-lane tensor computed inside the block loops; a cross-lane loop can "
+                        + "only be seeded from a splat or a program-uniform value", loc)
+            }
+            try append(
+                tileNest(tile, [.line("\(tile.slot) = \(try name(of: initial, loc));")]),
+                level: level, recomputable: false, sideEffecting: true, poisons: false, loc)
+        }
+        try append(
+            .line("threadgroup_barrier(mem_flags::mem_threadgroup);"), level: level,
+            recomputable: false, reason: reason, loc)
     }
 
     private static func findDot(_ result: String, in body: [Instruction]) -> DotOp? {
@@ -2925,7 +3594,7 @@ private struct FunctionEmitter {
     {
         var current = ssa
         for _ in 0..<8 {
-            if let name = names[current], (levels[current] ?? 0) == 0, tiles[current] == nil {
+            if let name = names[current], (levels[current] ?? []).isEmpty, tiles[current] == nil {
                 return name
             }
             guard
@@ -2948,8 +3617,8 @@ private struct FunctionEmitter {
                 "tt.dot inside an scf.if is not lowered: its threadgroup barriers would only be "
                     + "reached by the threads taking that branch", loc)
         }
-        var level = regionLevel([Instruction(kind: .ifOp(branch), mnemonic: "scf.if", loc: loc)], seed: 0)
-        level = min(level, rank)
+        let level = regionLevel(
+            [Instruction(kind: .ifOp(branch), mnemonic: "scf.if", loc: loc)], seed: [])
         try ensureLevel(level, loc)
 
         let conditionType = try type(of: branch.condition, loc)
@@ -2975,7 +3644,7 @@ private struct FunctionEmitter {
         for (isThen, body) in [(true, branch.thenBody), (false, branch.elseBody)] {
             if !isThen && body.isEmpty { continue }
             let open = isThen ? "if (\(conditionName)) {" : "else {"
-            frames.append(Frame(level: level, kind: .region, open: open))
+            frames.append(Frame(path: level, kind: .region, open: open))
             yieldTargets.append(targets)
             for instruction in body { try emit(instruction) }
             yieldTargets.removeLast()

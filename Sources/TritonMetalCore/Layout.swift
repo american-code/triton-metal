@@ -2,64 +2,92 @@ import Foundation
 
 /// How one kernel's tensors map onto the threadgroup's iteration space.
 ///
-/// Every tensor in a Triton program is a slice of one *block*: a rank-`rank`
-/// index space with `shape[d]` elements along dimension `d`. The emitter walks
-/// that space with one nested loop per dimension (see `MSLEmitter`), so each
-/// tensor value needs to know which block dimension each of *its* dimensions
-/// corresponds to — that is what `axes` records.
+/// Every tensor in a Triton program is a slice of one *block*: an index space
+/// whose dimensions this type calls **axes**. The emitter walks a value's axes
+/// with one nested loop each (see `MSLEmitter`), so each tensor value needs to
+/// know which block axis each of *its* dimensions corresponds to — that is what
+/// `axes` records — and in which nest it is emitted, which is `paths`.
 ///
 /// Ranks below the block rank appear all the time: `tl.arange(0, M)` is rank 1
 /// even in a rank-2 kernel, and only `tt.expand_dims` says whether it indexes
 /// rows or columns. So `axes` is inferred rather than assumed.
+///
+/// Axes are *not* one nest shared by every value. FlashAttention-2 is the kernel
+/// that forces this: its `p` spans (M, N) and its `acc` spans (M, HEAD_DIM), and
+/// neither is a slice of the other. Each value is therefore emitted in the nest
+/// over exactly the axes it varies along (`paths`), the nests sharing whatever
+/// prefix they have in common. See §Execution model.
 struct BlockLayout {
-    /// Number of *iteration* block dimensions — the ones the emitter walks with
-    /// nested loops (0 when the kernel is entirely scalar).
+    /// Number of *iteration* block axes — the ones the emitter walks with nested
+    /// loops (0 when the kernel is entirely scalar).
     let rank: Int
-    /// Iteration block size per dimension. Broadcast-only dimensions are 1.
+    /// Iteration block size per axis. Broadcast-only axes are 1.
     let shape: [Int]
-    /// SSA name -> block dimension for each of the value's own dimensions.
+    /// SSA name -> block axis for each of the value's own dimensions.
     let axes: [String: [Int]]
-    /// Extents of the **contraction** dimensions introduced by `tt.dot`, one per
-    /// dot. The axis index of `contractions[i]` is `rank + i`.
+    /// Extents of axes that no materialised value spans, so they are walked only
+    /// inside a `tt.dot`'s staging loops. The axis index of `contractions[i]` is
+    /// `rank + i`.
     ///
-    /// A contraction axis is deliberately *not* part of the iteration space: a
-    /// `tt.dot`'s operands are `MxK` and `KxN` while its result is `MxN`, so K is
-    /// walked only inside the dot's own staging loops and never by the
-    /// elementwise lane distribution.
+    /// A `tt.dot`'s contracted axis lands here *when nothing else needs it*. It
+    /// need not: FA-2's second dot contracts over the same axis its softmax
+    /// iterates, and that axis is an ordinary iteration axis.
     let contractions: [Int]
+    /// Iteration axes whose loop every thread walks in full, because some value
+    /// nests another axis inside it. The last axis of any nest is the one strided
+    /// across the threadgroup.
+    let uniformAxes: Set<Int>
+    /// SSA name -> the loop nest the value is emitted in, outermost axis first.
+    ///
+    /// A value's own varying axes, plus every axis a *consumer* nests outside
+    /// them — so that a value is always emitted in a prefix of its consumers'
+    /// nests and its variable is still in scope where it is read.
+    let paths: [String: [Int]]
+    /// True when the kernel contains a `tt.dot` at all.
+    let hasDot: Bool
 
-    static let scalar = BlockLayout(rank: 0, shape: [], axes: [:], contractions: [])
+    static let scalar = BlockLayout(
+        rank: 0, shape: [], axes: [:], contractions: [], uniformAxes: [], paths: [:],
+        hasDot: false)
 
-    /// Total number of block dimensions, iteration and contraction together.
+    /// Total number of block axes, iteration and contraction together.
     var axisCount: Int { rank + contractions.count }
 
     func extent(ofAxis axis: Int) -> Int {
         axis < rank ? shape[axis] : contractions[axis - rank]
     }
 
-    /// Block dimensions this value actually varies along (size-1 dimensions are
+    /// Block axes this value actually varies along (size-1 dimensions are
     /// broadcast, so the value does not depend on their index).
     func varyingAxes(of ssa: String, shape valueShape: [Int]) -> [Int] {
         guard let map = axes[ssa], map.count == valueShape.count else { return [] }
         return zip(map, valueShape).filter { $0.1 > 1 }.map(\.0)
     }
 
-    /// True when the value varies along a contraction axis, which means it can
-    /// only be materialised inside a `tt.dot`'s staging loops.
+    /// True when the value varies along an axis no materialised value spans,
+    /// which means it can only be built inside a `tt.dot`'s staging loops.
     func spansContraction(_ ssa: String, shape valueShape: [Int]) -> Bool {
         varyingAxes(of: ssa, shape: valueShape).contains { $0 >= rank }
     }
+
+    /// The loop nest `ssa` is emitted in, outermost first.
+    func path(of ssa: String) -> [Int] { paths[ssa] ?? [] }
+
+    /// True when every thread walks this axis in full (see `uniformAxes`).
+    func isUniform(_ axis: Int) -> Bool { uniformAxes.contains(axis) }
 }
 
-/// Decides which values a kernel has to *materialise* in the elementwise
+/// Decides which values a kernel has to *materialise* in an elementwise
 /// iteration nest and which exist only to feed a `tt.dot`.
 ///
-/// A `tt.dot` operand is never a per-lane value: it is staged into a threadgroup
-/// tile over an index space that includes the contraction dimension. Everything
-/// that feeds one — the pointer arithmetic, the masks, the loads — therefore has
-/// to be emitted inside the dot's own staging loops rather than where it appears.
-/// This is a backward liveness walk: a value is materialised when some use other
-/// than "an operand of a tt.dot" needs it, and deferred otherwise.
+/// A deferred `tt.dot` operand is never a per-lane value: it is staged into a
+/// threadgroup tile over an index space that includes the contraction dimension.
+/// Everything that feeds one — the pointer arithmetic, the masks, the loads —
+/// therefore has to be emitted inside the dot's own staging loops rather than
+/// where it appears. This is a backward liveness walk: a value is materialised
+/// when some use other than "an operand of a tt.dot" needs it, and deferred
+/// otherwise. FA-2's `p` is materialised *and* a dot operand — it is reduced to
+/// build `l_ij` — which is exactly why the two questions are separate.
 enum DotDeferral {
     /// Values reachable backwards from a real use. Everything else is either dead
     /// or exists only for a `tt.dot`.
@@ -143,34 +171,74 @@ enum DotDeferral {
     }
 }
 
+/// Union-find over axis *variables*: one per dimension of every tensor value.
+private struct DisjointSet {
+    private var parent: [Int] = []
+
+    mutating func make() -> Int {
+        parent.append(parent.count)
+        return parent.count - 1
+    }
+
+    mutating func find(_ x: Int) -> Int {
+        var root = x
+        while parent[root] != root { root = parent[root] }
+        var walk = x
+        while parent[walk] != root {
+            let next = parent[walk]
+            parent[walk] = root
+            walk = next
+        }
+        return root
+    }
+
+    mutating func union(_ a: Int, _ b: Int) {
+        let (ra, rb) = (find(a), find(b))
+        if ra != rb { parent[rb] = ra }
+    }
+}
+
 /// Infers the block layout of one `tt.func`.
 ///
 /// Two passes: shapes first (a light-weight rank/shape propagation that mirrors
-/// what the emitter later does for full types), then the axis assignment, by
-/// seeding every full-rank tensor with the identity map and propagating that
-/// through `tt.expand_dims`, `tt.broadcast`, `tt.reduce` and the elementwise ops.
+/// what the emitter later does for full types), then the axis assignment.
+///
+/// The axis assignment is *unification*, not seeding: every dimension of every
+/// tensor gets its own axis variable, and the ops that relate two tensors merge
+/// them — elementwise ops dimension-wise, `tt.expand_dims`/`tt.reduce` around the
+/// inserted or dropped dimension, `tt.trans` through its permutation, and
+/// `tt.dot` by pinning `a` to (M, K), `b` to (K, N) and the accumulator/result to
+/// (M, N). Two full-rank tensors that no chain relates are then merged onto one
+/// index space, which is what the old identity seeding did for every tensor and
+/// is still what an ordinary elementwise kernel wants.
+///
+/// Unification rather than seeding is what makes FlashAttention-2 expressible:
+/// its two dots share axes crosswise (the first contracts over the head
+/// dimension its accumulator iterates, the second over the key block its softmax
+/// iterates), which no fixed (M, N, fresh-K) assignment can describe.
 enum LayoutInference {
     static func compute(for function: TritonFunction) throws -> BlockLayout {
         var solver = Solver()
         for argument in function.arguments {
-            solver.shapes[argument.name] = argument.type.shape ?? []
+            solver.define(argument.name, argument.type.shape ?? [], argument.loc)
         }
         try solver.walk(function.body)
-
-        let rank = solver.shapes.values.map(\.count).max() ?? 0
-        guard rank > 0 else { return .scalar }
-        return try solver.solve(rank: rank, function: function)
+        return try solver.solve(function: function)
     }
 
     private struct Solver {
         /// `[]` for scalars, the dimension list for tensors.
         var shapes: [String: [Int]] = [:]
+        /// Definition order, so every decision below is deterministic.
+        var order: [String] = []
         /// Values that must share one axis map (same rank, elementwise-related).
         var groups: [[String]] = []
         /// `tt.expand_dims`: the result gains a size-1 dimension at `axis`.
         var expansions: [(source: String, result: String, axis: Int, loc: SourceLoc)] = []
         /// `tt.reduce`: the result drops the dimension at `axis`.
         var reductions: [(source: String, result: String, axis: Int, loc: SourceLoc)] = []
+        /// `tt.trans`: `result`'s dimension `i` is `source`'s dimension `order[i]`.
+        var transposes: [(source: String, result: String, order: [Int], loc: SourceLoc)] = []
         /// `tt.dot`: pins its operands onto (M, K) / (K, N) / (M, N).
         var dots: [(op: DotOp, loc: SourceLoc)] = []
         var locations: [String: SourceLoc] = [:]
@@ -183,7 +251,8 @@ enum LayoutInference {
             if tensors.count > 1 { groups.append(tensors) }
         }
 
-        private mutating func define(_ ssa: String, _ shape: [Int], _ loc: SourceLoc) {
+        mutating func define(_ ssa: String, _ shape: [Int], _ loc: SourceLoc) {
+            if shapes[ssa] == nil { order.append(ssa) }
             shapes[ssa] = shape
             locations[ssa] = loc
         }
@@ -207,6 +276,11 @@ enum LayoutInference {
                     define(result, type.shape ?? [], loc)
                     expansions.append((source: source, result: result, axis: axis, loc: loc))
 
+                case .trans(let result, let type, let source, let permutation):
+                    define(result, type.shape ?? [], loc)
+                    transposes.append(
+                        (source: source, result: result, order: permutation, loc: loc))
+
                 case .broadcast(let result, let type, let source):
                     define(result, type.shape ?? [], loc)
                     relate([source, result])
@@ -222,14 +296,18 @@ enum LayoutInference {
                             "tt.reduce axis \(axis) is out of range for \(reduced.count)-D operand",
                             loc)
                     }
+                    guard axis == reduced.count - 1 else {
+                        throw CoreError.unsupportedOp(
+                            "tt.reduce over axis \(axis) of a \(reduced.count)-D tensor "
+                                + "(only the last axis, which is the axis distributed across "
+                                + "threads, is lowered)", loc)
+                    }
                     reduced.remove(at: axis)
                     define(result, reduced, loc)
                     reductions.append((source: source, result: result, axis: axis, loc: loc))
 
                 case .dot(let dot):
                     define(dot.result, dot.resultType.shape ?? [], loc)
-                    // The accumulator and the result occupy the same MxN space.
-                    relate([dot.accumulator, dot.result])
                     dots.append((op: dot, loc: loc))
 
                 case .addPtr(let result, let pointer, let offset):
@@ -282,7 +360,8 @@ enum LayoutInference {
                     try walk(branch.elseBody)
                     for body in [branch.thenBody, branch.elseBody] {
                         guard let yielded = terminatorValues(of: body) else { continue }
-                        for (index, value) in yielded.enumerated() where index < branch.results.count {
+                        for (index, value) in yielded.enumerated()
+                        where index < branch.results.count {
                             relate([value, branch.results[index]])
                         }
                     }
@@ -295,143 +374,329 @@ enum LayoutInference {
             return values
         }
 
-        /// One round of constraint propagation, to a fixed point. Chains are short
-        /// (rank 1 -> rank 2), so this converges in a couple of passes; the bound
-        /// just keeps a malformed module from spinning.
-        private func propagate(_ axes: inout [String: [Int]], rank: Int) throws {
-            for _ in 0..<(rank + 4) {
-                var changed = false
-                for group in groups {
-                    guard let known = group.first(where: { axes[$0] != nil }) else { continue }
-                    let map = axes[known]!
-                    for member in group where axes[member] == nil {
-                        guard shapes[member]?.count == map.count else { continue }
-                        axes[member] = map
-                        changed = true
+        // MARK: - Solving
+
+        mutating func solve(function: TritonFunction) throws -> BlockLayout {
+            let maxRank = shapes.values.map(\.count).max() ?? 0
+            guard maxRank > 0 else { return .scalar }
+
+            var sets = DisjointSet()
+            var variables: [String: [Int]] = [:]
+            for ssa in order where !shape(ssa).isEmpty {
+                variables[ssa] = shape(ssa).map { _ in sets.make() }
+            }
+
+            /// Unifies two axis maps dimension-wise, **skipping dimensions of
+            /// extent 1**.
+            ///
+            /// A size-1 dimension is a broadcast placeholder, not an identity: the
+            /// matmul tutorial broadcasts one `tensor<BLOCK_M x 1 x i1>` row mask
+            /// into both a `BLOCK_M x BLOCK_K` and a `BLOCK_M x BLOCK_N` tensor,
+            /// and unifying its second dimension with both would declare the
+            /// contraction axis and the column axis to be the same one.
+            func unify(_ a: String, _ b: String, dropping axis: Int? = nil) {
+                guard var left = variables[a], let right = variables[b],
+                    var leftShape = shapes[a], let rightShape = shapes[b]
+                else { return }
+                if let axis, axis < left.count, axis < leftShape.count {
+                    left.remove(at: axis)
+                    leftShape.remove(at: axis)
+                }
+                guard left.count == right.count else { return }
+                for index in left.indices where leftShape[index] > 1 && rightShape[index] > 1 {
+                    sets.union(left[index], right[index])
+                }
+            }
+
+            // Elementwise relations: every member of a group with the same rank
+            // shares one axis map.
+            for group in groups {
+                var byRank: [Int: String] = [:]
+                for member in group {
+                    guard let map = variables[member] else { continue }
+                    if let representative = byRank[map.count] {
+                        unify(representative, member)
+                    } else {
+                        byRank[map.count] = member
                     }
                 }
-                for expansion in expansions {
-                    guard axes[expansion.source] == nil, var map = axes[expansion.result] else {
-                        continue
-                    }
-                    guard expansion.axis < map.count else {
+            }
+            for expansion in expansions {
+                guard let map = variables[expansion.result] else { continue }
+                guard expansion.axis < map.count else {
+                    throw CoreError.lowering(
+                        "tt.expand_dims axis \(expansion.axis) is out of range for its "
+                            + "\(map.count)-D result", expansion.loc)
+                }
+                unify(expansion.result, expansion.source, dropping: expansion.axis)
+            }
+            for reduction in reductions {
+                unify(reduction.source, reduction.result, dropping: reduction.axis)
+            }
+            for transpose in transposes {
+                guard let result = variables[transpose.result],
+                    let source = variables[transpose.source],
+                    let sourceShape = shapes[transpose.source],
+                    transpose.order.count == result.count, result.count == source.count
+                else { continue }
+                for (index, from) in transpose.order.enumerated() {
+                    guard from >= 0, from < source.count else {
                         throw CoreError.lowering(
-                            "tt.expand_dims axis \(expansion.axis) is out of range for its "
-                                + "\(map.count)-D result", expansion.loc)
+                            "tt.trans order \(transpose.order) is not a permutation of its "
+                                + "\(source.count) dimensions", transpose.loc)
                     }
-                    map.remove(at: expansion.axis)
-                    axes[expansion.source] = map
-                    changed = true
+                    if sourceShape[from] > 1 { sets.union(result[index], source[from]) }
                 }
-                for reduction in reductions {
-                    guard axes[reduction.result] == nil, var map = axes[reduction.source] else {
-                        continue
-                    }
-                    guard reduction.axis < map.count else { continue }
-                    map.remove(at: reduction.axis)
-                    axes[reduction.result] = map
-                    changed = true
-                }
-                if !changed { break }
             }
-        }
-
-        /// Pins one value's axis map, reporting a clash rather than overwriting.
-        private func pin(
-            _ axes: inout [String: [Int]], _ ssa: String, _ map: [Int], _ what: String,
-            _ loc: SourceLoc
-        ) throws {
-            guard let shape = shapes[ssa], shape.count == map.count else {
-                throw CoreError.lowering(
-                    "tt.dot's \(what) '%\(ssa)' must be a rank-\(map.count) tensor, found "
-                        + "rank \(shapes[ssa]?.count ?? 0)", loc)
-            }
-            if let existing = axes[ssa], existing != map {
-                throw CoreError.lowering(
-                    "'%\(ssa)' is used both as tt.dot's \(what) and along block dimensions "
-                        + "\(existing); one value cannot span two different index spaces", loc)
-            }
-            axes[ssa] = map
-        }
-
-        mutating func solve(rank: Int, function: TritonFunction) throws -> BlockLayout {
-            var axes: [String: [Int]] = [:]
-            let identity = Array(0..<rank)
-
-            // tt.dot pins its own operands first: `a` spans (M, K), `b` spans
-            // (K, N) and the accumulator/result span (M, N). Only then does the
-            // identity seeding below fill in the ordinary elementwise tensors, so
-            // that everything feeding an operand inherits the operand's axes
-            // rather than being forced onto the iteration space.
-            if !dots.isEmpty {
-                guard rank == 2 else {
+            for entry in dots {
+                let dot = entry.op
+                guard let lhs = variables[dot.lhs], lhs.count == 2,
+                    let rhs = variables[dot.rhs], rhs.count == 2,
+                    let result = variables[dot.result], result.count == 2,
+                    let lhsShape = shapes[dot.lhs], let rhsShape = shapes[dot.rhs]
+                else {
                     throw CoreError.lowering(
-                        "tt.dot needs a rank-2 block index space; the widest tensor in kernel "
-                            + "'\(function.name)' is rank \(rank)", dots[0].loc)
+                        "tt.dot's operands must be rank-2 tensors, found \(dot.lhsType) * "
+                            + "\(dot.rhsType) -> \(dot.resultType)", entry.loc)
                 }
-            }
-            for (index, entry) in dots.enumerated() {
-                let contraction = rank + index
-                try pin(&axes, entry.op.result, identity, "result", entry.loc)
-                try pin(&axes, entry.op.accumulator, identity, "accumulator", entry.loc)
-                try pin(&axes, entry.op.lhs, [0, contraction], "left operand", entry.loc)
-                try pin(&axes, entry.op.rhs, [contraction, 1], "right operand", entry.loc)
-            }
-            try propagate(&axes, rank: rank)
-
-            for (ssa, shape) in shapes where shape.count == rank && axes[ssa] == nil {
-                axes[ssa] = identity
-            }
-            try propagate(&axes, rank: rank)
-
-            for (ssa, shape) in shapes where !shape.isEmpty {
-                guard let map = axes[ssa] else {
-                    throw CoreError.lowering(
-                        "cannot infer which block dimension '%\(ssa)' spans: it is "
-                            + "\(shape.count)-D in a \(rank)-D kernel and never reaches a "
-                            + "tt.expand_dims or a full-rank operation",
-                        locations[ssa] ?? function.loc)
-                }
-                guard map.count == shape.count else {
-                    throw CoreError.lowering(
-                        "'%\(ssa)' is \(shape.count)-D but is combined with \(map.count)-D values",
-                        locations[ssa] ?? function.loc)
-                }
+                if lhsShape[0] > 1 { sets.union(lhs[0], result[0]) }
+                if lhsShape[1] > 1 { sets.union(lhs[1], rhs[0]) }
+                if rhsShape[1] > 1 { sets.union(rhs[1], result[1]) }
+                unify(dot.accumulator, dot.result)
             }
 
-            // Block size per dimension: every value must agree, ignoring broadcasts.
-            let axisCount = rank + dots.count
-            var block = [Int](repeating: 1, count: axisCount)
-            var pinned = [Bool](repeating: false, count: axisCount)
-            for (ssa, shape) in shapes where !shape.isEmpty {
-                let map = axes[ssa]!
-                for (index, dimension) in shape.enumerated() {
-                    guard dimension != 1 else { continue }
+            // Two full-rank tensors that nothing above relates share the kernel's
+            // one index space — the old identity seeding, kept for exactly the
+            // case it was written for. Tensors a `tt.dot` already placed are
+            // excluded: FA-2's `p` and `acc` are both rank 2 and must *not* be
+            // merged.
+            var dotVariables: Set<Int> = []
+            for entry in dots {
+                for value in [entry.op.lhs, entry.op.rhs, entry.op.accumulator, entry.op.result] {
+                    for variable in variables[value] ?? [] { dotVariables.insert(sets.find(variable)) }
+                }
+            }
+            // A transpose places its two values relative to each other and must not
+            // be overridden by the fallback either, or the contradiction it creates
+            // is reported as a size clash instead of by name.
+            for transpose in transposes {
+                for value in [transpose.source, transpose.result] {
+                    for variable in variables[value] ?? [] { dotVariables.insert(sets.find(variable)) }
+                }
+            }
+            let live = dots.isEmpty ? nil : DotDeferral.materialised(in: function)
+            func isMaterialised(_ ssa: String) -> Bool { live?.contains(ssa) ?? true }
+
+            var identity: String? = nil
+            // Only values the kernel actually uses: a dead `tensor<BLOCK_M x
+            // BLOCK_N>` constant left over from another spelling of the same
+            // kernel would otherwise be merged onto the live index space and
+            // declare two unrelated block dimensions to be one.
+            for ssa in order where shape(ssa).count == maxRank && isMaterialised(ssa) {
+                guard let map = variables[ssa] else { continue }
+                guard !map.contains(where: { dotVariables.contains(sets.find($0)) }) else { continue }
+                if let representative = identity {
+                    unify(representative, ssa)
+                } else {
+                    identity = ssa
+                }
+            }
+
+            // Extents. A dimension of 1 is a broadcast and says nothing.
+            var extents: [Int: Int] = [:]
+            for ssa in order {
+                guard let map = variables[ssa] else { continue }
+                for (index, dimension) in shape(ssa).enumerated() where dimension != 1 {
                     guard dimension > 0 else {
                         throw CoreError.lowering(
                             "tensor dimension must be positive, found \(dimension) in '%\(ssa)'",
                             locations[ssa] ?? function.loc)
                     }
-                    let axis = map[index]
-                    guard axis < axisCount else {
+                    let root = sets.find(map[index])
+                    if let existing = extents[root], existing != dimension {
                         throw CoreError.lowering(
-                            "'%\(ssa)' refers to block dimension \(axis), which does not exist",
+                            "kernel '\(function.name)' mixes tensor lengths \(existing) and "
+                                + "\(dimension) along block dimension \(index); one block size "
+                                + "per dimension is lowered",
                             locations[ssa] ?? function.loc)
                     }
-                    if pinned[axis], block[axis] != dimension {
-                        throw CoreError.lowering(
-                            "kernel '\(function.name)' mixes tensor lengths \(block[axis]) and "
-                                + "\(dimension) along block dimension \(axis); one block size per "
-                                + "dimension is lowered",
-                            locations[ssa] ?? function.loc)
-                    }
-                    block[axis] = dimension
-                    pinned[axis] = true
+                    extents[root] = dimension
                 }
             }
+
+            // A rank-deficient value that never reaches a full-rank one is a
+            // guess the inference refuses to make.
+            var fullRank: Set<Int> = []
+            for ssa in order where shape(ssa).count == maxRank {
+                guard let map = variables[ssa] else { continue }
+                for (index, size) in shape(ssa).enumerated() where size > 1 {
+                    fullRank.insert(sets.find(map[index]))
+                }
+            }
+            for ssa in order
+            where !shape(ssa).isEmpty && shape(ssa).count < maxRank && shape(ssa).contains(where: { $0 > 1 })
+            {
+                guard let map = variables[ssa],
+                    zip(map, shape(ssa)).contains(where: { $0.1 > 1 && fullRank.contains(sets.find($0.0)) })
+                else {
+                    throw CoreError.lowering(
+                        "cannot infer which block dimension '%\(ssa)' spans: it is "
+                            + "\(shape(ssa).count)-D in a \(maxRank)-D kernel and never reaches a "
+                            + "tt.expand_dims or a full-rank operation",
+                        locations[ssa] ?? function.loc)
+                }
+            }
+
+            // Iteration axes are the ones a materialised value spans; the rest are
+            // walked only inside a tt.dot's staging loops.
+            var iteration: [Int] = []
+            var seenIteration: Set<Int> = []
+            for ssa in order where !shape(ssa).isEmpty && isMaterialised(ssa) {
+                // Only dimensions that actually vary: a size-1 dimension is a
+                // broadcast placeholder and never gets a loop.
+                for (index, size) in shape(ssa).enumerated() where size > 1 {
+                    let root = sets.find(variables[ssa]![index])
+                    if seenIteration.insert(root).inserted { iteration.append(root) }
+                }
+            }
+
+            // Nesting order: a materialised value's own dimension order says which
+            // of its axes is outside which. Deferred operands do not constrain it
+            // — they are staged over their own two dimensions, in whichever order
+            // they are written (`K^T` and `V` disagree about the head dimension,
+            // and both are right).
+            var successors: [Int: Set<Int>] = [:]
+            var incoming: [Int: Int] = [:]
+            for root in iteration {
+                successors[root] = []
+                incoming[root] = 0
+            }
+            for ssa in order where isMaterialised(ssa) {
+                guard let map = variables[ssa] else { continue }
+                let roots = zip(map, shape(ssa)).filter { $0.1 > 1 }.map { sets.find($0.0) }
+                for index in 1..<max(1, roots.count) {
+                    let (before, after) = (roots[index - 1], roots[index])
+                    guard before != after, successors[before] != nil, successors[after] != nil else {
+                        continue
+                    }
+                    if successors[before]!.insert(after).inserted {
+                        incoming[after] = (incoming[after] ?? 0) + 1
+                    }
+                }
+            }
+            var ordered: [Int] = []
+            var ready = iteration.filter { incoming[$0] == 0 }
+            while !ready.isEmpty {
+                let root = ready.removeFirst()
+                ordered.append(root)
+                for next in iteration where successors[root]!.contains(next) {
+                    incoming[next]! -= 1
+                    if incoming[next] == 0 { ready.append(next) }
+                }
+            }
+            guard ordered.count == iteration.count else {
+                throw CoreError.lowering(
+                    "kernel '\(function.name)' nests its block dimensions in two incompatible "
+                        + "orders; a value cannot be iterated both ways (a materialised tt.trans "
+                        + "of a value that is also used untransposed does this)",
+                    function.loc)
+            }
+
+            var index: [Int: Int] = [:]
+            for (position, root) in ordered.enumerated() { index[root] = position }
+            let rank = ordered.count
+            var contractionRoots: [Int] = []
+            for ssa in order {
+                guard let map = variables[ssa] else { continue }
+                for (position, size) in shape(ssa).enumerated() where size > 1 {
+                    let root = sets.find(map[position])
+                    if index[root] == nil {
+                        index[root] = rank + contractionRoots.count
+                        contractionRoots.append(root)
+                    }
+                }
+            }
+            // Broadcast placeholders: every size-1 dimension keeps an axis index of
+            // its own so that a tile's two dimensions never collide, but it has no
+            // extent and no loop.
+            var placeholder = rank + contractionRoots.count
+            for ssa in order {
+                for variable in variables[ssa] ?? [] where index[sets.find(variable)] == nil {
+                    index[sets.find(variable)] = placeholder
+                    placeholder += 1
+                }
+            }
+
+            var axes: [String: [Int]] = [:]
+            for ssa in order {
+                guard let map = variables[ssa] else { continue }
+                let resolved = map.map { index[sets.find($0)]! }
+                // Two varying dimensions of one value must index two different
+                // block dimensions. They collapse when a single `tl.arange` is
+                // expanded once into a row index and once into a column index —
+                // Triton's CSE will hand us that if BLOCK_M == BLOCK_N — and the
+                // value would then be a diagonal of itself.
+                var seen: Set<Int> = []
+                for (dimension, size) in shape(ssa).enumerated() where size > 1 {
+                    guard seen.insert(resolved[dimension]).inserted else {
+                        throw CoreError.lowering(
+                            "'%\(ssa)' indexes one block dimension with two of its own "
+                                + "dimensions; a value reached both a row and a column position "
+                                + "(a tl.arange expanded along axis 0 in one place and axis 1 in "
+                                + "another), which describes a diagonal rather than a tile",
+                            locations[ssa] ?? function.loc)
+                    }
+                }
+                axes[ssa] = resolved
+            }
+            let shapeByAxis = ordered.map { extents[$0] ?? 1 }
+            let contractionExtents = contractionRoots.map { extents[$0] ?? 1 }
+
+            // Nests. A value is emitted over its own varying axes, extended with
+            // every axis a consumer nests outside them so that its variable is
+            // still in scope where it is read (Triton's `offs_n < N` mask spans
+            // only the column axis but is consumed inside the row loop).
+            var pathSets: [String: Set<Int>] = [:]
+            for ssa in order where isMaterialised(ssa) && !shape(ssa).isEmpty {
+                let map = axes[ssa]!
+                var own: Set<Int> = []
+                for (dimension, size) in shape(ssa).enumerated() where size > 1 {
+                    if map[dimension] < rank { own.insert(map[dimension]) }
+                }
+                pathSets[ssa] = own
+            }
+            var related: [[String]] = groups
+            for expansion in expansions { related.append([expansion.source, expansion.result]) }
+            for reduction in reductions { related.append([reduction.source, reduction.result]) }
+            for _ in 0..<(rank + 2) {
+                var changed = false
+                for group in related {
+                    let members = group.filter { pathSets[$0] != nil }
+                    guard !members.isEmpty else { continue }
+                    var union: Set<Int> = []
+                    for member in members { union.formUnion(pathSets[member]!) }
+                    for member in members {
+                        guard let deepest = pathSets[member]!.max() else { continue }
+                        let filled = union.filter { $0 < deepest }
+                        if !filled.isSubset(of: pathSets[member]!) {
+                            pathSets[member]!.formUnion(filled)
+                            changed = true
+                        }
+                    }
+                }
+                if !changed { break }
+            }
+            var paths: [String: [Int]] = [:]
+            for (ssa, set) in pathSets { paths[ssa] = set.sorted() }
+
+            var uniform: Set<Int> = []
+            for (_, path) in paths where path.count > 1 {
+                uniform.formUnion(path.dropLast())
+            }
+
             return BlockLayout(
-                rank: rank, shape: Array(block[0..<rank]), axes: axes,
-                contractions: Array(block[rank...]))
+                rank: rank, shape: shapeByAxis, axes: axes, contractions: contractionExtents,
+                uniformAxes: uniform, paths: paths, hasDot: !dots.isEmpty)
         }
     }
 }

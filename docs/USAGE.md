@@ -681,7 +681,7 @@ parsed and then ignored.
 | --- | --- | --- |
 | Structure | `tt.func`, `tt.return` | one kernel per function, must return void; argument position == buffer index |
 | Program grid | `tt.get_program_id`, `tt.get_num_programs` | axes `x`/`y`/`z`, both the keyword and `{axis = N}` spellings |
-| Tensor shape | `tt.make_range`, `tt.splat`, `tt.expand_dims`, `tt.broadcast` | `make_range` is 1-D, as in Triton; `expand_dims`/`broadcast` emit no code |
+| Tensor shape | `tt.make_range`, `tt.splat`, `tt.expand_dims`, `tt.broadcast`, `tt.trans` | `make_range` is 1-D, as in Triton; `expand_dims`/`broadcast`/`trans` emit no code |
 | Memory | `tt.addptr`, `tt.load`, `tt.store` | any rank; `ptr[, mask[, other]]` → `mask ? *p : other`; store → `if (mask) …`; cache/eviction attributes parsed and ignored |
 | Integer arithmetic | `arith.addi subi muli divsi divui remsi remui andi ori xori shli shrsi shrui maxsi minsi maxui minui` | unsigned variants cast to `uint`/`ulong`; `i1` `andi`/`ori`/`xori` become `&&`/`\|\|`/`!=` |
 | Float arithmetic | `arith.addf subf mulf divf maximumf minimumf maxnumf minnumf` | |
@@ -691,7 +691,7 @@ parsed and then ignored.
 | Math (default ns) | `math.tanh erf floor ceil absf absi` | `erf` via a generated `tm_erf` (A&S 7.1.26, ~1.5e-7 abs) |
 | Constants | `arith.constant` | scalars and `dense<…>` splats, including `0xFF800000` bit-pattern non-finites |
 | Control flow | `scf.for`, `scf.if`, `scf.yield` | `iter_args` and multi-result `%r:2` / `%r#0`; a body containing a cross-lane op hoists the loop (below) |
-| Reduction | `tt.reduce` | single operand, **innermost axis only**, combiner `add`/`max`/`min`; generic MLIR form only |
+| Reduction | `tt.reduce` | single operand, **innermost axis only**, combiner `add`/`max`/`min`; generic MLIR form only; folds within a row's lane group when there is an axis outside the reduced one, across the threadgroup when there is not |
 | Matmul | `tt.dot` | rank 2, `f16`/`f32` with the accumulator at least as wide; `M`/`N`/`K` need not be multiples of 8 |
 
 ### Restrictions worth memorising
@@ -701,20 +701,35 @@ parsed and then ignored.
   *other* op must be in pretty form; generic syntax elsewhere is rejected.
 * **Reductions are last-axis only**, and the axis must be the distributed one.
 * **A cross-lane op inside an `scf.for` hoists the whole loop** to a
-  threadgroup-uniform level, which restricts what it may carry to: scalars, a
-  `tt.dot` accumulator, and a contraction-space pointer (strength-reduced rather
-  than carried). A per-lane **tensor** carried across such a loop is refused.
+  threadgroup-uniform level. It may carry scalars, a `tt.dot` accumulator it
+  yields directly (which stays in simdgroup registers for the whole loop), a
+  contraction-space pointer (strength-reduced rather than carried), and any other
+  per-lane tensor — the last of which is **spilled** to a threadgroup tile and
+  updated through a shadow. A carried tensor spanning more than two block axes is
+  refused.
 * **A cross-lane op inside an `scf.if` is refused outright** — an `scf.if` is
   per-lane by construction, and the barriers would not be reached by every thread.
-* **A `tt.dot` may not take another `tt.dot`'s result** as an operand.
+* **A `tt.trans` whose result is materialised is refused.** A transposed `tt.dot`
+  operand is free (it is a relabelling, staged over its own tile's axes); a
+  transposed value that has to be walked by an elementwise nest asks for two
+  contradictory nestings of the same two block dimensions.
+* **One `tl.arange` may not index both a row and a column** of the same value —
+  that describes a diagonal, not a tile, and is refused by name. Emit a separate
+  `tt.make_range` for each; Triton's CSE will otherwise merge them whenever the
+  two block sizes are equal.
 
 ### Not supported
 
-Each of these fails by name: `tt.trans`, `tt.cat`, `tt.atomic_*`, `tt.call`,
-`tt.histogram`, `tt.scan`, multi-operand `tt.reduce` (argmax/argmin), reductions
-over a non-innermost axis, cross-lane ops inside `scf.if`, per-lane tensors
-carried across a cross-lane `scf.for`, chained `tt.dot`s, and generic op syntax
-for anything but `tt.reduce`.
+Each of these fails by name: `tt.cat`, `tt.atomic_*`, `tt.call`, `tt.histogram`,
+`tt.scan`, multi-operand `tt.reduce` (argmax/argmin), reductions over a
+non-innermost axis, cross-lane ops inside `scf.if`, a materialised `tt.trans`,
+and generic op syntax for anything but `tt.reduce`.
+
+Two things this list used to contain and no longer does: a per-lane tensor carried
+across a cross-lane `scf.for` (now spilled to a threadgroup tile), and a `tt.dot`
+whose operand comes from another `tt.dot`'s result (the first result is already a
+tile, and the second dot's staging loops read it). Both were what
+FlashAttention-2 was waiting on.
 
 ---
 
@@ -763,15 +778,15 @@ RuntimeError: unsupported op 'tt.scan' at line 1, col 32: the Metal backend does
 not lower this operation yet (see docs/ARCHITECTURE.md §Supported IR subset)
 ```
 
-Lowering errors that are *not* about a missing op are just as specific. Carrying
-a per-lane tensor across a loop containing a `tt.dot` or `tt.reduce`, for
-instance, does not say "unsupported":
+Lowering errors that are *not* about a missing op are just as specific. A
+`tl.arange` that reached both a row and a column position, for instance, does not
+say "unsupported":
 
 ```
-lowering error at line L, col C: scf.for carries the tensor '%acc' across a
-cross-lane operation, which forces the loop to be threadgroup-uniform; the only
-tensor such a loop can carry is the accumulator a tt.dot itself updates, because
-that one lives in threadgroup memory
+lowering error at line L, col C: '%12' indexes one block dimension with two of its
+own dimensions; a value reached both a row and a column position (a tl.arange
+expanded along axis 0 in one place and axis 1 in another), which describes a
+diagonal rather than a tile
 ```
 
 Others in the same family: a block shape whose tiles overrun Metal's 32 KB
@@ -789,82 +804,63 @@ which is exactly why it is emitted as text.
 
 ## Implementing what's missing
 
-Five concrete pieces of work, with where to start on each. The first two are the
-FlashAttention-2 blockers; the next three are the matmul performance gap and are
-all local to one function; the last is the Triton pin.
+The first two entries were the FlashAttention-2 blockers and are **done** — kept
+here because what they turned out to need was not what this section predicted, and
+that is the useful part. The next three are the matmul performance gap and are all
+local to one function; the last is the Triton pin, which is now the most important
+open task in the project.
 
-### 1. A per-lane tensor carried across a cross-lane loop
+### 1–2. ~~The FlashAttention-2 blockers~~ — done
 
-**Why it blocks FA-2.** FlashAttention-2's inner loop carries `m_i`, `l_i` and
-`acc`. The first two are scalars, and scalars already work — that is exactly why
-the online softmax in `AdvancedFixtures.onlineSoftmax` runs end to end today.
-`acc` is a `BLOCK_M x HEAD_DIM` **tensor**, and it does not.
+Both landed, and the write-up of what they actually needed is in
+[ARCHITECTURE.md §Cross-lane regions](ARCHITECTURE.md#cross-lane-regions) and
+§Execution model. The short version, because the estimate in this section used to
+be wrong in an instructive way:
 
-**Where the refusal lives.** `MSLEmitter.swift`, in the `scf.for` lowering that
-handles a loop containing a cross-lane op (around the `argument.type.isTensor`
-check, ~line 1768). Three `iter_args` shapes are accepted there — scalar,
-`tt.dot` accumulator, contraction-space pointer — and the tensor case throws the
-message quoted above.
+* **A per-lane tensor carried across a cross-lane loop** is now spilled to a
+  threadgroup tile and updated through a shadow tile, written where the new value
+  is *defined* rather than at the `scf.yield` — the nest that computed it is
+  closed by then, and the old value is usually still being read. The one special
+  case worth having: when the loop yields a `tt.dot`'s result and the dot's
+  accumulator is a per-lane function of the carried value
+  (`acc = tt.dot(p, v, acc * alpha[:, None])`), the carried tile *is* the dot's
+  accumulator tile and the rescale becomes the staging pass that fills it — no
+  copy at all.
+* **`tt.trans`** turned out cheaper than the `transpose_matrix` route this section
+  proposed: it is a relabelling of which block axis each dimension indexes, so
+  `K^T` is staged over `(HEAD_DIM, BLOCK_N)` and **no code is emitted**. Setting
+  `simdgroup_load`'s flag is still worth doing later — staging `K^T` this way reads
+  `K` down its columns, so the loads are not coalesced — but that is throughput,
+  not correctness.
+* **What the estimate missed.** FA-2's `m_i`/`l_i` are not scalars but
+  `BLOCK_M`-wide vectors, so they needed the spill too. And two larger changes
+  were not on the list at all: a kernel's tensors stopped sharing one loop nest
+  (`p` spans `(M, N)`, `acc` spans `(M, HEAD_DIM)`, and neither contains the
+  other), and axis assignment became unification rather than identity seeding,
+  because FA-2's two dots share their axes crosswise.
 
-**Why the dot accumulator gets away with it.** It already lives in a threadgroup
-tile, and the dot updates it *in place inside its own barriers*. An arbitrary
-carried tensor is read and written by ordinary per-lane code between the
-barriers, which is the whole difficulty.
+The kernel itself is `AttentionKernel.forward(blockM:blockN:headDim:element:)` in
+`TritonMetalBench`, tested in `AttentionTests` and benchmarked by
+`tmbench --attn`.
 
-**Starting points, in order:**
+### What to do next on attention
 
-1. Reuse the tile machinery rather than inventing storage. `allocateTile`
-   (~line 1212) already pads to whole 8x8 fragments, checks the 32 KB budget and
-   registers a tile so downstream consumers read it as an ordinary per-lane
-   value via `registerTile` (~line 1239). A carried tensor wants the same
-   representation, minus the fragment padding.
-2. Spill at `scf.yield`. Every yield of a carried tensor becomes a tile write at
-   the lane's block index; the loop header becomes a tile read. `stage`
-   (~line 1323) is the model for the write side — note that it spreads the
-   threadgroup over *both* tile dimensions, which is what you want here too.
-3. Get the barrier discipline right, and treat this as the actual work. A tile
-   written by per-lane code and read after a cross-lane op needs a
-   `threadgroup_barrier(mem_flags::mem_threadgroup)` between the write and the
-   op, and another between the op and the next read. The existing dot emits its
-   pair around `multiplyAccumulate` (~line 1508); carried tensors add writes
-   *outside* that pair, so the barriers have to be lifted to the loop body level.
-4. Decide spill vs. recompute per value. The emitter's default everywhere else is
-   recomputation (`recomputationOrder`), which is free for pure values and is why
-   softmax emits three lane loops instead of a spill. A carried value cannot be
-   recomputed — its definition is the previous iteration — so this is the one
-   place the spill path is mandatory. Keep the choice explicit rather than
-   switching the whole emitter over.
-5. Test against the shape that matters. `ReductionTests` line ~216 and
-   `DotTests` line ~386 currently assert the *refusal*; converting those into
-   correctness tests, then adding an FA-2-shaped loop carrying a
-   `BLOCK_M x HEAD_DIM` accumulator, is the acceptance criterion.
+**A. Keep the score tile out of threadgroup memory.** The f32 accumulator
+(`BLOCK_M x HEAD_DIM`) and the f32 score tile (`BLOCK_M x BLOCK_N`) are both live
+for the whole iteration, which is why `BLOCK_M` above 32 does not fit at
+`HEAD_DIM = 64` and why the kernel stages 10240 elements to do 131072 MACs at
+`16x64`. This is the same change the GEMM wants for its accumulator, and it is the
+one that lifts the cap on arithmetic intensity.
 
-### 2. `tt.trans` via `simdgroup_load`'s transpose flag
+**B. Hoist loop-invariant dot operands.** `Q` is restaged on every iteration
+although nothing in it depends on the induction variable — 1024 redundant device
+loads per iteration at `16x64`. The deferral model rebuilds an operand inside the
+dot's own loops and does not yet notice that this one need not move.
 
-**Why it blocks FA-2.** Attention needs `K^T`.
-
-**Why it is cheaper than it looks.** `simdgroup_load` takes a
-`transpose_matrix` flag, so a transposed dot *operand* never needs a data
-movement at all — it is a staging-time decision. The two `simdgroup_load` calls
-that fetch operand fragments are in `multiplyAccumulate` (~line 1508), inside the
-`for (uint tm_step…)` group, and each already takes an origin and a row stride.
-
-**Starting points:**
-
-1. Parse `tt.trans` into an op that records the permutation and produces no code
-   — structurally the same as `tt.expand_dims`/`tt.broadcast`, which are pure
-   relabellings in `Layout.swift`.
-2. Propagate the swap through axis inference. `Layout.swift` seeds a dot's
-   operands with `(M, K)` and `(K, N)` and propagates backwards to a fixed point;
-   a transpose is a swap of the two axes on the way through.
-3. Set the flag at the load. If the transposed value feeds a dot operand and
-   nothing else, `stage` never has to materialise it transposed — pass
-   `transpose_matrix` to the `simdgroup_load` for that operand and leave the tile
-   in its natural order.
-4. Handle the other case honestly. A `tt.trans` whose result is *materialised*
-   (stored, or consumed by elementwise code) has no such shortcut and needs a
-   real staged transpose. Refusing that case by name, initially, is consistent
-   with how the rest of the emitter behaves.
+**C. Stop computing `P` twice.** It is materialised once for the row sum and
+rebuilt once inside the second dot's staging — one extra `exp2` per element per
+iteration. Using its spill tile as the dot's operand tile would remove that, at
+the cost of one more `BLOCK_M x BLOCK_N` tile.
 
 ### 3–5. The matmul performance gap
 
@@ -873,7 +869,9 @@ square (4.66 TFLOP/s f32 at 2048 on an M1 Max; 2.33 TFLOP/s on an M1 Pro), up fr
 ~33% at the first working version. That clears the >50% milestone and lands inside
 the 62–82% band published Triton reaches on its own target. The per-change
 attribution — and, more usefully, the two CUDA-playbook techniques that did *not*
-transfer to Apple silicon, plus the one with no CUDA analogue that beat both — is in
+transfer to M1-generation Apple silicon (all of it measured on M1 Max and M1 Pro;
+nothing here has been re-run on M2/M3/M4), plus the one with no CUDA analogue that
+beat both — is in
 [ARCHITECTURE.md §Matmul throughput](ARCHITECTURE.md#matmul-throughput).
 
 What landed, all local to `emitDot` and its helpers: register blocking of the
@@ -909,7 +907,10 @@ launcher knows and the emitter does not — it is statically true, and so is mos
 the masking in the scalar path behind it.
 
 Measure with `swift run -c release tmbench` (works without Xcode), or
-`TM_BENCH=1 swift test --filter MatmulBenchmark`. `tmbench --sweep full` sweeps
+`TM_BENCH=1 swift test --filter MatmulBenchmark`. `tmbench --attn` is the same
+sweep for attention, against the unfused MPS composite;
+`tmbench --attn-shapes 1,8,512,64 --verbose` prints every configuration and
+`tmbench --emit-attn 32,32,16,64` prints the kernel. `tmbench --sweep full` sweeps
 block shapes, `num_warps`, register blocking, tile padding and double buffering;
 `tmbench --config 64,128,16,16,0,0,0,-1,0,0` turns vector staging off;
 `tmbench --config 64,128,16,16` pins one configuration, which is how a change

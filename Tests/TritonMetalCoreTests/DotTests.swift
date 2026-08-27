@@ -591,30 +591,66 @@ final class DotTests: XCTestCase {
                 """), contains: "tt.dot inside an scf.if is not lowered")
     }
 
-    /// A contraction-space value that something other than the dot wants is the
-    /// one thing the deferral model cannot serve.
-    func testUsingAContractionSpaceValueOutsideTheDotIsReported() {
-        expectError(
-            """
+    /// A value that spans a `tt.dot`'s contracted dimension *and* is materialised
+    /// used to be refused. It no longer is: the axis simply becomes an ordinary
+    /// iteration axis, walked by a nest of its own. FlashAttention needs exactly
+    /// this — its `p` is both the second dot's left operand and the tensor the
+    /// row sum reduces.
+    func testAContractionSpaceValueMayAlsoBeMaterialised() throws {
+        try skipWithoutMetal()
+        let ir = """
             module {
               tt.func public @k(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
                 %c = arith.constant dense<0.000000e+00> : tensor<16x16xf32>
-                %a = arith.constant dense<1.000000e+00> : tensor<16x8xf32>
+                %a = arith.constant dense<1.500000e+00> : tensor<16x8xf32>
                 %b = arith.constant dense<2.000000e+00> : tensor<8x16xf32>
                 %d = tt.dot %a, %b, %c : tensor<16x8xf32> * tensor<8x16xf32> -> tensor<16x16xf32>
+                %m = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %k = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+                %mr = tt.expand_dims %m {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+                %kc = tt.expand_dims %k {axis = 0 : i32} : tensor<8xi32> -> tensor<1x8xi32>
+                %c8 = arith.constant dense<8> : tensor<16x1xi32>
+                %row = arith.muli %mr, %c8 : tensor<16x1xi32>
+                %rowb = tt.broadcast %row : tensor<16x1xi32> -> tensor<16x8xi32>
+                %colb = tt.broadcast %kc : tensor<1x8xi32> -> tensor<16x8xi32>
+                %off = arith.addi %rowb, %colb : tensor<16x8xi32>
                 %p = tt.splat %arg1 : !tt.ptr<f32> -> tensor<16x8x!tt.ptr<f32>>
-                tt.store %p, %a : tensor<16x8x!tt.ptr<f32>>
+                %q = tt.addptr %p, %off : tensor<16x8x!tt.ptr<f32>>, tensor<16x8xi32>
+                tt.store %q, %a : tensor<16x8x!tt.ptr<f32>>
+                %cm = arith.constant dense<16> : tensor<16x1xi32>
+                %nr = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %nc = tt.expand_dims %nr {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+                %crow = arith.muli %mr, %cm : tensor<16x1xi32>
+                %crowb = tt.broadcast %crow : tensor<16x1xi32> -> tensor<16x16xi32>
+                %ccolb = tt.broadcast %nc : tensor<1x16xi32> -> tensor<16x16xi32>
+                %coff = arith.addi %crowb, %ccolb : tensor<16x16xi32>
+                %cp = tt.splat %arg0 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
+                %cq = tt.addptr %cp, %coff : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+                tt.store %cq, %d : tensor<16x16x!tt.ptr<f32>>
                 tt.return
               }
             }
-            """, contains: "the contraction dimension of a tt.dot")
+            """
+        // Three iteration axes now: M, N and the one the dot contracts over.
+        let layout = try LayoutInference.compute(for: TritonIRParser.parse(ir).functions[0])
+        XCTAssertEqual(layout.rank, 3)
+        XCTAssertEqual(layout.contractions, [])
+
+        let run = try GPU.run(ir: ir, args: [.output(count: 256), .output(count: 128)])
+        assertClose(
+            GPU.read(run.outputs[0], Float.self, 256),
+            [Float](repeating: 1.5 * 2.0 * 8, count: 256), tolerance: 1e-5, "the dot's result")
+        assertClose(
+            GPU.read(run.outputs[1], Float.self, 128),
+            [Float](repeating: 1.5, count: 128), tolerance: 1e-5, "the left operand, stored")
     }
 
-    /// A tensor carried across a dot loop that is not the accumulator has nowhere
-    /// to live: it is neither a tile nor rebuildable from the induction variable.
-    func testCarryingAnUnrelatedTensorAcrossADotLoopIsReported() {
-        expectError(
-            """
+    /// A tensor carried across a dot loop that is not the accumulator used to have
+    /// nowhere to live. It is now spilled to a threadgroup tile and updated
+    /// through a shadow (docs/ARCHITECTURE.md §Cross-lane regions).
+    func testAnUnrelatedTensorCarriedAcrossADotLoopIsSpilled() throws {
+        try skipWithoutMetal()
+        let ir = """
             module {
               tt.func public @k(%arg0: !tt.ptr<f32>, %arg1: i32) {
                 %c0 = arith.constant 0 : i32
@@ -629,12 +665,29 @@ final class DotTests: XCTestCase {
                   %n = arith.addf %other, %e : tensor<16x16xf32>
                   scf.yield %d, %n : tensor<16x16xf32>, tensor<16x16xf32>
                 }
+                %m = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %n = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %mr = tt.expand_dims %m {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+                %nc = tt.expand_dims %n {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+                %c16 = arith.constant dense<16> : tensor<16x1xi32>
+                %row = arith.muli %mr, %c16 : tensor<16x1xi32>
+                %rowb = tt.broadcast %row : tensor<16x1xi32> -> tensor<16x16xi32>
+                %colb = tt.broadcast %nc : tensor<1x16xi32> -> tensor<16x16xi32>
+                %off = arith.addi %rowb, %colb : tensor<16x16xi32>
                 %p = tt.splat %arg0 : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>>
-                tt.store %p, %r#1 : tensor<16x16x!tt.ptr<f32>>
+                %q = tt.addptr %p, %off : tensor<16x16x!tt.ptr<f32>>, tensor<16x16xi32>
+                tt.store %q, %r#1 : tensor<16x16x!tt.ptr<f32>>
                 tt.return
               }
             }
-            """, contains: "the only tensor such a loop can carry is the accumulator")
+            """
+        for trips in [0, 1, 5] {
+            let run = try GPU.run(ir: ir, args: [.output(count: 256), .int32(Int32(trips))])
+            assertClose(
+                GPU.read(run.outputs[0], Float.self, 256),
+                [Float](repeating: Float(3 * (trips + 1)), count: 256), tolerance: 1e-5,
+                "\(trips) trips")
+        }
     }
 
     func testThreadgroupMemoryOverrunIsReported() {

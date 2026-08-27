@@ -19,21 +19,34 @@ parser, a layout-inference pass, and an emitter that produces textual Metal
 Shading Language, then compiles and launches it through Metal at runtime.
 Triton's fused-softmax and matmul tutorial kernels both run on the GPU and match
 CPU references, including at sizes divisible by neither the block shape nor the
-8x8 simdgroup fragment. All compiler logic is Swift, exposed as a C ABI; the
-Python package is a ctypes shim with no logic in it, present only because
-Triton's backend discovery imports a Python module.
+8x8 simdgroup fragment, and so does the **FlashAttention-2 forward pass** — the
+kernel this backend was aimed at, and the one that decides whether a Triton
+backend is useful for anything beyond elementwise work. All compiler logic is
+Swift, exposed as a C ABI; the Python package is a ctypes shim with no logic in
+it, present only because Triton's backend discovery imports a Python module.
 
 The evaluation is deliberately unflattering where the results are. The test suite
-is 131 Swift cases and 14 Python cases, at ~83% region / ~86% function / ~91%
+is 144 Swift cases and 14 Python cases, at ~84% region / ~86% function / ~91%
 line coverage of the Swift core. The lowered matmul reaches **76% of
 `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.66
 TFLOP/s f32 at 2048), and 69–82% on an M1 Pro depending on its thermal state — up
-from ~33% at the first working version, which clears both the >50% milestone and the 60–80% band the second
-optimisation round aimed at. We give a per-change attribution, including the two
-techniques from the CUDA playbook that did **not** transfer to Apple silicon and
-the one with no CUDA analogue that was worth more than either of them. Two named
-blockers stand between this backend and a FlashAttention-2 forward pass, and the
-Triton release it should be pinned to has not been pinned.
+from ~33% at the first working version, which clears both the >50% milestone and
+the 60–80% band the second optimisation round aimed at. Fused attention is
+measured against the composite it replaces rather than against a single MPS
+kernel, because that is the comparison fusion exists to win: **357% of a
+`Q K^T` + `MPSMatrixSoftMax` + `P V` composite** at `b1 h8 s512 d64` on an M1 Max,
+107% at `s1024`, and 68% at `s2048` where MPS's own GEMMs reach their peak. We
+give a per-change attribution for both kernels, including the two techniques from
+the CUDA playbook that did **not** transfer to M1-generation Apple silicon and
+the one with no CUDA analogue that was worth more than either of them.
+
+Getting attention to run needed more than the two blockers we had named. Spilling
+a loop-carried tensor was one of them, and it was the smaller half: the layout
+model also had to stop assuming that a kernel's tensors share one loop nest, and
+axis assignment had to become unification rather than seeding, because
+FlashAttention's two `tt.dot`s share their axes crosswise and no fixed
+(M, N, fresh-K) assignment can describe that. The backward pass, `tt.atomic_*`
+and the Triton release this backend should be pinned to all remain open.
 
 ---
 
@@ -376,14 +389,14 @@ Regenerated with `swift test --enable-code-coverage`, then
 | --- | --- | --- | --- |
 | `Compiler.swift` | 97.58% | 97.22% | 99.03% |
 | `IR/Lexer.swift` | 84.13% | 95.35% | 91.86% |
-| `IR/Parser.swift` | 80.44% | 87.69% | 85.45% |
-| `IR/TritonIR.swift` | 80.28% | 71.43% | 90.76% |
-| `Layout.swift` | 84.31% | 70.37% | 90.12% |
-| `MSLEmitter.swift` | 83.59% | 85.78% | 92.23% |
+| `IR/Parser.swift` | 80.26% | 85.29% | 85.09% |
+| `IR/TritonIR.swift` | 81.69% | 71.43% | 91.67% |
+| `Layout.swift` | 89.24% | 76.74% | 93.60% |
+| `MSLEmitter.swift` | 84.35% | 85.77% | 91.88% |
 | `Runtime.swift` | 85.92% | 100.00% | 92.21% |
-| **Total** | **83.49%** | **85.99%** | **91.01%** |
+| **Total** | **84.49%** | **85.77%** | **91.24%** |
 
-Over ~5,000 lines of Swift core and ~3,600 lines of tests. The 282-line Python
+Over ~6,900 lines of Swift core and ~3,900 lines of tests. The 282-line Python
 package is the shim. `TritonMetalBench` — the GEMM sweep shared by `tmbench` and
 the opt-in XCTest wrapper — is measurement infrastructure rather than core and is
 excluded; it is exercised by `tmbench` itself, which verifies every configuration
@@ -507,6 +520,18 @@ how cheaply the guard can be computed, were.
 
 This is the part of the result we think is worth publishing.
 
+**Scope.** Both results, and the attention crossover in §6.2 below, are
+**M1-generation** measurements — an M1 Max and an M1 Pro. We give architectural
+reasons for them (Metal has no `cp.async`; an Apple GPU hides latency with
+occupancy; simdgroup-matrix fragments move through threadgroup memory rather than
+named lanes), and those reasons are properties of a generation, not of Metal. The
+M3 and M4 GPUs reworked the memory hierarchy, and we have not measured on them. We
+would expect the *direction* of the double-buffering result to survive as long as
+there is no copy engine and the register-blocking result to be the more fragile of
+the two, but that is a prediction, not a measurement. Re-running it is one command
+(`tmbench --sweep full`), and doing so on M2/M3/M4 parts is the first item of
+future work.
+
 **Double buffering is a wash.** With two operand buffers a contraction step stages
 into the half the previous step is not reading, so the trailing barrier goes and
 the staging need not wait on the arithmetic. Measured 2863 GFLOP/s against 2900
@@ -536,6 +561,47 @@ before the fact — ours said multiply-accumulates were an eighth of the slots a
 named operand traffic as the top fix — ranks the fixes in the wrong order when the
 costs are not independent, and says nothing at all about the techniques whose cost
 is occupancy rather than instructions.
+
+### 6.2b Attention throughput
+
+FlashAttention-2 forward against the unfused composite it replaces — `Q K^T` and
+`P V` as two `MPSMatrixMultiplication`s with an `MPSMatrixSoftMax` between them,
+one head at a time, through a real `S x S` f32 score matrix. That is the honest
+comparison for a fused kernel: the composite runs the same arithmetic through
+Apple's own GEMM, which is faster than ours, but it writes the score matrix to
+device memory and reads it back twice.
+
+Same methodology as §6.2 — dispatches packed to ~25ms per sample, median of three.
+FLOPs counted as `4 * S^2 * D` per head; the softmax is uncounted on both sides.
+
+| shape | M1 Max fused | composite | ratio | M1 Pro fused | composite | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| `b1 h8 s512 d64` f32 | **1358 GF** | 381 GF | **357%** | **891 GF** | 513 GF | **174%** |
+| `b1 h8 s1024 d64` f32 | **1678 GF** | 1575 GF | **107%** | 948 GF | 1244 GF | 76% |
+| `b1 h16 s2048 d64` f32 | 1761 GF | 2586 GF | 68% | — | — | — |
+| `b1 h8 s512 d64` f16 | **1680 GF** | 702 GF | **239%** | **772 GF** | 531 GF | **146%** |
+| `b1 h8 s1024 d64` f16 | **2089 GF** | 1582 GF | **132%** | 1195 GF | 1231 GF | 97% |
+
+The shape of the result is the point. At `s512` the composite's GEMMs are small
+and there are three dispatches per head, so fusion wins by 1.5–3.6x. By `s2048`
+the composite's GEMMs reach MPS's own peak and the traffic fusion removes stops
+being what decides. The crossover sits near `s1024` on both machines and f16 moves
+it out.
+
+Two caveats we would rather state than have found. The composite's `s512` readings
+move a lot run to run — 478, 513 and 588 GF in one M1 Pro session — because 24
+small dispatches are mostly submission overhead, so read those ratios as "clearly
+ahead" rather than as a number. And ours is not the only possible composite:
+metalscope's bench measured MPS-composite SDPA at ~744 GF on an M1 Pro for the same
+shape, faster than the 513–588 GF we measure, so a better-written composite exists
+and the `s512` margin against *it* would be nearer 1.2x than 1.7x.
+
+**What one change was worth.** Reducing across a row's lane group rather than
+across the whole threadgroup took the best M1 Pro configuration at
+`b1 h8 s512 d64` from **174 GF to 674 GF** — 3.9x — with nothing else altered.
+This is the same category of result as §6.2's two inversions: the cost that
+dominated was not arithmetic and not memory traffic but *serialization*, and no
+instruction-slot account would have found it.
 
 ### 6.3 Where the gap is now
 
@@ -584,23 +650,75 @@ None of the three is a layout redesign, and two of them are local to `emitDot`.
 
 ## 7. Limitations and future work
 
-**FlashAttention-2 needs two things this backend does not have.** It is the
-integration milestone kernel, and both blockers are precisely characterised.
+**FlashAttention-2 forward now runs**, and what it took is the most transferable
+result in this paper, because what it took was not what we had written down.
 
-*A per-lane tensor carried across a cross-lane loop.* A loop-carried **tensor**
-would have to be spilled to a threadgroup tile, and unlike a dot accumulator
-(which the dot updates in place inside its own barriers) an arbitrary carried
-tensor is read and written by ordinary per-lane code. Making that correct means a
-tile write at every `scf.yield`, a barrier discipline around each cross-lane op
-that also covers those writes, and a per-value decision between spilling and the
-recomputation the emitter uses everywhere else. FA-2's `acc`
-(`BLOCK_M x HEAD_DIM`) is exactly this case; its `m_i`/`l_i` are not — they are
-the scalars that already work.
+We had named two blockers. *`tt.trans`* was the easy one and turned out easier
+than predicted: we had planned to pass `simdgroup_load`'s `transpose_matrix` flag,
+but a transpose is a relabelling of which block axis each dimension indexes, so
+`K^T`'s tile is staged over `(HEAD_DIM, BLOCK_N)` directly and **no code is
+emitted for the op at all**. *Spilling a per-lane tensor carried across a
+cross-lane loop* was real and landed roughly as described — a tile, a shadow tile
+written where the new value is defined rather than at the `scf.yield`, and a copy
+between two barriers at the end of the body — plus one case we had not seen: when
+the loop yields a `tt.dot`'s result and the dot's accumulator is a per-lane
+function of the carried value (`acc = tt.dot(p, v, acc * alpha[:, None])`, FA-2's
+rescale), the carried tile can *be* the dot's accumulator tile and the rescale
+becomes the staging pass that fills it — no copy, one tile, at the cost of
+register residency.
 
-*`tt.trans`, for `K^T`.* Cheaper than it looks here: `simdgroup_load` takes a
-`transpose_matrix` flag, so a transposed dot *operand* is a staging-time decision
-rather than a data movement. A transposed value that is *materialised* instead
-has no such shortcut.
+Three things we had not named were larger than either.
+
+*The loop nest had to stop being one nest.* FA-2's `p` spans
+`(BLOCK_M, BLOCK_N)` and its `acc` spans `(BLOCK_M, HEAD_DIM)`. Neither contains
+the other, and the old model — one index space of rank R, walked by R nested
+loops, innermost distributed — can only serve both by putting all three axes in
+one nest, which recomputes each tensor `HEAD_DIM` or `BLOCK_N` times over. Nests
+had to become a *tree*: each value is emitted under exactly the axes it varies
+along, and sibling nests share their common prefix. That is a change to how every
+statement in the emitter is placed.
+
+*Axis assignment had to become unification.* The old pass seeded every full-rank
+tensor with the identity map and propagated. FA-2's two dots share their axes
+crosswise — the first contracts over the head dimension the accumulator iterates,
+the second over the key block the softmax iterates — so no fixed
+(M, N, fresh-K) assignment describes it. Every dimension now gets an axis variable
+and the ops that relate two tensors merge them. Two rules in that pass were found
+by running real Triton IR through it rather than by thinking: a size-1 dimension
+must carry no axis identity (the matmul tutorial broadcasts one row mask into both
+a `BLOCK_M x BLOCK_K` and a `BLOCK_M x BLOCK_N` tensor, and unifying its second
+dimension with both declares the contraction axis and the column axis to be the
+same one), and two varying dimensions of one value must not collapse onto one axis
+(which is what a single `tl.arange` expanded into both a row and a column index
+does, and Triton's CSE hands you that whenever `BLOCK_M == BLOCK_N`).
+
+*A reduction result a later dot has to read.* Dot operands are rebuilt inside the
+dot's own staging loops, and a `tt.reduce` is the one thing that cannot be rebuilt
+there — the fold has already happened. FA-2's `p = exp2(qk * scale - m_ij)` is the
+second dot's left operand and `m_ij` is a row reduction, so the row maximum is
+spilled into a `BLOCK_M`-float array where it is computed and read out of it in
+the staging nest.
+
+We also had one plain factual error in the earlier version of this section: FA-2's
+`m_i` and `l_i` are not scalars. They are `BLOCK_M`-wide per-row vectors, which in
+this model are rank-1 tensors and needed the same spill machinery `acc` did. Only
+a rank-1 kernel's online softmax carries genuine scalars.
+
+**Attention throughput, and where the fusion stops paying.** Against the unfused
+composite (`Q K^T` + `MPSMatrixSoftMax` + `P V`) the fused kernel is 357% at
+`b1 h8 s512 d64` on an M1 Max, 107% at `s1024`, and 68% at `s2048`. The crossover
+is where MPS's GEMMs get big enough to reach their own peak, at which point the
+score-matrix traffic the fusion removes stops being what decides. The single
+change that mattered most on our side was worth **3.9x** and had nothing to do
+with the dots: a `tt.reduce` used to fold across the whole threadgroup, so an
+online softmax over key blocks ran `2 * BLOCK_M` threadgroup-wide folds per
+iteration, serially, with 128 threads cooperating on 32 values at a time. Handing
+each row a lane group inside one simdgroup makes every row fold at once with no
+barrier at all. What now caps the kernel is threadgroup memory: the f32
+accumulator and the f32 score tile are both live across the whole iteration, so
+`BLOCK_M` above 32 does not fit at `HEAD_DIM = 64`, which caps arithmetic
+intensity. Keeping the score tile in registers between the two dots is the same
+change the GEMM wants for its accumulator.
 
 **Layout conversions.** The inference in `Layout.swift` is the honest, small
 version of what ttgir's layout system does. It maps tensor dimensions to block
@@ -627,10 +745,24 @@ them), its eventual coverage will be partial.
 machinery and are believed to work — but "believed to work" is not a claim this
 paper makes about anything else in it, so it is listed as a limitation.
 
-**Occupancy of outer block dimensions.** Only the innermost dimension is spread
-across threads, so a `BLOCK_M x BLOCK_N` tile with a small `BLOCK_N` leaves most
-of the threadgroup idle. A `tt.dot`'s staging loops already spread over both tile
-dimensions; doing the same for the elementwise nest is the obvious next step.
+**Occupancy of outer block dimensions.** Mostly closed: a `tt.dot`'s staging
+loops spread over both tile dimensions, a dot kernel's per-lane nest does too, and
+a kernel with a reduction now splits the lane index so that several rows reduce at
+once. What is left is the elementwise nest of a kernel that has neither — which is
+also the only kind of kernel not contractually launched at the reported
+threadgroup size, so the split cannot simply be baked in.
+
+**The FA-2 backward pass.** The forward pass runs; the backward pass needs
+`tt.atomic_*` (for the `dq` accumulation across key blocks in the usual
+formulation) and has not been attempted.
+
+**Re-measuring on newer Apple silicon.** Every throughput number and every
+"this CUDA technique inverts here" claim in this paper is an M1-generation
+measurement, on an M1 Max and an M1 Pro. The reasons we give are architectural,
+but they are properties of a generation: the M3 and M4 GPUs reworked the memory
+hierarchy, and we have not run on them. Re-running is one command
+(`tmbench --sweep full`, `tmbench --attn`), and it is the cheapest piece of future
+work in this list.
 
 **No conformance suite yet.** The tests here are ours. Porting a subset of
 Triton's own `test_core.py` against numpy references is what would turn

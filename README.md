@@ -15,7 +15,7 @@ backend lets that entire body of research code run on Apple Silicon without rewr
 | [docs/USAGE.md](docs/USAGE.md) | **Start here.** Runnable Swift, C-ABI and Python examples (every one executed before it was written down), the supported IR subset, exact error behaviour, and concrete starting points for the work that is still missing. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The lowering pipeline, the execution and layout model, the full IR subset and C ABI reference, matmul throughput, and the hard parts ranked. |
 | [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | Motivation, related work, design and implementation rationale, and an evaluation with real coverage and benchmark numbers — including the performance target this milestone missed. |
-| [docs/COMPARISON.md](docs/COMPARISON.md) | Measured efficiency vs. published Triton-on-CUDA numbers, and the transfer matrix: which CUDA GEMM techniques port to Apple silicon and which invert. |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | Measured efficiency vs. published Triton-on-CUDA numbers; the transfer matrix (which CUDA GEMM techniques port to M1-generation Apple silicon and which invert); and fused attention vs. the unfused MPS composite. |
 
 ## Structure & language policy
 
@@ -46,35 +46,51 @@ hard parts (barrier semantics, layout conversions, spilling a loop-carried tenso
 **Working end-to-end spine, with real kernels on it.** Triton IR text -> MSL ->
 `MTLLibrary` -> compute pipeline -> unified-memory buffers -> dispatch -> results,
 driven either from Swift or from Python over the `tm_*` C ABI. Triton's fused
-**softmax** and **matmul** tutorial kernels both run on the GPU and match CPU
-references — the matmul at f32 and at f16-in/f32-out, at sizes that divide
-neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` among them).
+**softmax**, **matmul** and **FlashAttention-2 forward** kernels all run on the
+GPU and match CPU references — at f32 and at f16-in/f32-accumulate, at sizes that
+divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
+`h2 s127 d64` among them), and, for attention, on scores large enough that a naive
+`exp` overflows.
 
 - **Lowering**: a recursive-descent parser for Triton's pretty MLIR syntax (plus
   the generic form for `tt.reduce`, which carries a region) and an MSL emitter.
-  Supported subset: 1-D and 2-D tensors with `tt.expand_dims`/`tt.broadcast`,
+  Supported subset: 1-D and 2-D tensors with
+  `tt.expand_dims`/`tt.broadcast`/`tt.trans`,
   masked `tt.load`/`tt.store` at any rank, the `arith` integer/float/compare ops,
   all the `arith` conversions, `math.*` unary ops, `arith.select`, `scf.for`/
   `scf.if` with `iter_args` and multiple results, `tt.reduce` (add/max/min) over
   the innermost axis, and `tt.dot`. Anything else fails with the op name and
   source line. Full list:
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Supported IR subset.
-- **Layout**: tensors live in one per-kernel block index space with a block size
-  per dimension. Which block dimension a rank-deficient tensor spans is *inferred*
-  from the `tt.expand_dims` that consumes it, so row-uniform work is emitted once
-  per row rather than once per element. A `tt.dot` adds a **contraction**
-  dimension that the elementwise lane distribution deliberately does not walk.
+- **Layout**: every dimension of every tensor gets an axis *variable*, and the ops
+  that relate two tensors **unify** them — elementwise dimension-wise,
+  `tt.expand_dims`/`tt.reduce` around the inserted or dropped dimension,
+  `tt.trans` through its permutation, `tt.dot` onto (M, K)/(K, N)/(M, N). Each
+  value is then emitted in a loop nest over exactly the axes it varies along, and
+  sibling nests share their common prefix, so row-uniform work is emitted once per
+  row and two tensors on different axis pairs (attention's `p` and `acc`) each get
+  their own nest. An axis no materialised value spans — a GEMM's K — is walked only
+  inside a `tt.dot`'s staging loops.
 - **`tt.dot`**: a second SSA value class for tensors that live in a threadgroup
   tile instead of per-lane registers, `simdgroup_load` /
   `simdgroup_multiply_accumulate` / `simdgroup_store` over 8x8 fragments, and
   zero-padded edge tiles so `BLOCK_M`/`BLOCK_N`/`BLOCK_K` need not be multiples of
   8. Everything feeding an operand is rebuilt inside the dot's own staging loops;
   a pointer advanced across the K loop is strength-reduced rather than carried.
-- **Reductions**: `simd_shuffle_down` within each 32-wide simdgroup, threadgroup
-  memory across simdgroups. A reduction closes the distributed loop and the values
-  still needed afterwards are recomputed, not spilled. A reduction *inside* an
-  `scf.for` hoists the whole loop to a threadgroup-uniform level, which is what an
-  online softmax needs.
+- **Reductions**: a reduction with an axis outside the reduced one hands each row a
+  *group of lanes* inside one simdgroup and folds with `simd_shuffle_down` plus a
+  `simd_shuffle` broadcast — no threadgroup memory, no barrier, every row at once
+  (worth 3.9x on attention). A rank-1 reduction has no outer axis, so it still
+  folds within each simdgroup and then across them. A reduction closes the
+  distributed loop and the values still needed afterwards are recomputed, not
+  spilled. A reduction *inside* an `scf.for` hoists the whole loop to a
+  threadgroup-uniform level, which is what an online softmax needs.
+- **Loop-carried tensors**: a per-lane tensor carried across a loop containing a
+  `tt.dot` or `tt.reduce` is spilled to a threadgroup tile and updated through a
+  shadow tile, copied back between barriers at the end of the body. A dot
+  accumulator the loop rescales in place — FlashAttention's
+  `acc = tt.dot(p, v, acc * alpha[:, None])` — instead *becomes* the dot's
+  accumulator tile, and the rescale becomes the staging pass that fills it.
 - **Numerics**: fast math is switched off (Metal defaults it on) and `math.*` maps
   to `precise::` wherever Metal has it; `fast::` is never emitted. Every math op is
   checked against a CPU reference on the GPU.
@@ -90,21 +106,31 @@ neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` among them)
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Matmul throughput has the
   per-machine numbers, what each optimisation was worth measured one at a time, the
   two CUDA-playbook techniques (double buffering, and register blocking past 1x1)
-  that did **not** transfer to Apple silicon, and the one with no CUDA analogue —
+  that did **not** transfer to M1-generation Apple silicon (unmeasured on M2/M3/M4,
+  which changed the memory hierarchy), and the one with no CUDA analogue —
   a wave-to-fragment mapping that makes every wave of a simdgroup share its B
   fragment — that was worth more than either. Sweep it yourself with
   `swift run -c release tmbench`, which needs no Xcode.
-- **Tests**: 131 Swift cases (parser, emitter, layout, casts/math, control flow,
-  rank-2, reductions, `tt.dot`, error paths, and GPU runs verified against CPU
-  references on an M1 Pro) + 14 Python cases including vector-add and softmax
-  round trips, plus an opt-in MPS benchmark. 83.49% region / 85.99% function /
-  91.01% line coverage of the Swift core — see
+- **Fused attention**: FlashAttention-2 forward against the composite it replaces
+  (`Q K^T` + `MPSMatrixSoftMax` + `P V`, three dispatches per head through a real
+  `S x S` score matrix) reaches **357%** of it at `b1 h8 s512 d64` and **107%** at
+  `s1024` on an M1 Max, falling to 68% at `s2048` where MPS's own GEMMs reach
+  their peak. Also M1-generation only.
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Attention throughput has both
+  machines, the run-to-run variance on the composite side, and the one change that
+  was worth 3.9x. Sweep it with `swift run -c release tmbench --attn`.
+- **Tests**: 144 Swift cases (parser, emitter, layout, casts/math, control flow,
+  rank-2, reductions, `tt.dot`, FlashAttention-2, error paths, and GPU runs
+  verified against CPU references on an M1 Pro) + 14 Python cases including
+  vector-add and softmax round trips, plus opt-in MPS benchmarks. 84.49% region /
+  85.77% function / 91.24% line coverage of the Swift core — see
   [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the breakdown and for
   what the uncovered fraction is made of.
 
-Not yet: atomics, `tt.trans`, and a per-lane tensor carried across a loop that
-contains a cross-lane op — the last of which is what FlashAttention-2's
-accumulator needs (§Hard parts 3). Not yet pinned to a Triton release.
+Not yet: `tt.atomic_*`, the FlashAttention-2 **backward** pass (which needs them),
+`bf16`, and block pointers. Not yet pinned to a Triton release — now the most
+important open task, because it gates the plugin being *loadable* rather than
+merely correct.
 [docs/USAGE.md §Implementing what's missing](docs/USAGE.md#implementing-whats-missing)
 has concrete starting points for each of these.
 

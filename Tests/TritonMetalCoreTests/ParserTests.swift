@@ -132,11 +132,67 @@ final class ParserTests: XCTestCase {
             module {
               tt.func public @k(%arg0: !tt.ptr<f32>) {
                 %0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
-                %1 = tt.trans %0 : tensor<16xi32> -> tensor<16xi32>
+                %1 = tt.cat %0, %0 : tensor<16xi32> -> tensor<32xi32>
                 tt.return
               }
             }
-            """, contains: "unsupported op 'tt.trans'")
+            """, contains: "unsupported op 'tt.cat'")
+    }
+
+    /// `tt.trans` records a permutation and produces no code; both the explicit
+    /// `order` attribute and the bare 2-D form Triton prints are accepted.
+    func testTransposeParsesBothSpellings() throws {
+        for spelling in [
+            "%1 = tt.trans %0 {order = array<i32: 1, 0>} : tensor<8x16xf32> -> tensor<16x8xf32>",
+            "%1 = tt.trans %0 : tensor<8x16xf32> -> tensor<16x8xf32>",
+        ] {
+            let ir = """
+                module {
+                  tt.func public @k(%arg0: !tt.ptr<f32>) {
+                    %0 = arith.constant dense<1.000000e+00> : tensor<8x16xf32>
+                \(spelling)
+                    tt.return
+                  }
+                }
+                """
+            let function = try TritonIRParser.parse(ir).functions[0]
+            guard case .trans(let result, let type, let source, let order) = function.body[1].kind
+            else { return XCTFail("expected tt.trans for '\(spelling)'") }
+            XCTAssertEqual(result, "1")
+            XCTAssertEqual(source, "0")
+            XCTAssertEqual(order, [1, 0])
+            XCTAssertEqual(type, .tensor(shape: [16, 8], element: .float(width: 32)))
+        }
+    }
+
+    /// A transposed value that has to be *materialised* asks for two contradictory
+    /// nestings of the same two block dimensions, and is refused by name.
+    func testMaterialisedTransposeIsRejected() {
+        expectError(
+            """
+            module {
+              tt.func public @k(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+                %0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+                %1 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %2 = tt.expand_dims %0 {axis = 1 : i32} : tensor<8xi32> -> tensor<8x1xi32>
+                %3 = tt.expand_dims %1 {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+                %4 = tt.broadcast %2 : tensor<8x1xi32> -> tensor<8x16xi32>
+                %5 = tt.broadcast %3 : tensor<1x16xi32> -> tensor<8x16xi32>
+                %6 = arith.addi %4, %5 : tensor<8x16xi32>
+                %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>>
+                %8 = tt.addptr %7, %6 : tensor<8x16x!tt.ptr<f32>>, tensor<8x16xi32>
+                %9 = tt.load %8 : tensor<8x16xf32>
+                %10 = tt.trans %9 : tensor<8x16xf32> -> tensor<16x8xf32>
+                %11 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<16x8x!tt.ptr<f32>>
+                %12 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+                %13 = tt.expand_dims %12 {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+                %14 = tt.broadcast %13 : tensor<16x1xi32> -> tensor<16x8xi32>
+                %15 = tt.addptr %11, %14 : tensor<16x8x!tt.ptr<f32>>, tensor<16x8xi32>
+                tt.store %15, %10 : tensor<16x8x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+            """, contains: "nests its block dimensions in two incompatible orders")
     }
 
     func testUnsupportedAtomicsAreNamed() {

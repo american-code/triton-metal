@@ -330,6 +330,32 @@ public struct TritonIRParser {
             }
             return .expandDims(result: result, type: type, source: source, axis: Int(axis))
 
+        case "tt.trans":
+            let result = try single(results, mnemonic, loc)
+            let source = try expectSSA()
+            var permutation: [Int]? = nil
+            if peek().isPunct("{") {
+                let attrs = try parseAttrDict()
+                if case .list(let items)? = attrs["order"] {
+                    permutation = items.compactMap { $0.intValue.map(Int.init) }
+                    guard permutation?.count == items.count else {
+                        throw CoreError.parse("tt.trans 'order' must be a list of integers", loc)
+                    }
+                }
+            }
+            let types = try parseOptionalTrailingTypes()
+            guard let type = types.last, let shape = type.shape else {
+                throw CoreError.parse("tt.trans requires a tensor result type", loc)
+            }
+            // Triton omits `order` for the 2-D case it emits most, where the only
+            // permutation is the reversal.
+            let order = permutation ?? Array((0..<shape.count).reversed())
+            guard order.count == shape.count, Set(order) == Set(0..<shape.count) else {
+                throw CoreError.parse(
+                    "tt.trans order \(order) is not a permutation of \(shape.count) dimensions", loc)
+            }
+            return .trans(result: result, type: type, source: source, order: order)
+
         case "tt.broadcast":
             let result = try single(results, mnemonic, loc)
             let source = try expectSSA()

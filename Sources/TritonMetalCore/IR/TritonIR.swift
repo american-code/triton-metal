@@ -140,6 +140,10 @@ public enum OpKind: Sendable {
     case unary(result: String, op: MathOp, source: String)
     case select(result: String, condition: String, whenTrue: String, whenFalse: String)
     case expandDims(result: String, type: TMType, source: String, axis: Int)
+    /// `tt.trans %x {order = array<i32: 1, 0>}` — result dimension `i` is
+    /// source dimension `order[i]`. A relabelling of the block axes, no data
+    /// movement (see `BlockLayout` and `MSLEmitter.emit`).
+    case trans(result: String, type: TMType, source: String, order: [Int])
     case broadcast(result: String, type: TMType, source: String)
     case reduce(result: String, source: String, axis: Int, op: ReduceOp)
     case dot(DotOp)
@@ -198,6 +202,7 @@ extension OpKind {
         case .constant, .programID, .numPrograms, .makeRange, .ret:
             return []
         case .splat(_, _, let source), .expandDims(_, _, let source, _),
+            .trans(_, _, let source, _),
             .broadcast(_, _, let source), .cast(_, _, let source, _),
             .unary(_, _, let source), .reduce(_, let source, _, _):
             return [source]
@@ -230,8 +235,8 @@ extension OpKind {
             .intBinary(let r, _, _, _), .floatBinary(let r, _, _, _),
             .intCompare(let r, _, _, _), .floatCompare(let r, _, _, _),
             .cast(let r, _, _, _), .unary(let r, _, _), .select(let r, _, _, _),
-            .expandDims(let r, _, _, _), .broadcast(let r, _, _), .reduce(let r, _, _, _),
-            .load(let r, _, _, _):
+            .expandDims(let r, _, _, _), .trans(let r, _, _, _), .broadcast(let r, _, _),
+            .reduce(let r, _, _, _), .load(let r, _, _, _):
             return [r]
         case .dot(let dot):
             return [dot.result]

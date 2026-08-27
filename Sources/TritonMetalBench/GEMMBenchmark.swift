@@ -405,9 +405,9 @@ public enum GEMMBenchmark {
         2.0 * Double(size) * Double(size) * Double(size)
     }
 
-    static func cdiv(_ a: Int, _ b: Int) -> Int { (a + b - 1) / b }
+    public static func cdiv(_ a: Int, _ b: Int) -> Int { (a + b - 1) / b }
 
-    static func upload(_ values: [Float]) throws -> MTLBuffer {
+    public static func upload(_ values: [Float]) throws -> MTLBuffer {
         let buffer = try MetalRuntime.makeBuffer(length: max(1, values.count * 4))
         values.withUnsafeBytes {
             if let base = $0.baseAddress {

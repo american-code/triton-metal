@@ -37,15 +37,24 @@ non-multiple-of-tile sizes before being reported.
 
 ## The transfer matrix: what ports from CUDA, what inverts
 
-Measured one change at a time (M1 Max @ 2048):
+Measured one change at a time (M1 Max @ 2048).
 
-- **Transferred:** register-resident accumulators (+13%); staging locality + literal
+**Scope: this is an M1-generation result.** Everything below was measured on M1
+Max and M1 Pro parts. The inversions are claims about *these* GPUs, and the
+reasons given for them — no `cp.async` copy engine, occupancy as the latency-hiding
+mechanism, fragments moving through threadgroup memory rather than named lanes —
+are architectural properties that later generations may well have changed. The M3
+and M4 GPUs reworked the memory hierarchy (dynamic caching) in particular. Nothing
+here should be assumed to hold on M2, M3 or M4 silicon until it is re-measured;
+`tmbench --sweep full` is the re-measurement, and it is one command.
+
+- **Transferred (M1):** register-resident accumulators (+13%); staging locality + literal
   trip counts (+16%); the accumulator tile doubling as the operand staging arena
   (+6%, and the enabler for 64×128 blocks inside the 32 KB threadgroup budget);
   vectorized (`float4`) global loads (+20%, the largest single change of either
   round — though on this chip most of it is the *address arithmetic* the vector
   path skips, not the loads).
-- **Did not transfer:** *double buffering is a wash* — Metal has no `cp.async` copy
+- **Did not transfer (M1):** *double buffering is a wash* — Metal has no `cp.async` copy
   engine, so prefetch competes for the same issue slots and larger tiles cost the
   occupancy Apple silicon uses to hide latency (re-measured after the mapping
   change: 3633 vs 3627 GFLOP/s; after vector staging it is a 26% *loss*, because
@@ -55,13 +64,41 @@ Measured one change at a time (M1 Max @ 2048):
   up from 28%, the opposite of CUTLASS guidance. Blocking along **M** is the
   exception that proves the rule: 2×1 keeps the shared column and is worth +8% at
   the shape that wins.
-- **Metal-specific, no CUDA analogue:** the *shared-column wave mapping* (+15%).
+- **Metal-specific, no CUDA analogue (M1):** the *shared-column wave mapping* (+15%).
   Because Metal's simdgroup-matrix ops move whole 8×8 fragments through threadgroup
   memory rather than distributing them over named lanes, which fragment each
   simdgroup wants is an emitter decision — and choosing it so that every wave of a
   simdgroup shares one B fragment cuts a contraction step from 16 threadgroup reads
   to 9. There is nothing to port here: the CUDA equivalent of this decision is made
   by the mma layout, not by the kernel.
+
+## Attention: the fused kernel against the unfused composite
+
+The GEMM comparison above is against the best single kernel Apple ships for the
+same job, and this backend does not beat it. FlashAttention-2 is the other kind of
+comparison — a *fused* kernel against the *composite* it replaces — and there it
+wins, for the reason fusion exists.
+
+Against `Q K^T` + `MPSMatrixSoftMax` + `P V`, three dispatches per head through a
+real `S x S` f32 score matrix, on an M1 Max:
+
+| shape | fused | MPS composite | ratio |
+| --- | --- | --- | --- |
+| `b1 h8 s512 d64` f32 | 1358 GF | 381 GF | **357%** |
+| `b1 h8 s1024 d64` f32 | 1678 GF | 1575 GF | **107%** |
+| `b1 h16 s2048 d64` f32 | 1761 GF | 2586 GF | 68% |
+| `b1 h8 s1024 d64` f16 | 2089 GF | 1582 GF | **132%** |
+
+The crossover is around `s1024`: below it the composite's GEMMs are too small to
+reach MPS's peak and the dispatch count dominates; above it they do reach it and
+the score-matrix traffic the fusion removes stops being what decides. Also an
+M1-generation result, and the same caveat applies — a chip with a different cache
+hierarchy would move the crossover, plausibly in the fused kernel's favour if
+DRAM traffic becomes relatively more expensive, or against it if the composite's
+score matrix starts fitting in cache. [ARCHITECTURE.md](ARCHITECTURE.md)
+§Attention throughput has the M1 Pro numbers, the run-to-run variance on the
+composite side, and a note that a better-written composite (metalscope measured
+~744 GF for the same shape on an M1 Pro) would narrow the `s512` margin.
 
 ## Where it sits now
 

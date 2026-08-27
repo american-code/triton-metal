@@ -85,17 +85,37 @@ final class ReductionTests: XCTestCase {
 
     /// A row-wise reduction produces a value indexed by the *outer* dimension, so
     /// it must be computed once per row, between the two loops.
+    ///
+    /// Each row gets a *group* of lanes rather than the whole threadgroup, so
+    /// several rows reduce at once and the fold is shuffles alone — no
+    /// threadgroup memory and no barrier. A store at the row level is then owned
+    /// by the first lane of the row's group rather than by thread 0.
     func testRowWiseReductionSitsBetweenTheLoops() throws {
         let source = try MetalCompiler.emitMSL(ttir: AdvancedFixtures.rowSum, options: .init())
-        let outer = try XCTUnwrap(source.range(of: "for (uint tm_i0 = 0u;"))
+        let outer = try XCTUnwrap(source.range(of: "for (uint tm_i0 = tm_thread_id.x / 32u;"))
         let reduce = try XCTUnwrap(source.range(of: "// tt.reduce (add)"))
-        let inner = try XCTUnwrap(source.range(of: "for (uint tm_i1 = tm_thread_id.x;"))
+        let inner = try XCTUnwrap(source.range(of: "for (uint tm_i1 = tm_thread_id.x % 32u;"))
         XCTAssertLessThan(outer.lowerBound, inner.lowerBound)
         XCTAssertLessThan(inner.lowerBound, reduce.lowerBound)
+        XCTAssertTrue(source.contains("fold within the 32 lanes of this row"), source)
         XCTAssertTrue(source.contains("simd_shuffle_down"), source)
-        XCTAssertTrue(source.contains("threadgroup float tm_scratch0[32];"), source)
-        XCTAssertTrue(
+        XCTAssertTrue(source.contains("simd_shuffle(tm_acc0, 0)"), source)
+        XCTAssertFalse(source.contains("tm_scratch0"), source)
+        XCTAssertFalse(
             source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"), source)
+        XCTAssertTrue(source.contains("if (tm_thread_id.x % 32u == 0u &&"), source)
+    }
+
+    /// A rank-1 reduction has no outer dimension to hand a lane group to, so its
+    /// row *is* the threadgroup and the fold still goes through threadgroup
+    /// memory and two barriers.
+    func testOneDimensionalReductionStillFoldsAcrossTheThreadgroup() throws {
+        let source = try MetalCompiler.emitMSL(
+            ttir: AdvancedFixtures.reduce1D(combiner: "arith.addf", identity: "0.000000e+00"),
+            options: .init())
+        XCTAssertTrue(source.contains("fold within each simdgroup, then across them"), source)
+        XCTAssertTrue(source.contains("threadgroup float tm_scratch0[32];"), source)
+        XCTAssertTrue(source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"), source)
     }
 
     // MARK: - Softmax (the integration kernel)
@@ -213,15 +233,20 @@ final class ReductionTests: XCTestCase {
         XCTAssertFalse(prologue.contains("for (uint tm_i0 = tm_thread_id.x"), prologue)
     }
 
-    /// A per-lane tensor cannot be carried across a loop that has to be
-    /// threadgroup-uniform — the precise obstacle, reported by name.
-    func testCarryingATensorAcrossAnInLoopReductionIsRefused() {
+    /// A per-lane tensor *can* be carried across a loop that has to be
+    /// threadgroup-uniform: it is spilled to a tile, updated through a shadow and
+    /// copied back once per iteration (docs/ARCHITECTURE.md §Cross-lane regions).
+    ///
+    /// `acc` starts at 1 in every lane and each iteration adds the row's own sum
+    /// to every lane, so after `t` iterations every lane holds `64^t`.
+    func testATensorCarriedAcrossAnInLoopReductionIsSpilled() throws {
+        try skipWithoutMetal()
         let ir = """
             module {
               tt.func public @k(%arg0: !tt.ptr<f32>, %arg1: i32) {
                 %c0 = arith.constant 0 : i32
                 %c1 = arith.constant 1 : i32
-                %cst = arith.constant dense<0.000000e+00> : tensor<64xf32>
+                %cst = arith.constant dense<1.000000e+00> : tensor<64xf32>
                 %r = scf.for %i = %c0 to %arg1 step %c1 iter_args(%acc = %cst)
                     -> (tensor<64xf32>) : i32 {
                   %20 = "tt.reduce"(%acc) <{axis = 0 : i32}> ({
@@ -230,7 +255,7 @@ final class ReductionTests: XCTestCase {
                     tt.reduce.return %21 : f32
                   }) : (tensor<64xf32>) -> f32
                   %22 = tt.splat %20 : f32 -> tensor<64xf32>
-                  %23 = arith.addf %acc, %22 : tensor<64xf32>
+                  %23 = arith.mulf %acc, %22 : tensor<64xf32>
                   scf.yield %23 : tensor<64xf32>
                 }
                 %p = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
@@ -241,9 +266,17 @@ final class ReductionTests: XCTestCase {
               }
             }
             """
-        XCTAssertThrowsError(try MetalCompiler.emitMSL(ttir: ir, options: .init())) {
-            XCTAssertTrue(
-                "\($0)".contains("carries the tensor '%acc' across a cross-lane operation"), "\($0)")
+        let source = try MetalCompiler.emitMSL(ttir: ir, options: .init())
+        XCTAssertTrue(source.contains("carry"), source)
+        for trips in [0, 1, 2, 3] {
+            var expected: Float = 1
+            for _ in 0..<trips { expected *= 64 * expected }
+            let run = try GPU.run(
+                ir: ir, args: [.output(count: 64), .int32(Int32(trips))])
+            assertClose(
+                GPU.read(run.outputs[0], Float.self, 64),
+                [Float](repeating: expected, count: 64), tolerance: 1e-5,
+                "\(trips) trips")
         }
     }
 
