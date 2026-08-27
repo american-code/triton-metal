@@ -30,10 +30,32 @@ public enum AttentionKernel {
     /// `element` is the input/output type; the accumulator, the softmax
     /// statistics and the score matrix are always f32, which is the
     /// f16-in/f32-accumulate shape that matters for ML.
+    /// `emitStats` appends two arguments, `%L: !tt.ptr<f32>` and
+    /// `%stride_lse: i32`, and writes the per-row **logsumexp in log2 units**
+    /// (`m_i + log2(l_i)`) to `L`. That single `BLOCK_M`-wide vector per query
+    /// block is all the backward pass needs to rebuild `P` — recomputing
+    /// `exp2(qk_scale * Q.K - M_i)` gives back exactly the probability this
+    /// kernel used, which is what makes a recompute-based backward cheaper than
+    /// storing the `S x S` score matrix. See `AttentionBackwardKernel`.
     public static func forward(
-        blockM: Int, blockN: Int, headDim: Int, element: String = "f32"
+        blockM: Int, blockN: Int, headDim: Int, element: String = "f32", emitStats: Bool = false
     ) -> String {
         let isHalf = element == "f16"
+        let statsArguments = emitStats ? ",\n      %L: !tt.ptr<f32>, %stride_lse: i32" : ""
+        let statsStore = emitStats
+            ? """
+                  %lse_log = math.log2 %res#1 : tensor<\(blockM)xf32>
+                  %lse = arith.addf %res#0, %lse_log : tensor<\(blockM)xf32>
+                  %lse_off = arith.muli %pid_h, %stride_lse : i32
+                  %l_base = tt.addptr %L, %lse_off : !tt.ptr<f32>, i32
+                  %l_p = tt.splat %l_base : !tt.ptr<f32> -> tensor<\(blockM)x!tt.ptr<f32>>
+                  %l_ptrs = tt.addptr %l_p, %offs_m : tensor<\(blockM)x!tt.ptr<f32>>, \
+                tensor<\(blockM)xi32>
+                      %nctx_1 = tt.splat %n_ctx : i32 -> tensor<\(blockM)xi32>
+                      %m_ok = arith.cmpi slt, %offs_m, %nctx_1 : tensor<\(blockM)xi32>
+                      tt.store %l_ptrs, %lse, %m_ok : tensor<\(blockM)x!tt.ptr<f32>>
+                """
+            : ""
         // P feeds the second dot, whose two operands must share an element type.
         let probability = isHalf
             ? """
@@ -53,7 +75,7 @@ public enum AttentionKernel {
               tt.func public @attn_fwd(
                   %Q: !tt.ptr<\(element)>, %K: !tt.ptr<\(element)>, %V: !tt.ptr<\(element)>,
                   %O: !tt.ptr<\(element)>, %sm_scale: f32,
-                  %stride_head: i32, %stride_seq: i32, %n_ctx: i32) {
+                  %stride_head: i32, %stride_seq: i32, %n_ctx: i32\(statsArguments)) {
                 %log2e = arith.constant 1.44269504088896340736 : f32
                 %qk_scale = arith.mulf %sm_scale, %log2e : f32
                 %c0_i32 = arith.constant 0 : i32
@@ -204,6 +226,7 @@ public enum AttentionKernel {
             tensor<\(blockM)xf32>, tensor<\(blockM)x\(headDim)xf32>
                 }
 
+                \(statsStore)
                 %l_r = tt.expand_dims %res#1 {axis = 1 : i32} : tensor<\(blockM)xf32> -> \
             tensor<\(blockM)x1xf32>
                 %l_b = tt.broadcast %l_r : tensor<\(blockM)x1xf32> -> \

@@ -2764,16 +2764,25 @@ private struct FunctionEmitter {
                     capacity: sharedArenaSlots(function.body))
             }
         }
+        // Every dot inside a loop that put an accumulator in registers stages
+        // into that accumulator's tile, not only the dot the accumulator belongs
+        // to: the storage is free for the whole loop, and the backward pass's
+        // three- and four-dot loops do not fit otherwise. The cursor restarts at
+        // each dot because a dot's trailing barrier orders its arithmetic before
+        // the next one's staging — unless double buffering is on, which needs the
+        // regions disjoint (see `operandArenaSlots`).
+        let arena = stagingArena != nil
+        if arena, !options.dotDoubleBuffer { stagingArena?.cursor = 0 }
         let lhs = try allocateTile(
             "dot_a", element: lhsElement, rows: lhsShape[0], columns: lhsShape[1],
             rowAxis: lhsAxes[0], columnAxis: lhsAxes[1],
             rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
-            intoArena: resident, intoSharedArena: shared, loc)
+            intoArena: arena, intoSharedArena: shared, loc)
         let rhs = try allocateTile(
             "dot_b", element: rhsElement, rows: rhsShape[0], columns: rhsShape[1],
             rowAxis: rhsAxes[0], columnAxis: rhsAxes[1],
             columnGranularity: blocking.tilesN * FunctionEmitter.fragment,
-            intoArena: resident, intoSharedArena: shared, loc)
+            intoArena: arena, intoSharedArena: shared, loc)
 
         // Everything staged below may read a tile ordinary per-lane code wrote
         // (a spilled reduction, a carried accumulator), and those writes are in
@@ -2870,9 +2879,20 @@ private struct FunctionEmitter {
         return largest
     }
 
-    /// How much arena the operand tiles of every `tt.dot` in `body` need, in slots
+    /// How much arena the operand tiles of the `tt.dot`s in `body` need, in slots
     /// of the accumulator's element type. The accumulator's tile is sized to hold
     /// this as well as itself, since the two are never live at the same time.
+    ///
+    /// The **largest** dot's footprint, not the sum of all of them, for the same
+    /// reason the kernel-wide shared arena takes a maximum: a dot ends with a
+    /// `threadgroup_barrier` after its arithmetic and the next one begins by
+    /// staging into the arena, so two dots' operand tiles are never live at once.
+    /// The backward pass is what forced this — its `dQ` loop stages three dots
+    /// and its `dK`/`dV` loop four, and summing them overruns Metal's 32KB at
+    /// every block shape worth having. Double buffering is the exception: it
+    /// makes a tile's base a variable that ping-pongs between two halves of its
+    /// own region, so those regions have to stay disjoint and the sum is what is
+    /// needed.
     private func operandArenaSlots(
         _ body: [Instruction], blocking: RegisterBlocking, arena: TMType
     ) -> Int {
@@ -2893,8 +2913,10 @@ private struct FunctionEmitter {
                 FunctionEmitter.padded(rhsShape[0]),
                 FunctionEmitter.padded(rhsShape[1], to: blocking.tilesN * size), rhsElement)
             let buffers = options.dotDoubleBuffer ? 2 : 1
-            slots += FunctionEmitter.arenaSlots(lhsCount, of: lhsElement, in: arena) * buffers
-            slots += FunctionEmitter.arenaSlots(rhsCount, of: rhsElement, in: arena) * buffers
+            let footprint =
+                FunctionEmitter.arenaSlots(lhsCount, of: lhsElement, in: arena) * buffers
+                + FunctionEmitter.arenaSlots(rhsCount, of: rhsElement, in: arena) * buffers
+            slots = options.dotDoubleBuffer ? slots + footprint : max(slots, footprint)
         }
         return slots
     }
@@ -3538,7 +3560,12 @@ private struct FunctionEmitter {
                 }
                 let accumulatorAxes = layout.axes[argument.name] ?? [0, 1]
                 let blocking = self.blocking(rows: shape[0], columns: shape[1])
-                let operands = operandArenaSlots(loop.body, blocking: blocking, arena: element)
+                // One arena per loop, carved out of the *first* register-resident
+                // accumulator's tile. A loop that carries two of them — the
+                // backward pass's `dK` and `dV` — does not need two arenas, and
+                // giving the second one the same slack would waste it.
+                let operands = stagingArena == nil
+                    ? operandArenaSlots(loop.body, blocking: blocking, arena: element) : 0
                 let tile = try allocateTile(
                     "dot_c", element: element, rows: shape[0], columns: shape[1],
                     rowAxis: accumulatorAxes[0], columnAxis: accumulatorAxes[1],
@@ -3589,11 +3616,12 @@ private struct FunctionEmitter {
                         .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
                         level: level, recomputable: false, reason: reason, loc)
                 }
-                let capacity = max(tile.elementCount, operands)
-                stagingArena = (
-                    name: tile.name, element: element, capacity: capacity, cursor: 0
-                )
-                pingPongTiles = []
+                if stagingArena == nil {
+                    stagingArena = (
+                        name: tile.name, element: element,
+                        capacity: max(tile.elementCount, operands), cursor: 0)
+                    pingPongTiles = []
+                }
                 residentAccumulators[tile.name] = registers
                 resident.append(registers)
 
