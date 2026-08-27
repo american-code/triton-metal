@@ -15,7 +15,11 @@ jobs:
   build-and-test:
     name: swift build + swift test + pytest (macOS arm64)
     runs-on: macos-latest
-    timeout-minutes: 45
+    # 45 was comfortable before the MLX frontend; `swift build` now also compiles
+    # mlx-swift's bundled MLX C++ core (179 translation units, ~70s on an M1 Pro
+    # with 10 cores, longer on a 3-vCPU runner) and clones a large checkout to do
+    # it. 60 leaves the same headroom the old number had.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +51,21 @@ jobs:
           set -o pipefail
           swift build 2>&1 | tail -20
 
+      # The MLX frontend's IR is generated in Swift, and `tmsae --emit-ir` prints
+      # it without touching MLX or the GPU — so it is the one part of that target
+      # a runner with no usable device can still exercise end to end.
+      - name: Lower the SAE kernel
+        run: |
+          set -o pipefail
+          swift build --product tmsae 2>&1 | tail -1
+          .build/debug/tmsae --emit-ir | head -3
+
+      # `mlx.metallib` is deliberately NOT fetched here. TritonMetalMLXTests gate
+      # on two things — a device that can run an emitted kernel, and MLX's shader
+      # library — and this runner fails the first one anyway, so installing the
+      # second would change nothing but the download. The bundle's 35 cases skip
+      # cleanly; `-rs` prints why. On a real Mac they run: see
+      # docs/USAGE.md §The Swift-native path.
       - name: swift test
         run: |
           set -o pipefail
