@@ -115,7 +115,7 @@ final class DotTests: XCTestCase {
     func testAccumulatorLivesInThreadgroupMemoryAcrossTheLoop() throws {
         let source = try MetalCompiler.emitMSL(
             ttir: DotFixtures.tutorial(blockM: 32, blockN: 32, blockK: 16), options: .init())
-        XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[1024];  // 32x32"), source)
+        XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[1024];"), source)
         let loop = try XCTUnwrap(source.range(of: "for (int varg12 ="))
         let prologue = String(source[source.startIndex..<loop.lowerBound])
         XCTAssertFalse(prologue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] = vcst;"), prologue)
@@ -123,9 +123,12 @@ final class DotTests: XCTestCase {
             prologue.contains(
                 "simdgroup_float8x8 tm_dot_c0_r_0_0_0 = "
                     + "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"), prologue)
-        // Read back per lane after the loop, by indexing the tile.
+        // Read back per lane after the loop, by indexing the tile — a panel of
+        // it, since the epilogue streams the fragments out (see
+        // `testTheEpilogueStreamsTheAccumulatorOutInPanels`).
         let epilogue = String(source[loop.upperBound...])
-        XCTAssertTrue(epilogue.contains("tm_dot_c0[tm_i0 * 32u + tm_i1] * vcone;"), epilogue)
+        XCTAssertTrue(
+            epilogue.contains("tm_dot_c0[(tm_i0 - tm_panel0) * 32u + tm_i1] * vcone;"), epilogue)
     }
 
     /// A non-zero seed still has to be staged in and loaded, because the value has
@@ -149,7 +152,7 @@ final class DotTests: XCTestCase {
             ttir: DotFixtures.tutorial(blockM: 64, blockN: 64, blockK: 32),
             options: .init(numSimdgroups: 16))
         let loop = try XCTUnwrap(source.range(of: "for (int varg12 ="))
-        let close = try XCTUnwrap(source.range(of: "// tt.dot accumulator: back to threadgroup"))
+        let close = try XCTUnwrap(source.range(of: "// tt.dot accumulator: 2 panels"))
         let prologue = String(source[source.startIndex..<loop.lowerBound])
         let body = String(source[loop.upperBound..<close.lowerBound])
         let epilogue = String(source[close.lowerBound...])
@@ -233,8 +236,12 @@ final class DotTests: XCTestCase {
         let source = try MetalCompiler.emitMSL(
             ttir: DotFixtures.tutorial(blockM: 128, blockN: 64, blockK: 32),
             options: .init(numSimdgroups: 16))
-        // 128x64 floats is the whole 32KB budget; the operands alias into it.
-        XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[8192];"), source)
+        // A 128x64 f32 accumulator is 8192 floats — Metal's entire 32KB budget —
+        // but nothing ever holds all of it: the operand tiles alias into it
+        // during the contraction, and the epilogue streams the fragments out a
+        // panel at a time, so what is actually declared is the larger of the two,
+        // which is the 6144-slot operand footprint (128x32 A plus 32x64 B).
+        XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[6144];"), source)
         XCTAssertTrue(source.contains("threadgroup float *tm_dot_a1 = tm_dot_c0;"), source)
         XCTAssertTrue(source.contains("threadgroup float *tm_dot_b2 = tm_dot_c0 + 4096;"), source)
         XCTAssertEqual(occurrences(of: "threadgroup float tm_dot", in: source), 1)
@@ -247,6 +254,91 @@ final class DotTests: XCTestCase {
         let store = try XCTUnwrap(source.range(of: "simdgroup_store(tm_dot_c0_r_"))
         let between = String(source[arithmetic.upperBound..<store.lowerBound])
         XCTAssertTrue(between.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"), between)
+    }
+
+    /// The accumulator lives in registers for the whole contraction; the only
+    /// thing that wants it in threadgroup memory is the epilogue, which reads it
+    /// back per lane. So the epilogue takes it a panel at a time: store the
+    /// fragments whose rows are in this panel, run the per-lane tail over those
+    /// rows, repeat. The tile then costs one panel instead of `BLOCK_M x BLOCK_N`.
+    func testTheEpilogueStreamsTheAccumulatorOutInPanels() throws {
+        let source = try MetalCompiler.emitMSL(
+            ttir: DotFixtures.tutorial(blockM: 64, blockN: 64, blockK: 16),
+            options: .init(numSimdgroups: 8))
+        // 64x64 is 4096 floats; what is declared is the 2048-slot operand
+        // footprint, which the 32-row panel fits inside for free.
+        XCTAssertTrue(
+            source.contains(
+                "threadgroup float tm_dot_c0[2048];  // 64x64 accumulator, streamed out 32 rows"),
+            source)
+        XCTAssertTrue(
+            source.contains("for (uint tm_panel0 = 0u; tm_panel0 < 64u; tm_panel0 += 32u) {"),
+            source)
+
+        let panel = try XCTUnwrap(source.range(of: "for (uint tm_panel0 ="))
+        let body = String(source[panel.upperBound...])
+        // Every fragment is stored under a test against the panel's row range,
+        // so each is written once across the whole epilogue rather than once per
+        // panel; the ones not in this panel simply stay in registers.
+        XCTAssertEqual(occurrences(of: "simdgroup_store(tm_dot_c0_r_", in: body), 8)
+        XCTAssertEqual(occurrences(of: ">= tm_panel0 &&", in: body), 8)
+        // The per-lane walk is restricted to the panel, and reads the tile
+        // relative to it.
+        XCTAssertTrue(
+            body.contains(
+                "for (uint tm_i0 = tm_panel0 + tm_thread_id.x / 64u; tm_i0 < tm_panel0 + 32u;"),
+            body)
+        XCTAssertTrue(body.contains("tm_dot_c0[(tm_i0 - tm_panel0) * 64u + tm_i1]"), body)
+        // Both barriers matter: the leading one orders the previous panel's
+        // reads (and, on the first pass, the operand tiles' last reads) before
+        // this panel's stores.
+        let store = try XCTUnwrap(body.range(of: "simdgroup_store(tm_dot_c0_r_"))
+        let before = String(body[body.startIndex..<store.lowerBound])
+        XCTAssertTrue(before.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"), before)
+    }
+
+    /// The shape the panelled epilogue exists for. A `128x128` f32 accumulator is
+    /// 64KB — twice Metal's whole threadgroup budget — so before the fragments
+    /// could be streamed out this kernel could not be lowered at all.
+    func testLargeBlockShapesLowerOnlyBecauseTheEpilogueStreams() throws {
+        let ir = DotFixtures.tutorial(blockM: 128, blockN: 128, blockK: 16)
+        let options = MetalCompiler.Options(numSimdgroups: 16)
+        let source = try MetalCompiler.emitMSL(ttir: ir, options: options)
+        XCTAssertTrue(source.contains("threadgroup float tm_dot_c0[4096];"), source)
+
+        var withoutPanels = options
+        withoutPanels.dotEpiloguePanel = 0
+        XCTAssertThrowsError(try MetalCompiler.emitMSL(ttir: ir, options: withoutPanels)) {
+            XCTAssertTrue("\($0)".contains("threadgroup memory"), "\($0)")
+        }
+    }
+
+    /// ...and it computes the same thing, at sizes that divide neither the block
+    /// shape nor the 8x8 fragment, with and without panels where both lower.
+    func testPanelledEpilogueMatchesTheCPUReference() throws {
+        try skipWithoutMetal()
+        for (m, n, k, blockM, blockN, blockK, warps) in [
+            (129, 257, 65, 128, 128, 16, 16),  // only lowers with panels
+            (37, 41, 43, 128, 128, 16, 16),
+            (129, 257, 65, 64, 64, 16, 8),
+            (100, 100, 33, 128, 64, 16, 8),
+        ] {
+            let a = matrix(m * k, seed: 3)
+            let b = matrix(k * n, seed: 11)
+            let run = try GPU.run(
+                ir: DotFixtures.tutorial(blockM: blockM, blockN: blockN, blockK: blockK),
+                grid: (GPU.cdiv(m, blockM), GPU.cdiv(n, blockN), 1), args: [
+                    .floats(a), .floats(b), .output(count: m * n),
+                    .int32(Int32(m)), .int32(Int32(n)), .int32(Int32(k)),
+                    .int32(Int32(k)), .int32(1),
+                    .int32(Int32(n)), .int32(1),
+                    .int32(Int32(n)), .int32(1),
+                ], numSimdgroups: warps)
+            assertClose(
+                GPU.read(run.outputs[0], Float.self, m * n),
+                reference(a, b, m: m, n: n, k: k, lda: k, ldb: n),
+                tolerance: 1e-5, "\(m)x\(n)x\(k) BLOCK=\(blockM)x\(blockN)x\(blockK)/w\(warps)")
+        }
     }
 
     /// Without residency there is no dead window to share, so a stand-alone dot

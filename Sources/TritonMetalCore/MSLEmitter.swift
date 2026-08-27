@@ -313,11 +313,28 @@ private struct Tile {
     /// `l_i` — which is one element per row and indexed by the row axis alone.
     var hasColumns: Bool = true
 
+    /// A tile whose storage holds only `rows` rows of the logical tile at a
+    /// time, the window starting at the MSL expression `base`.
+    ///
+    /// This is what a register-resident accumulator's epilogue uses: the
+    /// fragments are streamed out of registers a panel at a time, so the tile
+    /// costs one panel of threadgroup memory rather than `BLOCK_M x BLOCK_N`.
+    /// Readers subtract the base, which is the panel loop's induction variable.
+    var panel: (rows: Int, base: String)?
+
     /// The distance between one row and the next, which is also the leading
     /// dimension every `simdgroup_load` and `simdgroup_store` is given.
     var stride: Int { paddedColumns + rowPadding }
     var elementCount: Int { paddedRows * stride }
+    /// Elements this tile actually occupies — one panel's worth, when panelled.
+    var storageCount: Int { (panel?.rows ?? paddedRows) * stride }
     var needsPadding: Bool { paddedRows != rows || paddedColumns != columns }
+
+    /// The row index a reader uses, relative to whatever the storage holds.
+    private var rowIndex: String {
+        guard let panel else { return "tm_i\(rowAxis)" }
+        return "(tm_i\(rowAxis) - \(panel.base))"
+    }
 
     /// The block axes a reader of this tile must have loops open for. A tile
     /// dimension of extent 1 is a broadcast and needs none.
@@ -333,14 +350,14 @@ private struct Tile {
     /// broadcast shortcut would fold every padding lane onto slot zero.
     var slot: String {
         hasColumns
-            ? "\(name)[tm_i\(rowAxis) * \(stride)u + tm_i\(columnAxis)]"
-            : "\(name)[tm_i\(rowAxis)]"
+            ? "\(name)[\(rowIndex) * \(stride)u + tm_i\(columnAxis)]"
+            : "\(name)[\(rowIndex)]"
     }
 
     /// How the tile reads as an ordinary per-lane value, once the emitter is back
     /// inside the block loops.
     var expression: String {
-        let row = rows > 1 ? "tm_i\(rowAxis)" : "0u"
+        let row = rows > 1 ? rowIndex : "0u"
         guard hasColumns else { return "\(name)[\(row)]" }
         let column = columns > 1 ? "tm_i\(columnAxis)" : "0u"
         return "\(name)[\(row) * \(stride)u + \(column)]"
@@ -540,6 +557,14 @@ private struct FunctionEmitter {
     private var stagingDepth = 0
     /// Which frame of the staging nest the next rebuilt statement belongs in.
     private var stagingTargetFrame: Int?
+    /// While a register-resident accumulator's epilogue runs panel by panel: the
+    /// block axis whose lane loop is restricted to the panel, the panel loop's
+    /// induction variable, and how many rows a panel holds. Set when the panel
+    /// loop opens after the contraction loop; the loop stays open to the end of
+    /// the kernel, because everything downstream of the dot is its body.
+    private var epiloguePanel: (axis: Int, base: String, rows: Int)?
+    private var epiloguePanelDepth = 0
+    private var panelCount = 0
     private var tileCount = 0
     private var dotCount = 0
     private var advanceCount = 0
@@ -659,6 +684,13 @@ private struct FunctionEmitter {
             try emit(instruction)
         }
         try ensureLevel([], function.loc)
+        // A panelled epilogue's loop is open from the contraction loop's end to
+        // here: everything downstream of the dot is its body.
+        while epiloguePanelDepth > 0 {
+            epiloguePanelDepth -= 1
+            epiloguePanel = nil
+            closeTopFrame()
+        }
 
         if usesProgramID {
             parameters.append("uint3 tm_program_id [[threadgroup_position_in_grid]]")
@@ -840,22 +872,33 @@ private struct FunctionEmitter {
             let extent = layout.shape[axis]
             let variable = "tm_i\(axis)"
             let lanes = laneWidth
-            let open: String
+            let start: String
+            let advance: String
             if !layout.isUniform(axis), lanes < threadsPerThreadgroup {
-                open =
-                    "for (uint \(variable) = tm_thread_id.x % \(lanes)u; "
-                    + "\(variable) < \(extent)u; \(variable) += \(lanes)u) {"
+                start = "tm_thread_id.x % \(lanes)u"
+                advance = "\(variable) += \(lanes)u"
             } else if !layout.isUniform(axis) {
-                open =
-                    "for (uint \(variable) = tm_thread_id.x; \(variable) < \(extent)u; "
-                    + "\(variable) += tm_threadgroup_size.x) {"
+                start = "tm_thread_id.x"
+                advance = "\(variable) += tm_threadgroup_size.x"
             } else if distributesRows, layout.isUniform(axis), lanes < threadsPerThreadgroup {
-                let rows = threadsPerThreadgroup / lanes
-                open =
-                    "for (uint \(variable) = tm_thread_id.x / \(lanes)u; "
-                    + "\(variable) < \(extent)u; \(variable) += \(rows)u) {"
+                start = "tm_thread_id.x / \(lanes)u"
+                advance = "\(variable) += \(threadsPerThreadgroup / lanes)u"
             } else {
-                open = "for (uint \(variable) = 0u; \(variable) < \(extent)u; ++\(variable)) {"
+                start = "0u"
+                advance = "++\(variable)"
+            }
+            // An accumulator streamed out of registers a panel at a time only
+            // ever has one panel in threadgroup memory, so the epilogue's walk
+            // over its rows is restricted to the panel the enclosing loop is on.
+            let open: String
+            if let panel = epiloguePanel, axis == panel.axis {
+                let inside = extent % panel.rows == 0
+                    ? "" : " && \(variable) < \(extent)u"
+                open =
+                    "for (uint \(variable) = \(panel.base) + \(start); "
+                    + "\(variable) < \(panel.base) + \(panel.rows)u\(inside); \(advance)) {"
+            } else {
+                open = "for (uint \(variable) = \(start); \(variable) < \(extent)u; \(advance)) {"
             }
             frames.append(Frame(path: path, kind: .laneLoop, open: open))
 
@@ -2027,7 +2070,8 @@ private struct FunctionEmitter {
     private mutating func allocateTile(
         _ prefix: String, element: TMType, rows: Int, columns: Int, rowAxis: Int, columnAxis: Int,
         rowGranularity: Int = fragment, columnGranularity: Int = fragment, capacity: Int = 0,
-        intoArena: Bool = false, intoSharedArena: Bool = false, _ loc: SourceLoc
+        intoArena: Bool = false, intoSharedArena: Bool = false,
+        panel: (rows: Int, base: String)? = nil, _ loc: SourceLoc
     ) throws -> Tile {
         let paddedColumns = FunctionEmitter.padded(columns, to: columnGranularity)
         let tile = Tile(
@@ -2035,7 +2079,7 @@ private struct FunctionEmitter {
             paddedRows: FunctionEmitter.padded(rows, to: rowGranularity),
             paddedColumns: paddedColumns,
             rowPadding: FunctionEmitter.rowPadding(paddedColumns, element, options),
-            rowAxis: rowAxis, columnAxis: columnAxis)
+            rowAxis: rowAxis, columnAxis: columnAxis, panel: panel)
         tileCount += 1
         let elementName = try scalarTypeName(element, loc)
         let shape = "\(tile.paddedRows)x\(tile.paddedColumns)"
@@ -2107,7 +2151,7 @@ private struct FunctionEmitter {
             return tile
         }
 
-        let slots = max(capacity, tile.elementCount)
+        let slots = max(capacity, tile.storageCount)
         threadgroupBytes += slots * (element.scalarByteWidth ?? 4)
         guard threadgroupBytes <= FunctionEmitter.threadgroupMemoryLimit else {
             throw CoreError.lowering(
@@ -2116,9 +2160,16 @@ private struct FunctionEmitter {
                     + "\(FunctionEmitter.threadgroupMemoryLimit)-byte limit; reduce BLOCK_M, "
                     + "BLOCK_N or BLOCK_K", loc)
         }
-        let note = slots > tile.elementCount
-            ? "  // \(shape) accumulator; also the arena its operand tiles stage into"
-            : "  // \(shape)"
+        let note: String
+        if let panel {
+            note =
+                "  // \(shape) accumulator, streamed out \(panel.rows) rows at a time; "
+                + "also the arena its operand tiles stage into"
+        } else if slots > tile.storageCount {
+            note = "  // \(shape) accumulator; also the arena its operand tiles stage into"
+        } else {
+            note = "  // \(shape)"
+        }
         preamble.append(.line("threadgroup \(elementName) \(tile.name)[\(slots)];\(note)"))
         return tile
     }
@@ -3169,6 +3220,79 @@ private struct FunctionEmitter {
         return statements
     }
 
+    /// How many rows of a register-resident accumulator to stream out at a time,
+    /// or `nil` to stream the whole thing through a full-size tile.
+    ///
+    /// The accumulator lives in registers for the whole contraction loop already;
+    /// what makes it *also* occupy `BLOCK_M x BLOCK_N` of threadgroup memory is
+    /// only the epilogue, which reads it back per lane. Streaming it out a panel
+    /// at a time makes that storage one panel instead, and the panel is free: the
+    /// operand tiles have to exist anyway, and they are dead by the time the
+    /// epilogue runs, so any panel that fits inside the operand arena costs
+    /// nothing. `128x128` — whose f32 accumulator is 64KB on its own, twice
+    /// Metal's whole budget — exists at all only this way, and where the full
+    /// tile did fit, the memory handed back is occupancy.
+    ///
+    /// The default (`-1`) takes the largest panel the operand arena has already
+    /// paid for, so panelling never costs a byte the kernel did not already need
+    /// and often gives some back. Measured neutral at `64x64`, `64x128` and
+    /// `64x64x64`, worth +15% at `128x64` (whose full accumulator was Metal's
+    /// entire 32KB, one threadgroup per core), and the only reason `128x128`
+    /// lowers at all — docs/ARCHITECTURE.md §Matmul throughput. `0` forbids it
+    /// and a positive value pins the height, which is how the sweep measures it.
+    private func epiloguePanelRows(paddedRows: Int, stride: Int, operandSlots: Int) -> Int? {
+        guard options.dotEpiloguePanel != 0 else { return nil }
+        let size = FunctionEmitter.fragment
+        let requested = options.dotEpiloguePanel > 0
+            ? options.dotEpiloguePanel : operandSlots / max(1, stride)
+        // Panels have to tile the accumulator exactly — a boundary through an 8x8
+        // fragment would need one fragment stored twice — so the height is the
+        // largest whole number of fragments that both divides the accumulator and
+        // fits the request. A panel that covers the whole thing is just the
+        // unpanelled epilogue with extra arithmetic, so that is not one.
+        var rows = 0
+        var candidate = size
+        while candidate < paddedRows {
+            if paddedRows % candidate == 0, candidate <= requested { rows = candidate }
+            candidate += size
+        }
+        return rows == 0 ? nil : rows
+    }
+
+    /// Writes the fragments whose rows fall inside the current panel into the
+    /// accumulator tile, leaving the rest in registers for a later panel.
+    ///
+    /// Every fragment is *tested* once per panel and *stored* once in total. The
+    /// test is simdgroup-uniform (a fragment's row block is), so it costs a
+    /// scalar branch, against a contraction loop that has just run `K/BLOCK_K`
+    /// times.
+    private func storeAccumulatorPanel(
+        _ registers: AccumulatorRegisters, base: String, rows: Int
+    ) -> [Stmt] {
+        let size = FunctionEmitter.fragment
+        let blocking = registers.blocking
+        let tile = registers.tile
+        var statements: [Stmt] = []
+        for wave in 0..<blocking.waves {
+            for row in 0..<blocking.tilesM {
+                let top = "\(registers.fragmentRow(wave, row)) * \(size)u"
+                var condition = "\(top) >= \(base) && \(top) < \(base) + \(rows)u"
+                if blocking.ragged { condition = "\(registers.live(wave)) && \(condition)" }
+                var stores: [Stmt] = []
+                for column in 0..<blocking.tilesN {
+                    stores.append(
+                        .line(
+                            "simdgroup_store(\(registers.register(wave, row, column)), "
+                                + "\(tile.name) + (\(top) - \(base)) * \(tile.stride)u + "
+                                + "\(registers.fragmentColumn(wave, column)) * \(size)u, "
+                                + "\(tile.stride)u);"))
+                }
+                statements.append(.group(open: "if (\(condition)) {", body: stores, close: "}"))
+            }
+        }
+        return statements
+    }
+
     /// Writes the register-held fragments back into the accumulator tile, which is
     /// where every downstream per-lane consumer reads the dot's result from.
     private func storeAccumulator(_ registers: AccumulatorRegisters) -> [Stmt] {
@@ -3446,6 +3570,33 @@ private struct FunctionEmitter {
         }
     }
 
+    /// True when the only things in `body` that touch a carried accumulator are
+    /// the `tt.dot` that accumulates into it and the `scf.yield` that carries its
+    /// result on — nothing reads it per lane inside the loop.
+    ///
+    /// That is what makes the panelled epilogue safe: a panelled tile only holds
+    /// one window of the accumulator, and only after the contraction is over, so
+    /// a per-lane read *inside* the loop would index storage that does not hold
+    /// the row it asks for. Triton's matmul is exactly this shape; anything else
+    /// keeps the full-size tile.
+    private static func isOnlyAccumulated(
+        _ carried: String, by dot: DotOp, in body: [Instruction]
+    ) -> Bool {
+        for instruction in body {
+            switch instruction.kind {
+            case .forLoop, .ifOp: return false
+            case .dot(let other):
+                guard other.result == dot.result else { return false }
+                if other.lhs == carried || other.rhs == carried { return false }
+            case .yield: continue
+            default:
+                let read = instruction.kind.operandNames
+                if read.contains(carried) || read.contains(dot.result) { return false }
+            }
+        }
+        return true
+    }
+
     private static func terminatorValues(of body: [Instruction]) -> [String] {
         guard case .yield(let values) = body.last?.kind else { return [] }
         return values
@@ -3605,18 +3756,39 @@ private struct FunctionEmitter {
                 // giving the second one the same slack would waste it.
                 let operands = stagingArena == nil
                     ? operandArenaSlots(loop.body, blocking: blocking, arena: element) : 0
-                let tile = try allocateTile(
-                    "dot_c", element: element, rows: shape[0], columns: shape[1],
-                    rowAxis: accumulatorAxes[0], columnAxis: accumulatorAxes[1],
-                    rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
-                    columnGranularity: blocking.tilesN * FunctionEmitter.fragment,
-                    capacity: operands, loc)
                 let reason = "a tt.dot accumulator cannot be recomputed"
                 // The usual `dense<0.0>` seed never goes near threadgroup memory:
                 // the fragments start zero in registers, which skips a whole
                 // per-lane pass over the tile, one `simdgroup_load` per fragment
                 // and both of the barriers that ordered them.
                 let zeroed = isZeroSplat(argument.initial)
+
+                // The epilogue is the only thing that wants this accumulator in
+                // threadgroup memory at all; giving it one panel at a time is
+                // what lets a block shape exist whose whole accumulator does not
+                // fit, and hands the rest of the budget back where it did.
+                let columnGranularity = blocking.tilesN * FunctionEmitter.fragment
+                let paddedColumns = FunctionEmitter.padded(shape[1], to: columnGranularity)
+                let stride =
+                    paddedColumns + FunctionEmitter.rowPadding(paddedColumns, element, options)
+                let paddedRows = FunctionEmitter.padded(
+                    shape[0], to: blocking.tilesM * FunctionEmitter.fragment)
+                var panel: (rows: Int, base: String)?
+                if zeroed, dotTotal == 1, stagingArena == nil,
+                    FunctionEmitter.isOnlyAccumulated(argument.name, by: dot, in: loop.body),
+                    let rows = epiloguePanelRows(
+                        paddedRows: paddedRows, stride: stride, operandSlots: operands)
+                {
+                    panel = (rows: rows, base: "tm_panel\(panelCount)")
+                    panelCount += 1
+                }
+
+                let tile = try allocateTile(
+                    "dot_c", element: element, rows: shape[0], columns: shape[1],
+                    rowAxis: accumulatorAxes[0], columnAxis: accumulatorAxes[1],
+                    rowGranularity: blocking.tilesM * FunctionEmitter.fragment,
+                    columnGranularity: columnGranularity,
+                    capacity: operands, panel: panel, loc)
                 if !zeroed {
                     let initial = try stage(argument.initial, into: tile, loc)
                     try append(
@@ -3658,7 +3830,7 @@ private struct FunctionEmitter {
                 if stagingArena == nil {
                     stagingArena = (
                         name: tile.name, element: element,
-                        capacity: max(tile.elementCount, operands), cursor: 0)
+                        capacity: max(tile.storageCount, operands), cursor: 0)
                     pingPongTiles = []
                 }
                 residentAccumulators[tile.name] = registers
@@ -3793,21 +3965,61 @@ private struct FunctionEmitter {
         stagingArena = nil
         for registers in resident {
             let reason = "a tt.dot accumulator cannot be recomputed"
+            residentAccumulators[registers.tile.name] = nil
+            let tile = registers.tile
+
+            // A panelled accumulator opens a loop that the whole rest of the
+            // kernel becomes the body of: each pass stores the fragments of one
+            // panel and then runs the epilogue over that panel's rows. The
+            // fragments that are not in this panel simply stay in registers.
+            guard let panel = tile.panel else {
+                try append(
+                    .line("// tt.dot accumulator: back to threadgroup memory for the epilogue"),
+                    level: level, recomputable: false, reason: reason, loc)
+                // The operand tiles alias the storage about to be written, so
+                // every simdgroup has to be finished reading them first.
+                try append(
+                    .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
+                    level: level, recomputable: false, reason: reason, loc)
+                for statement in storeAccumulator(registers) {
+                    try append(statement, level: level, recomputable: false, reason: reason, loc)
+                }
+                try append(
+                    .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
+                    level: level, recomputable: false, reason: reason, loc)
+                continue
+            }
+
+            let panels = tile.paddedRows / panel.rows
             try append(
-                .line("// tt.dot accumulator: back to threadgroup memory for the epilogue"),
+                .line(
+                    "// tt.dot accumulator: \(panels) panels of \(panel.rows) rows, streamed out "
+                        + "of registers — it never occupies the whole tile"),
                 level: level, recomputable: false, reason: reason, loc)
-            // The operand tiles alias the storage about to be written, so every
-            // simdgroup has to be finished reading them first.
+            try ensureLevel(level, loc)
+            frames.append(
+                Frame(
+                    path: level, kind: .uniformRegion,
+                    open: "for (uint \(panel.base) = 0u; \(panel.base) < \(tile.paddedRows)u; "
+                        + "\(panel.base) += \(panel.rows)u) {"))
+            frames[frames.count - 1].discardable = false
+            epiloguePanelDepth += 1
+            // The leading barrier does double duty: on the first pass it orders
+            // the operand tiles' last reads before the storage is overwritten,
+            // and on every later pass it orders the previous panel's epilogue
+            // reads before this panel's stores.
             try append(
                 .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
                 level: level, recomputable: false, reason: reason, loc)
-            for statement in storeAccumulator(registers) {
+            for statement in storeAccumulatorPanel(
+                registers, base: panel.base, rows: panel.rows)
+            {
                 try append(statement, level: level, recomputable: false, reason: reason, loc)
             }
             try append(
                 .line("threadgroup_barrier(mem_flags::mem_threadgroup);"),
                 level: level, recomputable: false, reason: reason, loc)
-            residentAccumulators[registers.tile.name] = nil
+            epiloguePanel = (axis: tile.rowAxis, base: panel.base, rows: panel.rows)
         }
 
         history = savedHistory

@@ -30,13 +30,18 @@ public struct GEMMConfig: Sendable, Hashable {
     /// Read a staged run of four columns with one vector load. On by default;
     /// the sweep turns it *off* to keep the comparison measurable.
     public var vectorStaging: Bool
+    /// Rows of the accumulator streamed out of registers at a time. `-1` asks the
+    /// emitter to panel only where the whole accumulator would not fit, `0`
+    /// forbids panelling, a positive value pins the panel height.
+    public var epiloguePanel: Int
 
     public init(
         blockM: Int, blockN: Int, blockK: Int, simdgroups: Int, registerM: Int = 0,
         registerN: Int = 0, stagingUnroll: Int = 0, tilePadding: Int = -1,
-        doubleBuffer: Bool = false, vectorStaging: Bool = true
+        doubleBuffer: Bool = false, vectorStaging: Bool = true, epiloguePanel: Int = -1
     ) {
         self.vectorStaging = vectorStaging
+        self.epiloguePanel = epiloguePanel
         self.blockM = blockM
         self.blockN = blockN
         self.blockK = blockK
@@ -56,6 +61,7 @@ public struct GEMMConfig: Sendable, Hashable {
         options.dotTilePadding = tilePadding
         options.dotDoubleBuffer = doubleBuffer
         options.dotVectorStaging = vectorStaging
+        options.dotEpiloguePanel = epiloguePanel
         return options
     }
 
@@ -66,14 +72,16 @@ public struct GEMMConfig: Sendable, Hashable {
         let staging = stagingUnroll > 0 ? "/u\(stagingUnroll)" : ""
         let padding = tilePadding >= 0 ? "/p\(tilePadding)" : ""
         let buffering = (doubleBuffer ? "/db" : "") + (vectorStaging ? "" : "/nov4")
+        let panel = epiloguePanel >= 0 ? "/e\(epiloguePanel)" : ""
         return "\(blockM)x\(blockN)x\(blockK)/w\(simdgroups)\(blocking)\(staging)\(padding)"
-            + buffering
+            + buffering + panel
     }
 
-    /// `M,N,K,W[,RM,RN[,U[,P[,DB]]]]`, the spelling `tmbench --config` takes.
+    /// `M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]`, the spelling `tmbench --config`
+    /// takes.
     public static func parse(_ text: String) -> GEMMConfig? {
         let fields = text.split(separator: ",").map { Int($0.trimmingCharacters(in: .whitespaces)) }
-        guard [4, 6, 7, 8, 9, 10].contains(fields.count), !fields.contains(where: { $0 == nil })
+        guard [4, 6, 7, 8, 9, 10, 11].contains(fields.count), !fields.contains(where: { $0 == nil })
         else {
             return nil
         }
@@ -85,7 +93,8 @@ public struct GEMMConfig: Sendable, Hashable {
             stagingUnroll: values.count >= 7 ? values[6] : 0,
             tilePadding: values.count >= 8 ? values[7] : -1,
             doubleBuffer: values.count >= 9 && values[8] != 0,
-            vectorStaging: values.count < 10 || values[9] != 0)
+            vectorStaging: values.count < 10 || values[9] != 0,
+            epiloguePanel: values.count >= 11 ? values[10] : -1)
     }
 }
 
@@ -190,6 +199,25 @@ public enum GEMMBenchmark {
         let pipeline: MTLComputePipelineState
         let grid: MTLSize
         let threads: MTLSize
+    }
+
+    /// The largest threadgroup Metal will run this configuration's kernel at.
+    ///
+    /// A *measurement*, not a constant: the compiler reports it after allocating
+    /// registers, so a kernel whose accumulator fragments crowd the register file
+    /// reports less than the 1024 the hardware allows — which is how the register
+    /// wall behind large block shapes becomes visible from outside
+    /// (docs/ARCHITECTURE.md §Matmul throughput). `nil` when the kernel does not
+    /// lower or compile at all.
+    public static func maxThreads(_ config: GEMMConfig) -> Int? {
+        guard let emission = try? MetalCompiler.emit(
+            ttir: GEMMKernel.tutorial(
+                blockM: config.blockM, blockN: config.blockN, blockK: config.blockK),
+            options: config.options),
+            let pipeline = try? MetalCompiler.compileMSL(
+                emission.source, kernelName: "matmul_kernel")
+        else { return nil }
+        return pipeline.maxTotalThreadsPerThreadgroup
     }
 
     private static func plan(_ config: GEMMConfig, size: Int) throws -> Plan {
@@ -358,9 +386,11 @@ public enum GEMMBenchmark {
                     let seconds = try timeKernel(
                         configuration, size: size, harness: harness, a: a, b: b, c: c)
                     if verbose {
+                        let ceiling = maxThreads(configuration).map { "\($0)" } ?? "?"
                         log(
                             "  " + pad(configuration.name, 24)
-                                + String(format: "%9.1f GFLOP/s", flops(size) / seconds / 1e9))
+                                + String(format: "%9.1f GFLOP/s", flops(size) / seconds / 1e9)
+                                + "   max threads \(ceiling)")
                     }
                     if best == nil || seconds < best!.seconds {
                         best = (seconds, configuration)
@@ -373,7 +403,14 @@ public enum GEMMBenchmark {
             guard let best else {
                 throw BenchError("every configuration failed to lower or run at \(size)")
             }
-            let mps = try timeMPS(size: size, harness: harness, a: a, b: b, c: c)
+            // MPS twice, faster wins. The first configuration measured at a size
+            // runs cold and can read 20% low (docs/ARCHITECTURE.md §Matmul
+            // throughput) — that is true of MPS as well, and MPS is the
+            // denominator of every ratio quoted, so it gets the same second run
+            // the winning configuration effectively gets from being swept.
+            let mps = min(
+                try timeMPS(size: size, harness: harness, a: a, b: b, c: c),
+                try timeMPS(size: size, harness: harness, a: a, b: b, c: c))
             results.append(
                 GEMMMeasurement(
                     size: size, config: best.config, gflops: flops(size) / best.seconds / 1e9,

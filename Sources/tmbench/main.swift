@@ -10,7 +10,7 @@ import TritonMetalCore
 /// parsing and no dependencies.
 ///
 ///     tmbench [--sizes 512,1024,2048] [--sweep quick|full]
-///             [--config M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]] [--verbose] [--no-verify]
+///             [--config M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]] [--verbose] [--no-verify]
 ///             [--emit M,N,K,W[,...]]
 ///     tmbench --attn [--attn-shapes b,h,s,d;...] [--attn-config M,N,W]
 ///             [--attn-element f32|f16] [--emit-attn M,N,W,D]
@@ -80,12 +80,12 @@ func parseArguments() -> Arguments {
             arguments.sweep = sweep
         case "--config":
             guard let config = GEMMConfig.parse(value(flag)) else {
-                fail("--config takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]")
+                fail("--config takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]")
             }
             arguments.pinned.append(config)
         case "--emit":
             guard let config = GEMMConfig.parse(value(flag)) else {
-                fail("--emit takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]")
+                fail("--emit takes M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]")
             }
             arguments.emit = config
         case "--attn": arguments.attention = true
@@ -129,13 +129,14 @@ func parseArguments() -> Arguments {
                   --sizes N,N,...      matrix sizes to measure (default 512,1024,2048)
                   --sweep quick|full   block shapes only, or crossed with every explicit
                                        register blocking (default quick)
-                  --config M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]
+                  --config M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]
                                        measure exactly this configuration; repeatable.
                                        Overrides --sweep. RM/RN register blocking,
                                        U staging run length, P tile row padding,
                                        DB double buffering, V4 vector staging (on
-                                       unless given as 0).
-                  --emit M,N,K,W[,RM,RN[,U[,P[,DB[,V4]]]]]
+                                       unless given as 0), E accumulator epilogue
+                                       panel rows (-1 chooses, 0 forbids).
+                  --emit M,N,K,W[,RM,RN[,U[,P[,DB[,V4[,E]]]]]]
                                        print the emitted MSL for one configuration and exit
                   --verbose            print every configuration's throughput
                   --no-verify          skip the CPU-reference correctness check

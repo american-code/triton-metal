@@ -45,10 +45,23 @@ public enum MetalCompiler {
         /// worth on Apple silicon.
         public var dotVectorStaging: Bool
 
+        /// Rows of the accumulator streamed out of registers at a time, when a
+        /// `tt.dot` accumulator is register-resident for a whole contraction
+        /// loop. The accumulator then never needs storage for more than one
+        /// panel, which is what lets a block shape whose full accumulator
+        /// exceeds Metal's 32KB exist at all — and, where it already fitted,
+        /// hands the threadgroup budget back as occupancy.
+        ///
+        /// `0` streams the whole accumulator at once (one panel, the historical
+        /// behaviour). Negative means "choose": panels only where the whole
+        /// accumulator would not fit. A positive value is a row count, rounded
+        /// up to whole 8x8 fragments. See `MSLEmitter`'s `epiloguePanelRows`.
+        public var dotEpiloguePanel: Int
+
         public init(
             numSimdgroups: Int = 4, dotRegisterM: Int = 0, dotRegisterN: Int = 0,
             dotStagingUnroll: Int = 0, dotTilePadding: Int = -1, dotDoubleBuffer: Bool = false,
-            dotVectorStaging: Bool = true
+            dotVectorStaging: Bool = true, dotEpiloguePanel: Int = -1
         ) {
             self.numSimdgroups = numSimdgroups
             self.dotRegisterM = dotRegisterM
@@ -57,6 +70,7 @@ public enum MetalCompiler {
             self.dotTilePadding = dotTilePadding
             self.dotDoubleBuffer = dotDoubleBuffer
             self.dotVectorStaging = dotVectorStaging
+            self.dotEpiloguePanel = dotEpiloguePanel
         }
     }
 

@@ -57,9 +57,12 @@ jobs:
       # suite skips itself when `import triton` fails, which it does here —
       # Triton publishes no macOS wheel and building it from source is ~9
       # minutes (docs/USAGE.md).
+      # A venv because the runner's python3 is Homebrew's, which is
+      # externally managed (PEP 668) and refuses a bare `pip install`.
       - name: pytest (Python shim)
         working-directory: python
         run: |
           set -o pipefail
-          python3 -m pip install --quiet --disable-pip-version-check pytest
-          PYTHONPATH=. python3 -m pytest tests/ -q -rs 2>&1 | tail -40
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --disable-pip-version-check pytest
+          PYTHONPATH=. .venv/bin/python -m pytest tests/ -q -rs 2>&1 | tail -40
