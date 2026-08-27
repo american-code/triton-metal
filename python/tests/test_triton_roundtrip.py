@@ -88,3 +88,42 @@ def test_vector_add_runs_on_the_gpu():
     finally:
         for buffer in (x, y, out):
             buffer.free()
+
+
+@requires_metal
+def test_attention_trains_through_the_backward_pass():
+    """The end-to-end training claim, as a test: a real `@triton.jit` attention
+    layer's forward *and* backward on the GPU, with the gradients checked against
+    a hand-written numpy autograd.
+
+    The kernels are the ones in `python/examples/attention_training.py`, which is
+    the readable version with the finite-difference check and the descent loop.
+    """
+    import sys
+    from pathlib import Path
+
+    numpy = pytest.importorskip("numpy")
+    examples = str(Path(__file__).resolve().parents[1] / "examples")
+    if examples not in sys.path:
+        sys.path.insert(0, examples)
+    import attention_training as demo
+
+    heads, seq, dim = 1, 48, 64
+    rng = numpy.random.default_rng(7)
+    q = rng.standard_normal((heads, seq, dim), dtype=numpy.float32) * 0.5
+    k = rng.standard_normal((heads, seq, dim), dtype=numpy.float32) * 0.5
+    v = rng.standard_normal((heads, seq, dim), dtype=numpy.float32) * 0.5
+    d_out = rng.standard_normal((heads, seq, dim), dtype=numpy.float32) * 0.5
+
+    layer = demo.Layer(heads, seq, dim, block_m=16, block_n=32)
+    try:
+        out = layer.forward(q, k, v)
+        expected, weights = demo.numpy_attention(q, k, v, layer.scale)
+        assert demo.relative_error(out, expected) < 2e-5
+
+        dq, dk, dv = layer.backward(d_out)
+        ref = demo.numpy_attention_backward(q, k, v, weights, d_out, layer.scale)
+        for got, want in zip((dq, dk, dv), ref):
+            assert demo.relative_error(got, want) < 2e-5
+    finally:
+        layer.free()

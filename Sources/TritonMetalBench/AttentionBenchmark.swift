@@ -129,7 +129,7 @@ public enum AttentionBenchmark {
         var strideSeq = Int32(shape.dim)
         var context = Int32(shape.seq)
 
-        return try time(harness: harness) { commandBuffer in
+        return try timeCommandBuffer(harness: harness) { commandBuffer in
             guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
             encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(q, offset: 0, index: 0)
@@ -170,7 +170,7 @@ public enum AttentionBenchmark {
             resultRows: seq, resultColumns: dim, interiorColumns: seq, alpha: 1, beta: 0)
 
         let headBytes = seq * dim * 4
-        return try time(harness: harness) { commandBuffer in
+        return try timeCommandBuffer(harness: harness) { commandBuffer in
             for head in 0..<shape.batchedHeads {
                 let offset = head * headBytes
                 let qm = MPSMatrix(buffer: q, offset: offset, descriptor: rowsDescriptor)
@@ -192,7 +192,7 @@ public enum AttentionBenchmark {
 
     /// Median seconds per dispatch, calibrated so each sample is ~25ms of GPU
     /// work — the same methodology as the GEMM sweep, so the two are comparable.
-    private static func time(
+    static func timeCommandBuffer(
         harness: GEMMBenchmark.Harness, targetSeconds: Double = 0.025, samples: Int = 3,
         _ encode: (MTLCommandBuffer) -> Void
     ) throws -> Double {

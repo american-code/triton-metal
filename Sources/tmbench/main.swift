@@ -14,10 +14,13 @@ import TritonMetalCore
 ///             [--emit M,N,K,W[,...]]
 ///     tmbench --attn [--attn-shapes b,h,s,d;...] [--attn-config M,N,W]
 ///             [--attn-element f32|f16] [--emit-attn M,N,W,D]
+///     tmbench --attn-bwd [--attn-shapes ...] [--attn-config ...] [--attn-element ...]
 ///
 /// `--attn` measures the FlashAttention-2 forward kernel against the unfused
 /// composite (two MPS GEMMs with an MPS softmax between them), which is the
-/// comparison a fused kernel exists to win.
+/// comparison a fused kernel exists to win. `--attn-bwd` does the same for the
+/// backward pass, against five MPS GEMMs with an MPS softmax and softmax
+/// gradient between them.
 
 struct Arguments {
     var sizes = [512, 1024, 2048]
@@ -27,6 +30,7 @@ struct Arguments {
     var verify = true
     var emit: GEMMConfig?
     var attention = false
+    var attentionBackward = false
     var attentionShapes = [
         AttentionShape(batch: 1, heads: 8, seq: 512, dim: 64),
         AttentionShape(batch: 1, heads: 8, seq: 1024, dim: 64),
@@ -84,6 +88,7 @@ func parseArguments() -> Arguments {
             }
             arguments.emit = config
         case "--attn": arguments.attention = true
+        case "--attn-bwd": arguments.attentionBackward = true
         case "--attn-shapes":
             guard let shapes = parseShapes(value(flag)) else {
                 fail("--attn-shapes takes b,h,s,d[;b,h,s,d...]")
@@ -147,6 +152,14 @@ func parseArguments() -> Arguments {
                                        kernel input/output type (the accumulator
                                        and the softmax are always f32)
                   --emit-attn M,N,W,D  print the emitted MSL and exit
+
+                FlashAttention-2 backward, against the unfused MPS composite
+                (Q K^T, softmax, P^T dO, dO V^T, softmax gradient, dS K,
+                dS^T Q — seven dispatches through two live S x S matrices):
+
+                  --attn-bwd           measure the backward pass; takes the same
+                                       --attn-shapes / --attn-config /
+                                       --attn-element flags
                 """)
             exit(0)
         default:
@@ -179,6 +192,46 @@ if let request = arguments.emitAttention {
                     blockM: request.config.blockM, blockN: request.config.blockN,
                     headDim: request.dim, element: arguments.attentionElement),
                 options: request.config.options))
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
+if arguments.attentionBackward {
+    do {
+        let harness = try GEMMBenchmark.Harness()
+        print("device: \(harness.device.name)")
+        let configurations =
+            arguments.attentionPinned.isEmpty
+            ? AttentionBackwardBenchmark.configurations() : arguments.attentionPinned
+        print(
+            "attention-backward sweep: \(configurations.count) configuration"
+                + "\(configurations.count == 1 ? "" : "s"), shapes "
+                + arguments.attentionShapes.map(\.name).joined(separator: " / "))
+
+        let results = try AttentionBackwardBenchmark.run(
+            shapes: arguments.attentionShapes, configurations: configurations,
+            element: arguments.attentionElement, harness: harness, verbose: arguments.verbose)
+
+        if arguments.verify {
+            var checked: Set<AttentionConfig> = []
+            for result in results where !checked.contains(result.config) {
+                checked.insert(result.config)
+                if let complaint = try AttentionBackwardBenchmark.verify(
+                    result.config, harness: harness)
+                {
+                    fail(complaint)
+                }
+            }
+            print(
+                "verified \(checked.count) winning configuration"
+                    + "\(checked.count == 1 ? "" : "s") against a CPU reference")
+        }
+
+        print("")
+        print(AttentionBackwardBenchmark.header)
+        for result in results { print(AttentionBackwardBenchmark.row(result)) }
         exit(0)
     } catch {
         fail("\(error)")

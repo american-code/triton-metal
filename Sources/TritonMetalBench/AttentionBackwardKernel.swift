@@ -29,10 +29,16 @@ import Foundation
 /// that. Two ways out: accumulate `dQ` with `tt.atomic_rmw fadd` from the
 /// key-block program, or run the two directions as separate programs. This takes
 /// the second — the split two-pass formulation Triton's tutorial uses — because
-/// it needs nothing the forward did not already need, keeps every gradient
-/// deterministic, and each program's accumulator stays a register-resident dot
-/// accumulator instead of a stream of read-modify-writes to device memory. The
-/// atomic path is measured against it in `tmbench --attn-bwd`.
+/// it needs nothing the forward did not already need, and — the argument that
+/// decides it — every gradient stays **deterministic**. A `tt.atomic_rmw fadd`
+/// accumulation of `dQ` would make the result depend on the order in which
+/// threadgroups reach each address (§Atomics), which is a poor property for a
+/// training loop to have by default. It also keeps each accumulator in
+/// simdgroup registers for the whole loop instead of turning it into a stream of
+/// read-modify-writes to device memory. The cost is that `Q K^T` is recomputed
+/// in both directions: seven dot-products' worth of arithmetic where the
+/// mathematics needs five (`tmbench --attn-bwd` credits both sides with the
+/// five).
 public enum AttentionBackwardKernel {
 
     /// `Delta_i = dO_i . O_i`, one row per query.
