@@ -512,9 +512,9 @@ the code that looks like it does the arithmetic.
 
 ## 6. Test strategy
 
-228 Swift cases across sixteen suites (one, the benchmark, is opt-in and skipped
-by default; three cover the MLX frontend and skip without its shader library),
-plus 23 Python cases. Everything that can run on the real GPU does,
+228 Swift cases across the seventeen suites below (one, the benchmark, is opt-in
+and skipped by default; three cover the MLX frontend and skip without its shader
+library), plus 23 Python cases. Everything that can run on the real GPU does,
 including on GitHub Actions — where the runner's *Apple Paravirtual device* is
 probed with a real kernel before its GPU results are believed (§6, end).
 
