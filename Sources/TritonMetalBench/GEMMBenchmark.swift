@@ -132,7 +132,9 @@ public enum GEMMBenchmark {
         case quick
         /// The same, plus every one-axis deviation from the emitter's choice:
         /// each explicit register blocking, each tile padding, double buffering,
-        /// and scalar (non-vector) staging. One axis at a time rather than the full cross product —
+        /// scalar (non-vector) staging, and the accumulator through one
+        /// full-size tile instead of streamed out in panels. One axis at a time
+        /// rather than the full cross product —
         /// that is both tractable and how the axes were attributed in the first
         /// place (docs/ARCHITECTURE.md §Matmul throughput).
         case full
@@ -164,6 +166,12 @@ public enum GEMMBenchmark {
                     var scalarStaging = base
                     scalarStaging.vectorStaging = false
                     configurations.append(scalarStaging)
+                    // The accumulator through one full-size tile rather than
+                    // streamed out in panels, which is the other way round from
+                    // the default and is how the panel's cost is attributed.
+                    var wholeTile = base
+                    wholeTile.epiloguePanel = 0
+                    configurations.append(wholeTile)
                 }
             }
         }

@@ -741,10 +741,11 @@ which has the full detail and the reasoning.
 | Triton | MSL | Notes |
 | --- | --- | --- |
 | `i1`, `i8`, `i16`, `i32`, `i64` | `bool`, `char`, `short`, `int`, `long` | |
-| `f16`, `f32` | `half`, `float` | no `f64`, no `bf16` |
+| `f16`, `f32` | `half`, `float` | no `f64` — Metal has no `double` |
+| `bf16` | `bfloat` | MSL 3.1 and later; a type of its own, not interchangeable with `f16` |
 | `!tt.ptr<T>` | `device T *` | unified memory; no address-space variants |
 | `tensor<D0x…xT>` | one per-lane value of `T` per block point | ranks 1 and 2 exercised end to end; higher ranks lower through the same machinery, untested |
-| a `tt.dot` operand/accumulator | `threadgroup T[]`, moved as 8x8 `simdgroup_{half,float}8x8` fragments | |
+| a `tt.dot` operand/accumulator | `threadgroup T[]`, moved as 8x8 `simdgroup_{half,float}8x8` or `simdgroup_matrix<bfloat, 8, 8>` fragments | the accumulator's tile is one *panel* of the block, streamed out of registers |
 
 Block pointers (`!tt.ptr<tensor<…>>`) are not lowered. ttgir layout encodings are
 parsed and then ignored.
@@ -948,13 +949,15 @@ the cost of one more `BLOCK_M x BLOCK_N` tile.
 ### 3–5. The matmul performance gap
 
 The kernel reaches 76% of `MPSMatrixMultiplication` at 1024, 2048 and 4096
-square (4.66 TFLOP/s f32 at 2048 on an M1 Max; 2.33 TFLOP/s on an M1 Pro), up from
-~33% at the first working version. That clears the >50% milestone and lands inside
-the 62–82% band published Triton reaches on its own target. The per-change
-attribution — and, more usefully, the two CUDA-playbook techniques that did *not*
-transfer to M1-generation Apple silicon (all of it measured on M1 Max and M1 Pro;
-nothing here has been re-run on M2/M3/M4), plus the one with no CUDA analogue that
-beat both — is in
+square on an M1 Max (4.64 TFLOP/s f32 at 2048) and 75% at 1024 and 2048 on an M1
+Pro (2.43 TFLOP/s), up from ~33% at the first working version. That is inside the
+62–82% band published Triton reaches end-to-end on its own target, and below the
+80–100% band it reaches on GEMM specifically. In absolute terms it is 75% of the
+machine's measured f32 peak against MPS's 99%. The per-change attribution — and,
+more usefully, the CUDA-playbook techniques that did *not* transfer to
+M1-generation Apple silicon (all of it measured on M1 Max and M1 Pro; nothing here
+has been re-run on M2/M3/M4), plus the one with no CUDA analogue that beat all of
+them — is in
 [ARCHITECTURE.md §Matmul throughput](ARCHITECTURE.md#matmul-throughput).
 
 What landed, all local to `emitDot` and its helpers: register blocking of the
@@ -965,37 +968,53 @@ consecutive columns, compile-time staging trip counts, a zero accumulator that
 never enters threadgroup memory, a 2-D-distributed epilogue, a wave-to-fragment
 mapping that lets every wave of a simdgroup share one B fragment (+15%), and
 `float4` staging runs behind a runtime contiguity check (+20%), and two fragment
-rows per simdgroup where the blocking score ties (+8%).
+rows per simdgroup where the blocking score ties (+8%), and an epilogue that
+streams the accumulator out of registers a panel of rows at a time, so that
+threadgroup memory stops constraining block shape at all (0% at the shape that
+wins, +15% at `128x64`, and the only reason `128x128` lowers).
+
+Two things were tried since and did not pay, which is most of what tells you where
+to look next. The `128x128` tile the panelled epilogue unlocks runs **21% slower**
+than `64x64`, and `float2` staging runs for tiles too narrow to hand out runs of
+four measure **2891 GFLOP/s against 4326**. Both have the same cause: what a large
+block shape or a wider vector guard actually runs out of is *registers*, and
+registers are what occupancy costs. `tmbench --verbose` now prints the
+`maxTotalThreadsPerThreadgroup` Metal reports after register allocation — 1024 for
+the winner, 768 for `128x128`, 448 for `128x128` at 2x2 blocking, which cannot
+launch its own 512 threads — and it falls monotonically with throughput.
 
 What is left, in the order to try it:
 
-**A. Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
-would halve staging traffic again, and its f32 accumulator alone is 64KB — twice
-the whole budget. The only route is an epilogue that streams register fragments
-out in panels instead of through one full-size tile, which means giving the
-epilogue its own loop over panels. Much the largest of the three, and untried: the
-throughput target was reached without it.
+**A. `simdgroup_load` straight from device memory for the B operand.** MSL's
+`simdgroup_load` takes a `device` pointer as happily as a `threadgroup` one, and
+under the shared-column mapping each simdgroup reads exactly one B fragment per
+contraction step with no two reading the same one — so B crosses the memory system
+once either way and staging it buys only masking and layout normalisation. Loading
+it directly deletes the whole B staging pass. (A must stay staged: every simdgroup
+reads all of it.) The cost is a runtime guard — unit innermost stride, fragment
+wholly inside the matrix — hoisted out of the K loop, which means emitting the
+contraction loop twice. Largest of the three.
 
-**B. Vector staging for narrow tiles.** A tile is only vectorised when a run of
-four columns leaves no thread idle. At the winning `64x64x16` on 8 simdgroups both
-operand tiles clear that bar; at `64x128x16` on 16 the `64x16` A tile does not and
-stages scalar. Forcing runs of four there measures 3069 GFLOP/s against 4223 — the
-occupancy loss dwarfs the vector win. What is needed is a staging distribution that
-lets a *narrow* tile hand out runs of four without idling threads (one thread
-taking several rows), not a longer run.
-
-**C. Specialising the run mask away.** The vector fast path re-checks the mask at
+**B. Specialising the run mask away.** The vector fast path re-checks the mask at
 the run's last column on every K step. When `BLOCK_N` divides `N` — which the
 launcher knows and the emitter does not — it is statically true, and so is most of
-the masking in the scalar path behind it.
+the masking in the scalar path behind it. Same shape as (A): a guard hoisted out
+of the loop, two bodies.
+
+**C. Spending fewer registers.** Untried, and the direction everything above
+points. Whether the winning configuration is register-bound at 1024 threads or
+merely close to it is not currently knowable, because
+`maxTotalThreadsPerThreadgroup` saturates at 1024 and stops reporting.
 
 Measure with `swift run -c release tmbench` (works without Xcode), or
 `TM_BENCH=1 swift test --filter MatmulBenchmark`. `tmbench --attn` is the same
 sweep for attention, against the unfused MPS composite;
 `tmbench --attn-shapes 1,8,512,64 --verbose` prints every configuration and
 `tmbench --emit-attn 32,32,16,64` prints the kernel. `tmbench --sweep full` sweeps
-block shapes, `num_warps`, register blocking, tile padding and double buffering;
-`tmbench --config 64,128,16,16,0,0,0,-1,0,0` turns vector staging off;
+block shapes, `num_warps`, register blocking, tile padding, double buffering and
+the epilogue panel;
+`tmbench --config 64,128,16,16,0,0,0,-1,0,0` turns vector staging off and
+`tmbench --config 64,128,16,16,0,0,0,-1,0,1,0` turns the epilogue panel off;
 `tmbench --config 64,128,16,16` pins one configuration, which is how a change
 should be attributed — one axis at a time. `tmbench --emit 64,64,16,16` prints the
 kernel. Ignore the 512 row when judging a change: that GEMM is under a millisecond
@@ -1024,11 +1043,13 @@ What is left of this task:
 4. **Conformance.** Port a subset of Triton's own `test_core.py` against numpy
    references — the signal this backend still does not have. Now that real Triton
    drives the backend, that suite is runnable rather than hypothetical.
-5. **`bf16`.** The type real training uses, and the largest remaining type gap.
-   Metal has no `bfloat` before Metal 3.1 and no `simdgroup_bfloat8x8` at all, so
-   this means deciding between an f32-widening lowering (correct, and it gives up
-   the memory saving that is the point of `bf16`) and a `ushort`-based one that
-   converts around every arithmetic op.
+5. **bf16 throughput.** bf16 lowers — Metal's native `bfloat` and
+   `simdgroup_matrix<bfloat, 8, 8>`, so a bf16 dot is a real matrix multiply — and
+   is checked against f32 CPU references, but it is not swept. `tmbench`'s GEMM
+   sweep is f32-only and its attention benchmark takes f32 or f16, because the MPS
+   reference path converts on the host. Adding a bf16 column means a host-side
+   encode/decode and an MPS comparison that is honest about what MPS does with the
+   type.
 6. **Above the kernel layer.** There is no autograd, no optimizer-state kernel, no
    RNG and therefore no dropout. Adam's moment update is ordinary elementwise work
    and should lower through the existing machinery unchanged; `tl.rand` needs a

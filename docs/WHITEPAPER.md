@@ -34,12 +34,14 @@ is a ctypes shim with no logic in it, present only because Triton's backend
 discovery imports a Python module.
 
 The evaluation is deliberately unflattering where the results are. The test suite
-is 184 Swift cases and 22 Python cases (15 of which need no Triton install), at
-~83% region / ~85% function / ~90% line coverage of the Swift core. The lowered matmul reaches **76% of
-`MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.66
-TFLOP/s f32 at 2048), and 69–82% on an M1 Pro depending on its thermal state — up
-from ~33% at the first working version, which clears both the >50% milestone and
-the 60–80% band the second optimisation round aimed at. Fused attention is
+is 191 Swift cases and 23 Python cases (16 of which need no Triton install), at
+~83% region / ~85% function / ~90% line coverage of the Swift core, run on every
+push by GitHub Actions. The lowered matmul reaches **76% of
+`MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max (4.64
+TFLOP/s f32 at 2048) and 75% at 1024 and 2048 on an M1 Pro, with both sides timed
+twice and the faster taken — up from ~33% at the first working version. That is
+inside the 62–82% band published Triton reaches end-to-end on its native target
+and short of the 80–100% band it reaches on GEMM specifically. Fused attention is
 measured against the composite it replaces rather than against a single MPS
 kernel, because that is the comparison fusion exists to win: **357% of a
 `Q K^T` + `MPSMatrixSoftMax` + `P V` composite** at `b1 h8 s512 d64` on an M1 Max,
@@ -119,11 +121,16 @@ upstream file stays the only copy (§3).
 **Performance that is credible on arrival.** A portability story running at a
 fraction of vendor speed does not get used. The lowered matmul tutorial reaches
 **76% of `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an M1 Max
-(4.66 TFLOP/s f32 at 2048), up from ~33% at the first working version (§7.2). For
-calibration, published Triton reaches 62–82% of a CUDA-kernel stack end-to-end on
-its native target, and ~80–100% of cuBLAS on GEMM specifically, after years of
-NVIDIA-specific pipeline work (COMPARISON.md): two optimisation rounds put a new
-backend inside the lower band and not yet in the upper one. Fused attention
+(4.64 TFLOP/s f32 at 2048) and **75%** at 1024 and 2048 on an M1 Pro, up from
+~33% at the first working version (§7.2). Both sides are timed twice at each size
+with the faster taken, which is what makes the two machines agree to within a
+point. For calibration, published Triton reaches 62–82% of a CUDA-kernel stack
+end-to-end on its native target, and ~80–100% of cuBLAS on GEMM specifically,
+after years of NVIDIA-specific pipeline work (COMPARISON.md): three optimisation
+rounds put a new backend inside the lower band and not the upper one. The third
+round is where that stopped moving, and §7.3 says why — the kernel is at 75% of
+the machine's measured f32 peak against MPS's 99%, and what is between them is
+the register file rather than memory traffic. Fused attention
 decides whether a Triton backend is useful beyond elementwise work.
 FlashAttention-2 forward runs, and against the composite it replaces
 (`Q K^T` + `MPSMatrixSoftMax` + `P V`) it measures **357%** at `b1 h8 s512 d64`,
@@ -186,9 +193,9 @@ is no autograd — a caller writes or generates the backward kernel, as a Triton
 user does; no optimizer-state kernels (Adam's moment updates are ordinary
 elementwise work and would lower, but none is written or measured here); no
 dropout, because there is no `tl.rand` and no RNG lowering at all; and no
-distributed anything. There is no `bf16`, which is the type real training uses and
-the most urgent gap in this list; no `f64` (Metal has no `double` at all); and no
-block pointers. Atomics are 32-bit only — Metal has no 16- or 64-bit atomics and
+distributed anything. `bf16` lowers to Metal's native `bfloat`, including as a
+`simdgroup_matrix` operand type; there is no `f64` (Metal has no `double` at all)
+and no block pointers. Atomics are 32-bit only — Metal has no 16- or 64-bit atomics and
 no float `fetch_max`, which goes through a compare-exchange loop — and expose one
 memory order, so a kernel relying on an atomic's release edge to publish ordinary
 stores is not correctly lowered. Because Triton publishes no macOS wheel, adoption
@@ -474,27 +481,29 @@ the code that looks like it does the arithmetic.
 
 ## 6. Test strategy
 
-184 Swift cases across thirteen suites (one, the benchmark, is opt-in and skipped
-by default), plus 22 Python cases. Everything that can run on the real GPU does.
+191 Swift cases across thirteen suites (one, the benchmark, is opt-in and skipped
+by default), plus 23 Python cases. Everything that can run on the real GPU does,
+including on GitHub Actions — where the runner's *Apple Paravirtual device* is
+probed with a real kernel before its GPU results are believed (§6, end).
 
 | Suite | Cases | What it covers |
 | --- | --- | --- |
-| `ParserTests` | 17 | op/type/attribute shapes, both `tt.get_program_id` spellings, rank-N types, multi-result `%r:2`/`%r#0`, comments and `loc(…)`, and every error path asserting the message names the offender and its line |
+| `ParserTests` | 19 | op/type/attribute shapes, both `tt.get_program_id` spellings, rank-N types, multi-result `%r:2`/`%r#0`, comments and `loc(…)`, and every error path asserting the message names the offender and its line |
 | `EmitterTests` | 7 | the exact MSL for vector-add, uniform/row/lane partitioning, threadgroup sizing vs `num_warps`, metadata JSON, that `expand_dims`/`broadcast` emit nothing, that every fixture compiles in Metal's front end |
-| `CastMathTests` | 11 | one kernel per `arith` conversion and per `math.*` op against a CPU reference with per-function tolerance; `precise::` used exactly where Metal has it, `fast::` never |
+| `CastMathTests` | 12 | one kernel per `arith` conversion and per `math.*` op against a CPU reference with per-function tolerance; `precise::` used exactly where Metal has it, `fast::` never; a bf16 kernel whose reference rounds where the GPU rounds and is therefore demanded exactly |
 | `ControlFlowTests` | 9 | strided `scf.for` accumulation with tensor `iter_args`, a zero-trip loop, multi-result loops, a tensor-yielding `scf.if` |
 | `Rank2Tests` | 9 | tiled add and copy at sizes dividing neither block dimension, a padded-stride guard proving masks protect inter-row gaps, assertions that row-uniform work is hoisted |
-| `ReductionTests` | 15 | add/max/min swept across `num_warps` 1..32, row-wise rank-2 reduction, fused softmax at four shapes, a rows-sum-to-one check on inputs large enough to overflow a naive `exp`, and an online softmax with both reductions inside an `scf.for` |
-| `DotTests` | 27 | single-tile products at six shapes including `5x3x7` and `12x20x12`; the matmul tutorial at six shapes including `129x257x65`; f16-in/f32-out; `num_warps` 1..32; a sentinel test proving masked stores leave inter-row padding alone; the vector staging path taken and refused — padded tiles, misaligned rows, a non-unit innermost stride; assertions on tile sizes, barrier placement, accumulator residency, the shared-column mapping and pointer strength reduction; and eight error paths |
+| `ReductionTests` | 16 | add/max/min swept across `num_warps` 1..32, row-wise rank-2 reduction, fused softmax at four shapes, a rows-sum-to-one check on inputs large enough to overflow a naive `exp`, and an online softmax with both reductions inside an `scf.for` |
+| `DotTests` | 32 | single-tile products at six shapes including `5x3x7` and `12x20x12`; the matmul tutorial at six shapes including `129x257x65`; f16-in/f32-out; `num_warps` 1..32; a sentinel test proving masked stores leave inter-row padding alone; the vector staging path taken and refused — padded tiles, misaligned rows, a non-unit innermost stride; assertions on tile sizes, barrier placement, accumulator residency, the shared-column mapping and pointer strength reduction; the panelled epilogue, including `128x128` lowering only because of it and panelled and unpanelled agreeing at `129x257x65`; bf16-in/f32-out against a reference built from the already-rounded inputs; and eight error paths |
 | `EndToEndTests` | 16 | copy/add/mul/scale-bias/integer kernels vs CPU references at non-multiple-of-BLOCK sizes; guard-region tests; `num_warps` 1..32; the offline `xcrun metal` path and its diagnostics; runtime geometry validation; handle-table type safety |
-| `CABITests` | 20 | the whole spine through `tm_*` only, plus NULL-argument handling, handle validity, copy bounds, metallib loading, f32 and i64 launch arguments (the latter with a value that does not survive 32 bits), `f64` refused rather than narrowed, and leak checks via `tm_live_handle_count` |
+| `CABITests` | 21 | the whole spine through `tm_*` only, plus NULL-argument handling, handle validity, copy bounds, metallib loading, f32 and i64 launch arguments (the latter with a value that does not survive 32 bits), `f64` refused rather than narrowed, and leak checks via `tm_live_handle_count` |
 | `AtomicTests` | 24 | concurrent `fadd` accumulation across a grid where every slot is contended by hundreds of threads, at four shapes and `num_warps` 1..32; masked tails; every integer kind against an order-independent reference with a spread that makes signed and unsigned disagree; `exch`'s surviving-value invariant; f32 `max`/`min` through the compare-exchange loop; the returned old value as a permutation of `0..<k`; `tt.atomic_cas`'s one-winner-per-slot property; the reordering bound; the single-writer guard and the refusal of a used result under it; and the four type/kind refusals |
 | `AttentionTests` | 10 | FA-2 forward at five shapes dividing neither the block nor the fragment, f16-in/f32-accumulate, `num_warps` 1..8, scores that overflow a naive `exp`, and assertions on the three carried tensors, the spilled row maximum, the shared arena and the byte-counted refusal |
 | `AttentionBackwardTests` | 9 | the three backward kernels against an analytic `Double` reference at eight shapes including two f16 ones, against central finite differences of the forward, with the real forward's own statistics feeding them, at `num_warps` 1..8; every tolerance derived from a summation bound; plus the arena, the two resident accumulators, the logsumexp recomputation, and the one shape-and-warp combination that does not fit |
 | `AxisCloningTests` | 5 | the matmul tutorial as Triton prints it when block sizes collide, on the GPU at four of them; that the shared range is duplicated and the orphan removed; that a kernel which already lowers is untouched; and that a `tt.reduce` result at two dimensions is still refused |
-| `MatmulBenchmark` | 1 | opt-in (`TM_BENCH=1`); measures a machine, not a contract |
+| `MatmulBenchmark` | 2 | opt-in (`TM_BENCH=1`); measures a machine, not a contract |
 
-The Python suite splits in two. Fifteen cases assert the shim's *shape* (the
+The Python suite splits in two. Sixteen cases assert the shim's *shape* (the
 plugin directory Triton discovers, the registration symbol its `main.cc` calls,
 buffer alignment and dtypes) and run vector-add and softmax round trips over the
 C ABI — moving bytes and comparing numbers, while every compile, allocation and
@@ -503,6 +512,23 @@ through the pinned Triton — including an attention layer's forward *and* backw
 with the gradients checked against a hand-written numpy autograd — and skip, with
 an actionable message, on any machine that has not built it (§8.1), so the suite
 states the dependency without acquiring it.
+
+**Continuous integration.** `.github/workflows/ci.yml` runs `swift build`,
+`swift test` and the Python suite on `macos-latest`, an arm64 runner, on every
+push. The interesting part is that the runner's GPU is virtualised: it reports an
+*Apple Paravirtual device* whose `MTLCreateSystemDefaultDevice()` is non-nil and
+which answers every query, so gating GPU tests on "is there a device" would give a
+suite that fails rather than skips. The gate is instead a probe — one kernel using
+both halves of what every emitted kernel needs, an ordinary device store and an
+8x8 simdgroup multiply-accumulate through threadgroup memory, run once per process
+and cached. Both suites key off it (`skipWithoutMetal()` in Swift,
+`_core.is_usable()` in Python over a `tm_is_usable` export, the probe itself being
+Swift because the shim holds no logic), and `tmbench --probe` prints the verdict
+so a run's skips are explainable from its log. As it happens the paravirtual
+device runs simdgroup matrix operations correctly and the whole suite passes
+there — but that is a measured fact about the current runner image rather than
+something the suite assumes. Every piped step sets `set -o pipefail`, without
+which `swift test 2>&1 | tail -60` reports the exit status of `tail`.
 
 Two strategy choices are worth stating. Sizes divide *nothing*: `129x257x65`
 divides neither a block dimension nor the 8x8 fragment, softmax rows are 100
@@ -568,38 +594,43 @@ On an **Apple M1 Max** (Mac Studio; measured peaks 6.2 TFLOP/s f32, 371.5 GB/s),
 which is the machine to believe — it is not thermally constrained and its MPS
 readings are stable:
 
-| size | best configuration | triton-metal | MPS | ratio | round 1 | baseline |
+| size | best configuration | triton-metal | MPS | ratio | of peak | baseline |
 | --- | --- | --- | --- | --- | --- | --- |
-| 512 | 64x64x16, `num_warps=8` | 3.21 TFLOP/s | ~1.85 TFLOP/s | — | 92% | 62% |
-| 1024 | 64x64x16, `num_warps=8` | 4.33 TFLOP/s | ~5.70 TFLOP/s | **76%** | 50% | 33% |
-| 2048 | 64x64x16, `num_warps=8` | 4.66 TFLOP/s | ~6.10 TFLOP/s | **76%** | 50% | 33% |
-| 4096 | 64x64x16, `num_warps=8` | 4.64 TFLOP/s | ~6.10 TFLOP/s | **76%** | 52% | 32% |
+| 1024 | 64x64x16, `num_warps=8` | 4.30 TFLOP/s | 5.66 TFLOP/s | **76%** | 69% | 33% |
+| 2048 | 64x64x16, `num_warps=8` | 4.64 TFLOP/s | 6.10 TFLOP/s | **76%** | 75% | 33% |
+| 4096 | 64x64x16, `num_warps=8` | 4.65 TFLOP/s | 6.13 TFLOP/s | **76%** | 75% | 32% |
 
-On an **Apple M1 Pro** (laptop), where MPS readings move with thermal state:
+On an **Apple M1 Pro** (laptop; measured peaks 3.45 TFLOP/s f32, 166.4 GB/s),
+where MPS readings move with thermal state:
 
-| size | best configuration | triton-metal | MPS | ratio | round 1 | baseline |
+| size | best configuration | triton-metal | MPS | ratio | of peak | baseline |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1024 | 64x64x16, `num_warps=8` | 2.27 TFLOP/s | ~2.77 TFLOP/s | **82%** | 50% | 34% |
-| 2048 | 64x64x16, `num_warps=8` | 2.33 TFLOP/s | ~2.83 TFLOP/s | **82%** | 50% | 33% |
+| 1024 | 64x64x16, `num_warps=8` | 2.33 TFLOP/s | 3.10 TFLOP/s | **75%** | 67% | 34% |
+| 2048 | 64x64x16, `num_warps=8` | 2.43 TFLOP/s | 3.24 TFLOP/s | **75%** | 71% | 33% |
 
-**A second optimisation round took ~50% of MPS to 76% on the M1 Max** (1.52x on top
-of round 1's 1.55x, so 2.3x over the original kernel), which puts the backend inside
-the 62–82% band published Triton reaches against cuBLAS on its native target. The
-60% this round aimed at is cleared at every size where the measurement means
-anything, and the winning shape moved to `64x64x16` at `num_warps=8` everywhere.
-The laptop's 82% is flattered by a warm MPS reading — the same MPS configuration
-read 3.38 TFLOP/s earlier in the session, which would make it 69% — which is why
-the M1 Max is the machine to believe. Run-to-run variation there is about ±2%, once
-a configuration has been measured twice: the *first* measurement at a size runs
-cold and can read 20% low, which is a trap this round fell into before noticing.
+**75–76% of MPS at every size on both machines**, up from ~33% at the first
+working version, which puts the backend inside the 62–82% band published Triton
+reaches against cuBLAS on its native target and short of the 80–100% band it
+reaches on GEMM specifically. `64x64x16` at `num_warps=8` wins everywhere on both
+parts.
 
-The 512 row deserves its own sentence, because it would be easy to quote it
-misleadingly. At 512 the GEMM is under a millisecond and MPS's own timing swings
-by 1.5x run to run — we have measured the same MPS configuration at 1.36 and 2.28
-TFLOP/s minutes apart. That row says more about measurement variance than about
-either kernel, which is why the honest headline numbers come from 1024 and above.
+Both sides are timed twice at each size and the faster run taken, MPS included:
+the *first* measurement at a size runs cold and can read 20% low, and MPS is the
+denominator of every ratio here. That is what makes the two machines agree to
+within a point. Run-to-run variation after a warm pass is about ±2%.
 
-Reproduce with `.build/release/tmbench --sweep full`, or
+The "of peak" column is the one that says how much room is left. MPS reaches
+92–99% of the same machine's measured f32 peak; this kernel reaches 75%. What
+separates them is about four points of hardware utilisation, and §7.3 gives the
+measurement that says what those four points are made of.
+
+512 is deliberately not quoted. At that size the GEMM is under a millisecond and
+MPS's own timing swings by 1.5x run to run — we have measured the same MPS
+configuration at 1.36 and 2.28 TFLOP/s minutes apart. A ratio there would say more
+about measurement variance than about either kernel, which is why the headline
+numbers start at 1024.
+
+Reproduce with `.build/release/tmbench --sweep quick --sizes 1024,2048,4096`, or
 `TM_BENCH=1 swift test --filter MatmulBenchmark` where XCTest exists. The
 executable exists because the M1 Max above has only the command-line tools
 installed, and XCTest ships with Xcode.
@@ -624,6 +655,45 @@ pinning a configuration with `tmbench --config`:
 | + shared-column wave mapping, collapsing identical operand loads | 3551 | **+15%** |
 | + `float4` staging runs behind a runtime contiguity/alignment check | 4271 | **+20%** |
 | + two fragment rows per simdgroup where the score ties (at 64x64) | 4640 | **+8%** |
+| **round 3** | | |
+| + accumulator streamed out of registers in panels, at 64x64 | 4643 | 0% |
+| ...the same change at 128x64, whose full tile was the whole 32KB | 4138 | **+15%** |
+| ...and at 128x128, which does not lower without it | 3661 | 21% *below* the winner |
+
+#### What round 3 found
+
+Round 3 set out to take the last documented lever off the list: keep the
+accumulator out of threadgroup memory entirely, so that block shapes the 32KB
+budget forbids become possible and operand traffic per output element halves.
+The lever works — the epilogue now streams register fragments out a panel of rows
+at a time, `64x64` costs 8KB of threadgroup memory instead of 16, `128x64` 12KB
+instead of 32, and a `128x128` f32 accumulator, 64KB on its own, becomes
+emittable. It buys **nothing**: 0% at the shape that wins, and the `128x128` tile
+it unlocks runs 21% *slower* than the `64x64` one.
+
+The reason is visible from outside the kernel. Metal reports
+`maxTotalThreadsPerThreadgroup` for a compiled pipeline after it has allocated
+registers, and it falls monotonically with every configuration that is slower:
+1024 for the winner, 832 for `128x64`, 768 for `128x128`, 768 for `2x2` register
+blocking at `64x64`, 576 for `4x4`, and 448 for `128x128` at `2x2` — which is
+below the 512 threads that kernel asks for, so it will not launch at all.
+Threadgroup memory was never the binding constraint on block shape; the register
+file was, and moving the accumulator entirely into registers relocates the
+constraint rather than removing it.
+
+That also settles a question round 2 left open. Register blocking along N *does*
+reduce a contraction step's threadgroup reads — a `4x2` block at `64x64` needs 6
+operand loads for 8 multiply-accumulates where the winning `2x1` needs 9 for 8 —
+and it *still* loses, 4149 GFLOP/s against 4642, because of the 1024-to-768 drop
+in the threadgroup ceiling. The classic CUDA trade of registers for loads is not
+merely neutral on this part, it is inverted, and all three of round 2's inversions
+have the same single mechanism behind them: occupancy is how this GPU hides
+latency, registers are what occupancy costs.
+
+The round's other measurement is negative in the same direction. `float2` staging
+runs for tiles too narrow to hand out runs of four measure 2891 GFLOP/s against
+4326 — a 33% loss, because the run guard costs the same whether the run is two
+elements or four, so halving the run halves what it amortises over.
 
 #### What round 2 found
 
@@ -800,27 +870,48 @@ Two of the three candidates that account produced are now done, and the ordering
 gave them was again wrong: the prologue and epilogue it ranked first were worth 2%,
 and vector staging it ranked second was worth 20%.
 
-At 4.66 TFLOP/s a 2048-cube GEMM takes 3.7ms, and at the 64x64 tile that now wins
-its 1024 programs read 1 MiB of operands each — about 1.1 GB through the memory
-system, roughly **290 GB/s against a 371 GB/s part**, where the same calculation
-gave 145 GB/s at the end of round 1. (Some of that is L2 rather than DRAM, so it is
-an upper bound.) At ~75% of the measured 6.2 TFLOP/s compute peak and that close to
-the bandwidth wall, what is left to buy is arithmetic intensity, not latency. What
-we would try next:
+The account that replaced it was about memory traffic, and **that one was wrong
+too**. At 4.64 TFLOP/s a 2048-cube GEMM takes 3.7ms, and at the 64x64 tile its 1024
+programs read 1 MiB of operands each — about 1.1 GB through the memory system,
+roughly 290 GB/s against a 371 GB/s part. That looked close enough to the bandwidth
+wall to be the binding constraint, and the prescription that followed was a
+`128x128` tile, which halves the traffic. Round 3 built the mechanism that makes
+that tile possible and measured it: 21% *slower*. Giving the same threadgroup
+memory back at `64x64` and `64x128`, where the accumulator already fitted, is worth
+0%. Operand traffic is not what the kernel is waiting on.
 
-1. **Keeping the accumulator out of threadgroup memory entirely.** A 128x128 tile
-   halves the operand traffic of the 64x64 one that now wins, and that traffic is
-   now the binding constraint; its f32 accumulator alone is 64KB, twice the budget.
-   The route is an epilogue that streams register fragments out in panels instead
-   of through one full-size tile. Untried — the target was reached without it, and
-   it remains much the largest of the three.
-2. **Vector staging for the A tile as well.** Only B is vectorised at the winning
-   shape: a run of four columns of a 64x16 A tile would leave three quarters of the
-   threadgroup idle, and forcing it measures 3069 against 4223 GFLOP/s. The fix is a
-   staging distribution that lets a narrow tile hand out runs of four without
-   idling threads, not a longer run.
-3. **Specialising the run mask away.** The vector guard re-checks the mask at the
-   run's last column every K step; when `BLOCK_N` divides `N` it is statically true.
+What it is waiting on is legible in a number Metal reports and we were not reading:
+`maxTotalThreadsPerThreadgroup`, which the compiler fixes after register
+allocation. It is 1024 for the winning configuration and falls monotonically for
+every slower one — 832, 768, 576, and 448 for a `128x128`/`2x2` kernel that
+therefore cannot launch its own 512 threads. Occupancy is how this GPU hides
+latency; registers are what occupancy costs; every lever that buys arithmetic
+intensity with registers is paying in the currency that decides. That single
+mechanism accounts for all of round 2's inversions and both of round 3's negative
+results, which is more than either of the two previous accounts managed.
+
+So the remaining four points of hardware utilisation — 75% of the measured peak
+against MPS's 99% — are an *issue-slot* problem after all, but at fixed occupancy:
+how much non-arithmetic work a thread does per unit of matrix arithmetic, without
+spending registers to remove it. What we would try next:
+
+1. **`simdgroup_load` straight from device memory for the B operand.** MSL's
+   `simdgroup_load` takes a `device` pointer as happily as a `threadgroup` one.
+   Under the shared-column mapping each simdgroup reads exactly one B fragment per
+   contraction step and no two read the same one, so B crosses the memory system
+   once either way — staging it buys only masking and layout normalisation, and
+   costs an entire staging pass of address arithmetic, mask replays, vector guards
+   and threadgroup writes. A must stay staged, because every simdgroup reads all of
+   it. The cost is a runtime guard (unit innermost stride, fragment wholly inside
+   the matrix) hoisted out of the K loop, which means emitting the contraction loop
+   twice. Largest of the three, and the clearest mechanism.
+2. **Specialising the run mask away.** The vector guard re-checks the mask at the
+   run's last column every K step; when `BLOCK_N` divides `N` it is statically
+   true. Same shape as (1): a guard hoisted out of the loop, two bodies.
+3. **Spending fewer registers rather than more.** Nothing has been tried in that
+   direction, and everything measured says it is the direction. Whether the winner
+   is register-bound at 1024 threads or merely near it is not currently knowable —
+   `maxTotalThreadsPerThreadgroup` saturates at 1024 and stops reporting.
 
 None of the three is a layout redesign, and two of them are local to `emitDot`.
 
@@ -1039,10 +1130,10 @@ rather than the approximate 3.x layout (§8.1), but nothing yet re-verifies it w
 Triton moves. A check that rebuilds against the pinned tag is what would keep the
 adapter from silently drifting out of date.
 
-**Type coverage.** No `bf16`, which is the type real training actually uses and is
-now the most urgent gap in this list. No `f64`, and there will not be one: Metal
-has no `double` type at all. Block pointers (`!tt.ptr<tensor<…>>`) are not
-lowered.
+**Type coverage.** `f16`, `bf16` and `f32` lower, the two 16-bit types as
+distinct types rather than as each other. No `f64`, and there will not be one:
+Metal has no `double` type at all. Block pointers (`!tt.ptr<tensor<…>>`) are not
+lowered. bf16 is correctness-tested but not swept for throughput.
 
 **Atomics are 32-bit, unordered, and partly synthesised.** `tt.atomic_rmw` and
 `tt.atomic_cas` lower on `f32` and `i32` device pointers, and the four gaps are
@@ -1128,15 +1219,19 @@ without kernel-level annotation.
 Two results deserve restating plainly. The numerics are good: fast math off,
 `precise::` where Metal has it, a softmax that agrees with a CPU reference to about
 one ULP, and gradients whose tolerances are derived from a summation bound rather
-than chosen to pass. The performance is good rather than adequate: 76% of MPS on
-a GEMM, inside the band published Triton reaches against cuBLAS on its own target;
-357% of the MPS composite on attention forward at `s512` and 190% on the backward,
-with a measured crossover rather than a headline ratio.
+than chosen to pass. The performance is good rather than adequate: 75–76% of MPS
+on a GEMM across two machines, inside the band published Triton reaches against
+cuBLAS on its own target and below the one it reaches on GEMM specifically; 357%
+of the MPS composite on attention forward at `s512` and 190% on the backward, with
+a measured crossover rather than a headline ratio. The GEMM number did not move in
+round 3, and what that round produced instead is the mechanism behind it: the
+register file, not memory traffic, is what stands between this kernel and MPS.
 
 What stands between this and being *used* is no longer a research problem. The
-release is pinned and driven, both directions of the kernel that mattered run, and
-the remaining distance is `bf16`, a conformance subset, optimizer and RNG kernels
-that nothing in the design objects to, and measurements on silicon newer than M1 —
-a list of known work rather than of open questions. The honest boundary is that
+release is pinned and driven, both directions of the kernel that mattered run,
+bf16 lowers to Metal's native `bfloat`, and the remaining distance is a
+conformance subset, optimizer and RNG kernels that nothing in the design objects
+to, and measurements on silicon newer than M1 — a list of known work rather than
+of open questions. The honest boundary is that
 this compiles and runs the kernels a training loop is made of; it is not itself a
 training framework.

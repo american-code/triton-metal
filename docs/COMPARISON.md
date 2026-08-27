@@ -1,9 +1,10 @@
 # triton-metal vs. Triton-on-CUDA: a measured comparison
 
-*2026-08-27 (two optimisation rounds plus the backward pass). Local numbers from tmbench on a
-Mac Studio M1 Max (measured peaks 6.2 TF fp32 / 371.5 GB/s) and a MacBook M1 Pro
-(3.45 TF / 166.4 GB/s); CUDA numbers cited. The comparison is efficiency fractions
-against each platform's vendor library.*
+*2026-08-27 (three optimisation rounds plus the backward pass). Local numbers from
+tmbench on a Mac Studio M1 Max (measured peaks 6.2 TF fp32 / 371.5 GB/s) and a
+MacBook M1 Pro (3.45 TF / 166.4 GB/s), each side timed twice per size with the
+faster taken; CUDA numbers cited. The comparison is efficiency fractions against
+each platform's vendor library.*
 
 ## Published Triton anchors (its native CUDA target)
 
@@ -18,22 +19,28 @@ NVIDIA-specific pipeline work; 62–82% end-to-end is the realistic band.
 
 ## triton-metal measured (fp32 square GEMM vs. MPSMatrixMultiplication)
 
-| machine | size | baseline | round 1 | round 2 | of MPS |
-|---|---|---|---|---|---|
-| M1 Max | 1024 | 1.85 TF | 2.75 TF | **4.33 TF** | 33% → 50% → **76%** |
-| M1 Max | 2048 | 1.99 TF | 3.06 TF | **4.66 TF** | 33% → 50% → **76%** |
-| M1 Max | 4096 | 1.97 TF | 3.21 TF | **4.64 TF** | 32% → 52% → **76%** |
-| M1 Pro | 1024 | 1.02 TF | 1.57 TF | **2.27 TF** | 34% → 51% → **82%** |
-| M1 Pro | 2048 | 1.11 TF | 1.69 TF | **2.33 TF** | 33% → 50% → **82%** |
+| machine | size | baseline | round 1 | round 2 | round 3 | of MPS | of measured peak |
+|---|---|---|---|---|---|---|---|
+| M1 Max | 1024 | 1.85 TF | 2.75 TF | 4.33 TF | **4.30 TF** | 33% → 50% → **76%** | 69% |
+| M1 Max | 2048 | 1.99 TF | 3.06 TF | 4.66 TF | **4.64 TF** | 33% → 50% → **76%** | 75% |
+| M1 Max | 4096 | 1.97 TF | 3.21 TF | 4.64 TF | **4.65 TF** | 32% → 52% → **76%** | 75% |
+| M1 Pro | 1024 | 1.02 TF | 1.57 TF | 2.27 TF | **2.33 TF** | 34% → 51% → **75%** | 67% |
+| M1 Pro | 2048 | 1.11 TF | 1.69 TF | 2.33 TF | **2.43 TF** | 33% → 50% → **75%** | 71% |
 
 One pass of the published CUDA optimization playbook moved 33% → 50–52% (1.55×). A
 second pass — of things that are *not* in that playbook — moved 50% → 76% on the
 M1 Max (1.52× again, 2.3× over baseline), which lands inside the 62–82% band mature
-Triton reaches on its native target. (The M1 Pro rows are a laptop's, whose MPS
-readings move with its thermal state; a cooler MPS reading in the same session
-would put its 2048 row at 69%.) Correctness is at parity for the supported
-subset throughout — every winner is verified against a CPU reference at
-non-multiple-of-tile sizes before being reported.
+Triton reaches on its native target and below the 80–100% band it reaches on GEMM
+specifically. A third pass did not move it, and produced the mechanism instead
+(below). The ratios are 75–76% on both machines, which they were not when MPS was
+timed once: MPS is the denominator of every one of them and the first measurement
+at a size runs cold, so it now gets a second run too. Correctness is at parity for
+the supported subset throughout — every winner is verified against a CPU reference
+at non-multiple-of-tile sizes before being reported.
+
+The last column is the one that says how much room is left. MPS reaches 92–99% of
+the same machine's *measured* f32 peak; this kernel reaches 75%. The distance is
+about four points of hardware utilisation.
 
 ## The transfer matrix: what ports from CUDA, what inverts
 
@@ -54,6 +61,19 @@ here should be assumed to hold on M2, M3 or M4 silicon until it is re-measured;
   vectorized (`float4`) global loads (+20%, the largest single change of either
   round — though on this chip most of it is the *address arithmetic* the vector
   path skips, not the loads).
+- **Did not transfer (M1):** *bigger block shapes do not pay, and the reason is the
+  register file.* Round 3 removed threadgroup memory as a constraint on block shape
+  altogether — the epilogue streams the accumulator out of registers a panel of
+  rows at a time, so `64x64` costs 8 KB instead of 16, `128x64` 12 KB instead of
+  32, and a `128x128` f32 accumulator (64 KB, twice Metal's whole budget) becomes
+  emittable. It is worth 0% at the shape that wins, +15% at `128x64`, and the
+  `128x128` tile it unlocks — which halves operand traffic per output element —
+  runs 21% *slower* than `64x64`. What actually binds is visible in the
+  `maxTotalThreadsPerThreadgroup` Metal reports after register allocation: 1024 for
+  the winner, 832 for `128x64`, 768 for `128x128`, 448 for `128x128` at 2×2
+  blocking, which will not launch its own 512 threads. Occupancy is how this GPU
+  hides latency, registers are what occupancy costs, and that one mechanism is
+  behind every inversion in this list.
 - **Did not transfer (M1):** *double buffering is a wash* — Metal has no `cp.async` copy
   engine, so prefetch competes for the same issue slots and larger tiles cost the
   occupancy Apple silicon uses to hide latency (re-measured after the mapping
@@ -63,7 +83,10 @@ here should be assumed to hold on M2, M3 or M4 silicon until it is re-measured;
   — at `64x128` 1×1 now beats 2×2 by 53% at equal fragment counts (4327 vs 2836),
   up from 28%, the opposite of CUTLASS guidance. Blocking along **M** is the
   exception that proves the rule: 2×1 keeps the shared column and is worth +8% at
-  the shape that wins.
+  the shape that wins. And the register account settles it: a `4x2` block at
+  `64x64` genuinely does cut a contraction step from 9 operand loads to 6, and
+  still measures 4149 GFLOP/s against 2×1's 4642, because it takes the threadgroup
+  ceiling from 1024 to 768.
 - **Metal-specific, no CUDA analogue (M1):** the *shared-column wave mapping* (+15%).
   Because Metal's simdgroup-matrix ops move whole 8×8 fragments through threadgroup
   memory rather than distributing them over named lanes, which fragment each
@@ -134,12 +157,25 @@ about ±5 points. `tmbench --attn-bwd` re-runs the whole thing in one command.
 
 ## Where it sits now
 
-Inside the band, at the sizes where the measurement is trustworthy — 76% of MPS at
-1024, 2048 and 4096 on the M1 Max. What is left is
-characterized in [ARCHITECTURE.md](ARCHITECTURE.md) §Matmul throughput: register-only
-accumulators for 128×128 blocks (untried — the target was reached without it),
-vector staging for the narrow A tile, and specialising away the run mask. At 4.66 TF
-the 2048 GEMM is at ~75% of the *measured* 6.2 TF device peak and pushes ~290 GB/s
-of 371 GB/s through the memory system, so what is left is mostly arithmetic
-intensity — which is exactly what the 128×128 tile buys. MPS itself reaches 86–99%
-of that measured peak from the same API surface.
+Inside the end-to-end band and below the GEMM one: 76% of MPS at 1024, 2048 and
+4096 on the M1 Max, 75% at 1024 and 2048 on the M1 Pro. In absolute terms the
+2048 GEMM is at 75% of the machine's measured 6.2 TF f32 peak, against MPS's 99%
+from the same API surface.
+
+The account of what stood between those two numbers has now been wrong twice, and
+both corrections are measurements rather than arguments. The instruction-slot
+account ranked the prologue and epilogue first (worth 2%) and vector staging third
+(worth 20%). The arithmetic-intensity account that replaced it prescribed a
+`128×128` tile to halve operand traffic; that tile now exists and is 21% slower,
+and handing the same threadgroup memory back where the accumulator already fitted
+is worth nothing. Operand traffic is not what the kernel waits on.
+
+What it waits on is occupancy, and what occupancy costs is registers — the one
+mechanism behind every inversion above. So the remaining four points are an
+issue-slot problem *at fixed occupancy*: less non-arithmetic work per unit of
+matrix arithmetic, bought without registers.
+[ARCHITECTURE.md](ARCHITECTURE.md) §Matmul throughput has the candidates, of which
+the largest is loading the B operand's 8×8 fragments straight from device memory —
+MSL's `simdgroup_load` takes a `device` pointer, each simdgroup reads exactly one
+B fragment per step under the shared-column mapping, and staging it therefore buys
+only masking, at the cost of an entire staging pass.

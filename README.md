@@ -8,8 +8,9 @@ routing, quantization kernels) without hand-rolling CUDA — and Triton targets 
 CUDA/ROCm, which is CUDA's single biggest portable-code moat. This backend runs that
 same research code unmodified on hardware a team already owns: real `@triton.jit`
 through the pinned Triton 3.7.1, exact results, no patch to Triton — with the matmul
-tutorial at **76% of Apple's own `MPSMatrixMultiplication`** and FlashAttention-2
-beating the MPS composite it replaces at `s1024` and below in **both directions**.
+tutorial at **75–76% of Apple's own `MPSMatrixMultiplication`** on two machines,
+and FlashAttention-2 beating the MPS composite it replaces at `s1024` and below in
+**both directions**.
 An attention layer written as `@triton.jit` source now **trains** on a Mac GPU —
 forward, backward and a gradient-descent step — with gradients checked against a
 hand-written numpy autograd and against finite differences;
@@ -157,17 +158,23 @@ finite differences of the forward as well as against an analytic reference.
 - **Runtime**: handle-based C ABI — `tm_compile_msl`, `tm_load_kernel`,
   `tm_alloc_buffer`, `tm_launch`, with `tm_last_error` for diagnostics.
 - **Performance**: the matmul tutorial reaches **76% of
-  `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square — 4.66 TFLOP/s f32 at
-  2048 on an **M1 Max**, 2.33 TFLOP/s on an **M1 Pro** — up from ~33% at the first
-  working version, which clears the >50% milestone and lands inside the 62–82% band
-  published Triton reaches against cuBLAS on its own target.
+  `MPSMatrixMultiplication`** at 1024, 2048 and 4096 square on an **M1 Max**
+  (4.64 TFLOP/s f32 at 2048) and **75%** at 1024 and 2048 on an **M1 Pro**
+  (2.43 TFLOP/s), both sides timed twice with the faster taken — up from ~33% at
+  the first working version. That is inside the 62–82% band published Triton
+  reaches end-to-end against a CUDA-kernel stack, and below the 80–100% band it
+  reaches on GEMM specifically.
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Matmul throughput has the
   per-machine numbers, what each optimisation was worth measured one at a time, the
-  two CUDA-playbook techniques (double buffering, and register blocking past 1x1)
-  that did **not** transfer to M1-generation Apple silicon (unmeasured on M2/M3/M4,
-  which changed the memory hierarchy), and the one with no CUDA analogue —
-  a wave-to-fragment mapping that makes every wave of a simdgroup share its B
-  fragment — that was worth more than either. Sweep it yourself with
+  CUDA-playbook techniques that did **not** transfer to M1-generation Apple silicon
+  (double buffering; register blocking past 1x1; bigger block shapes, including the
+  `128x128` one that only became emittable in the third round and is 21% *slower*
+  than the `64x64` that wins), the one with no CUDA analogue that was worth more
+  than any of them — a wave-to-fragment mapping that makes every wave of a
+  simdgroup share its B fragment — and the single mechanism behind all the
+  inversions: the register file, not threadgroup memory or DRAM bandwidth, is what
+  a large block shape runs out of, and `tmbench --verbose` prints the
+  `maxTotalThreadsPerThreadgroup` that shows it. Sweep it yourself with
   `swift run -c release tmbench`, which needs no Xcode.
 - **Fused attention**: FlashAttention-2 forward against the composite it replaces
   (`Q K^T` + `MPSMatrixSoftMax` + `P V`, three dispatches per head through a real
@@ -184,20 +191,24 @@ finite differences of the forward as well as against an analytic reference.
   Both sides are credited with the five GEMMs the mathematics needs, although the
   fused side runs seven — `Q K^T` is recomputed in each direction — so the ratio
   understates it. `swift run -c release tmbench --attn-bwd`.
-- **Tests**: 184 Swift cases (parser, emitter, layout, casts/math, control flow,
+- **Types**: `f16`, `bf16` and `f32`. bf16 lowers to Metal's native `bfloat` and
+  to `simdgroup_matrix<bfloat, 8, 8>`, so a bf16 `tt.dot` is a real simdgroup
+  matrix multiply rather than a widen-and-multiply, and it is a type of its own
+  rather than a second spelling of `f16` — neither converts to the other directly.
+- **Tests**: 191 Swift cases (parser, emitter, layout, casts/math, control flow,
   rank-2, reductions, `tt.dot`, atomics, FlashAttention-2 forward *and* backward,
-  axis cloning, error paths, and GPU runs verified against CPU references on an
-  M1 Pro) + 15 Python cases including vector-add and softmax round trips, plus 7
-  more that drive **real** `@triton.jit` kernels — including a forward+backward
-  gradient check — and skip with an actionable message when Triton is not
-  installed, plus opt-in MPS benchmarks. 83.43% region /
-  85.23% function / 89.50% line coverage of the Swift core — see
-  [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the breakdown and for
-  what the uncovered fraction is made of.
+  axis cloning, error paths, and GPU runs verified against CPU references) + 16
+  Python cases including vector-add and softmax round trips, plus 7 more that drive
+  **real** `@triton.jit` kernels — including a forward+backward gradient check —
+  and skip with an actionable message when Triton is not installed, plus opt-in MPS
+  benchmarks. All of it runs on **GitHub Actions** (`macos-latest`, arm64) on every
+  push, with the runner's virtualised GPU probed by a real kernel before its
+  results are believed. 83.43% region / 85.23% function / 89.50% line coverage of
+  the Swift core — see [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the
+  breakdown and for what the uncovered fraction is made of.
 
-Not yet: `bf16` (the type real training uses, and the most urgent gap), block
-pointers, `f64` (Metal has no `double` at all), and anything above the kernel
-layer — no autograd, no optimizer-state kernels, no RNG and so no dropout.
+Not yet: block pointers, `f64` (Metal has no `double` at all), and anything above
+the kernel layer — no autograd, no optimizer-state kernels, no RNG and so no dropout.
 Atomics are 32-bit and unordered (see above). One narrower constraint the Triton
 integration exposed: a kernel argument must be backed by Metal memory
 (`MetalBuffer`), since a CPU torch tensor's allocation is not an `MTLBuffer` and
@@ -225,8 +236,9 @@ Never `xcodebuild`. GEMM throughput against MPS:
 ```
 swift run -c release tmbench                    # block-shape sweep, 512/1024/2048
 swift run -c release tmbench --sweep full       # + register blocking, tile padding,
-                                                #   double buffering
+                                                #   double buffering, epilogue panel
 swift run -c release tmbench --config 64,128,16,16   # pin one configuration
+swift run -c release tmbench --probe                 # can this machine run a kernel?
 swift run -c release tmbench --emit 64,64,16,16      # print the kernel it lowers
 swift run -c release tmbench --attn                  # FlashAttention-2 forward
 swift run -c release tmbench --attn-bwd              # ... and backward
