@@ -767,6 +767,7 @@ parsed and then ignored.
 | Control flow | `scf.for`, `scf.if`, `scf.yield` | `iter_args` and multi-result `%r:2` / `%r#0`; a body containing a cross-lane op hoists the loop (below) |
 | Reduction | `tt.reduce` | single operand, **innermost axis only**, combiner `add`/`max`/`min`; generic MLIR form only; folds within a row's lane group when there is an axis outside the reduced one, across the threadgroup when there is not |
 | Matmul | `tt.dot` | rank 2, `f16`/`f32` with the accumulator at least as wide; `M`/`N`/`K` need not be multiples of 8 |
+| Atomics | `tt.atomic_rmw` (`add fadd and or xor max min umax umin exch`), `tt.atomic_cas` | `f32` and `i32` device pointers, any rank, masked, returning the old value; `sem`/`scope` parsed and ignored (Metal has one memory order); f32 `max`/`min` go through a compare-exchange loop |
 
 ### Restrictions worth memorising
 
@@ -787,17 +788,25 @@ parsed and then ignored.
   operand is free (it is a relabelling, staged over its own tile's axes); a
   transposed value that has to be walked by an elementwise nest asks for two
   contradictory nestings of the same two block dimensions.
-* **One `tl.arange` may not index both a row and a column** of the same value —
-  that describes a diagonal, not a tile, and is refused by name. Emit a separate
-  `tt.make_range` for each; Triton's CSE will otherwise merge them whenever the
-  two block sizes are equal.
+* **One value may not index both a row and a column** of the same tensor — that
+  describes a diagonal, not a tile, and is refused by name. Triton's CSE produces
+  exactly that whenever two block sizes are equal, and the emitter un-shares the
+  arithmetic and retries before refusing, so equal block sizes work. What survives
+  is the case the rewrite cannot rebuild: a `tt.reduce` result placed at two
+  dimensions, because the fold has already happened.
+* **An atomic in a threadgroup-uniform nest is performed by one thread**, which is
+  a correctness requirement rather than an optimisation — every thread walking that
+  loop would otherwise add its contribution again. The old value it returns
+  therefore exists only in that thread, and using it is refused by name.
 
 ### Not supported
 
-Each of these fails by name: `tt.cat`, `tt.atomic_*`, `tt.call`, `tt.histogram`,
+Each of these fails by name: `tt.cat`, `tt.call`, `tt.histogram`,
 `tt.scan`, multi-operand `tt.reduce` (argmax/argmin), reductions over a
 non-innermost axis, cross-lane ops inside `scf.if`, a materialised `tt.trans`,
-and generic op syntax for anything but `tt.reduce`.
+`f16`/`i64` atomics and an atomic whose old value is read in a uniform nest,
+`f64` anywhere (Metal has no `double`), and generic op syntax for anything but
+`tt.reduce`.
 
 Two things this list used to contain and no longer does: a per-lane tensor carried
 across a cross-lane `scf.for` (now spilled to a threadgroup tile), and a `tt.dot`
@@ -1005,19 +1014,23 @@ What is left of this task:
    is absent — which is every machine that has not spent the 9 minutes. A CI job
    that does spend them turns the next interface churn into a test failure rather
    than a mystery.
-2. **Axis identity independent of extent.** The one constraint the matmul
-   tutorial exposed: block sizes must be pairwise distinct, because
-   `LayoutInference` identifies a block axis by its extent. `(64, 64, 32)` is
-   refused. This is the highest-value correctness item now.
-3. **Zero-copy tensors.** `MetalBuffer.from_torch` copies. Either allocate torch
+2. **Zero-copy tensors.** `MetalBuffer.from_torch` copies. Either allocate torch
    storage through Metal, or accept a page-aligned external allocation via
    `makeBuffer(bytesNoCopy:)` and add the `tm_*` export for it.
-4. **Cacheable binaries.** `binary_ext` is `msl`, so every process re-runs
+3. **Cacheable binaries.** `binary_ext` is `msl`, so every process re-runs
    `MTLDevice.makeLibrary(source:)`. `tm_load_metallib` already exists; what is
    missing is a way to *produce* the bytes without `xcrun metal`, which Command
    Line Tools do not ship.
-5. **Conformance.** Port a subset of Triton's own `test_core.py` against numpy
+4. **Conformance.** Port a subset of Triton's own `test_core.py` against numpy
    references — the signal this backend still does not have. Now that real Triton
    drives the backend, that suite is runnable rather than hypothetical.
-6. **i64 and f64 kernel arguments.** `tm_launch` carries `i32`/`f32` scalars only;
-   a 64-bit scalar argument is refused by the launcher with a clear message.
+5. **`bf16`.** The type real training uses, and the largest remaining type gap.
+   Metal has no `bfloat` before Metal 3.1 and no `simdgroup_bfloat8x8` at all, so
+   this means deciding between an f32-widening lowering (correct, and it gives up
+   the memory saving that is the point of `bf16`) and a `ushort`-based one that
+   converts around every arithmetic op.
+6. **Above the kernel layer.** There is no autograd, no optimizer-state kernel, no
+   RNG and therefore no dropout. Adam's moment update is ordinary elementwise work
+   and should lower through the existing machinery unchanged; `tl.rand` needs a
+   counter-based RNG lowered as `math`-level ops. Neither is written or measured,
+   so neither is claimed.

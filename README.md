@@ -9,8 +9,10 @@ CUDA/ROCm, which is CUDA's single biggest portable-code moat. This backend runs 
 same research code unmodified on hardware a team already owns: real `@triton.jit`
 through the pinned Triton 3.7.1, exact results, no patch to Triton — with the matmul
 tutorial at **76% of Apple's own `MPSMatrixMultiplication`** and FlashAttention-2
-forward beating the MPS composite it replaces at `s1024` and below. It is inference-only
-today (no atomics, no backward pass);
+beating the MPS composite it replaces at `s1024` and below in **both directions**.
+An attention layer written as `@triton.jit` source now **trains** on a Mac GPU —
+forward, backward and a gradient-descent step — with gradients checked against a
+hand-written numpy autograd and against finite differences;
 [docs/WHITEPAPER.md §2](docs/WHITEPAPER.md#2-value-proposition-breaking-the-portable-kernel-moat)
 has the full case and its boundaries, including which CUDA optimisation techniques
 transfer to M1-generation Apple silicon and which invert.
@@ -70,7 +72,11 @@ as pre-baked IR, and checked against numpy on an M1 Max:
 triton 3.7.1 on Apple M1 Max
 vector add, n=98432:              max |triton - numpy| = 0
 fused softmax, (1823, 781):       max |triton - numpy| = 1.49012e-08
-matmul 256x256x256 (tl.dot):      max |triton - numpy| = 0
+matmul 256x256x256 (tl.dot):      max |triton - numpy| = 0      (every block shape,
+                                    including (64,64,32), (64,64,64), (32,32,32))
+attention layer, h2 s96 d64:      dQ/dK/dV vs numpy autograd    <= 6.2e-07 relative
+                                  vs central finite differences <= 3.7e-08 relative
+                                  8 SGD steps: loss 1541.73 -> 1482.86
 ```
 
 Triton ships no macOS wheel, so this means building Triton from source with
@@ -81,11 +87,12 @@ toolchain, no Xcode, no patch to Triton. Recipe:
 **Working end-to-end spine, with real kernels on it.** Triton IR text -> MSL ->
 `MTLLibrary` -> compute pipeline -> unified-memory buffers -> dispatch -> results,
 driven from Swift, from Python over the `tm_*` C ABI, or now from Triton itself.
-Triton's fused **softmax**, **matmul** and **FlashAttention-2 forward** kernels all
-run on the GPU and match CPU references — at f32 and at f16-in/f32-accumulate, at sizes that
-divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
-`h2 s127 d64` among them), and, for attention, on scores large enough that a naive
-`exp` overflows.
+Triton's fused **softmax**, **matmul** and **FlashAttention-2 forward and backward**
+kernels all run on the GPU and match CPU references — at f32 and at
+f16-in/f32-accumulate, at sizes that divide neither the block shape nor the 8x8
+simdgroup fragment (`129x257x65` and `h2 s127 d64` among them), for attention on
+scores large enough that a naive `exp` overflows, and for the gradients against
+finite differences of the forward as well as against an analytic reference.
 
 - **Lowering**: a recursive-descent parser for Triton's pretty MLIR syntax (plus
   the generic form for `tt.reduce`, which carries a region) and an MSL emitter.
@@ -94,7 +101,8 @@ divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
   masked `tt.load`/`tt.store` at any rank, the `arith` integer/float/compare ops,
   all the `arith` conversions, `math.*` unary ops, `arith.select`, `scf.for`/
   `scf.if` with `iter_args` and multiple results, `tt.reduce` (add/max/min) over
-  the innermost axis, and `tt.dot`. Anything else fails with the op name and
+  the innermost axis, `tt.dot`, and `tt.atomic_rmw`/`tt.atomic_cas` on `f32` and
+  `i32` device pointers. Anything else fails with the op name and
   source line. Full list:
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Supported IR subset.
 - **Layout**: every dimension of every tensor gets an axis *variable*, and the ops
@@ -126,6 +134,21 @@ divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
   accumulator the loop rescales in place — FlashAttention's
   `acc = tt.dot(p, v, acc * alpha[:, None])` — instead *becomes* the dot's
   accumulator tile, and the rescale becomes the staging pass that fills it.
+- **Atomics**: `tt.atomic_rmw` (`add`, `fadd`, `and`, `or`, `xor`, `max`, `min`,
+  `umax`, `umin`, `exch`) and `tt.atomic_cas`, masked, returning the old value.
+  What Metal actually provides was established by compiling every candidate rather
+  than read off the spec, and the four gaps are refused by name: no 16- or 64-bit
+  atomics, no float `atomic_fetch_max_explicit` (so f32 `max`/`min` go through a
+  compare-exchange loop on the bit pattern), no strong compare-exchange, and
+  exactly one memory order — so Triton's `sem`/`scope` are parsed and dropped, and
+  nothing but the operation itself is ordered. Float atomics reorder; the suite
+  measures the spread against the recursive-summation bound rather than hiding it.
+- **Backward pass**: FlashAttention-2 backward as three recompute-based kernels —
+  `Delta = dO.O`, then `dQ` over key blocks, then `dK`/`dV` over query blocks. The
+  forward stores one `BLOCK_M`-wide logsumexp vector per query block and the
+  backward rebuilds `P` from it, so the `S x S` score matrix never exists. The
+  split two-pass shape rather than a `tt.atomic_rmw` accumulation of `dQ`, because
+  it keeps every gradient deterministic and every accumulator in registers.
 - **Numerics**: fast math is switched off (Metal defaults it on) and `math.*` maps
   to `precise::` wherever Metal has it; `fast::` is never emitted. Every math op is
   checked against a CPU reference on the GPU.
@@ -154,23 +177,31 @@ divide neither the block shape nor the 8x8 simdgroup fragment (`129x257x65` and
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §Attention throughput has both
   machines, the run-to-run variance on the composite side, and the one change that
   was worth 3.9x. Sweep it with `swift run -c release tmbench --attn`.
-- **Tests**: 144 Swift cases (parser, emitter, layout, casts/math, control flow,
-  rank-2, reductions, `tt.dot`, FlashAttention-2, error paths, and GPU runs
-  verified against CPU references on an M1 Pro) + 15 Python cases including
-  vector-add and softmax round trips, plus 6 more that drive **real** `@triton.jit`
-  kernels and skip with an actionable message when Triton is not installed, plus
-  opt-in MPS benchmarks. 84.49% region /
-  85.77% function / 91.24% line coverage of the Swift core — see
+- **Fused attention, backward**: against the strongest composite MPS can express
+  (five GEMMs with `MPSMatrixSoftMax` and `MPSMatrixSoftMaxGradient` between them,
+  through two live `S x S` matrices) the three backward kernels reach **190%** at
+  `b1 h8 s512 d64` and **220%** in f16 on an M1 Max, crossing over near `s1024`.
+  Both sides are credited with the five GEMMs the mathematics needs, although the
+  fused side runs seven — `Q K^T` is recomputed in each direction — so the ratio
+  understates it. `swift run -c release tmbench --attn-bwd`.
+- **Tests**: 184 Swift cases (parser, emitter, layout, casts/math, control flow,
+  rank-2, reductions, `tt.dot`, atomics, FlashAttention-2 forward *and* backward,
+  axis cloning, error paths, and GPU runs verified against CPU references on an
+  M1 Pro) + 15 Python cases including vector-add and softmax round trips, plus 7
+  more that drive **real** `@triton.jit` kernels — including a forward+backward
+  gradient check — and skip with an actionable message when Triton is not
+  installed, plus opt-in MPS benchmarks. 83.43% region /
+  85.23% function / 89.50% line coverage of the Swift core — see
   [docs/WHITEPAPER.md](docs/WHITEPAPER.md) §Evaluation for the breakdown and for
   what the uncovered fraction is made of.
 
-Not yet: `tt.atomic_*`, the FlashAttention-2 **backward** pass (which needs them),
-`bf16`, and block pointers. Two narrower gaps the Triton integration exposed, both
-now documented precisely rather than hypothesised: a kernel whose block sizes are
-not **pairwise distinct** is refused (the emitter identifies a block axis by its
-extent — `BLOCK_M == BLOCK_N` reads as a diagonal), and a kernel argument must be
-backed by Metal memory (`MetalBuffer`), since a CPU torch tensor's allocation is
-not an `MTLBuffer` and cannot be wrapped without a copy.
+Not yet: `bf16` (the type real training uses, and the most urgent gap), block
+pointers, `f64` (Metal has no `double` at all), and anything above the kernel
+layer — no autograd, no optimizer-state kernels, no RNG and so no dropout.
+Atomics are 32-bit and unordered (see above). One narrower constraint the Triton
+integration exposed: a kernel argument must be backed by Metal memory
+(`MetalBuffer`), since a CPU torch tensor's allocation is not an `MTLBuffer` and
+cannot be wrapped without a copy.
 [docs/USAGE.md §Implementing what's missing](docs/USAGE.md#implementing-whats-missing)
 has concrete starting points for each of these.
 
@@ -186,6 +217,7 @@ To run the `@triton.jit` tutorials you also need Triton built against this plugi
 
 ```
 python python/examples/vector_add.py
+python python/examples/attention_training.py    # forward + backward + a training step
 ```
 
 Never `xcodebuild`. GEMM throughput against MPS:
@@ -196,6 +228,8 @@ swift run -c release tmbench --sweep full       # + register blocking, tile padd
                                                 #   double buffering
 swift run -c release tmbench --config 64,128,16,16   # pin one configuration
 swift run -c release tmbench --emit 64,64,16,16      # print the kernel it lowers
+swift run -c release tmbench --attn                  # FlashAttention-2 forward
+swift run -c release tmbench --attn-bwd              # ... and backward
 ```
 
 `tmbench` is an executable rather than an XCTest case because XCTest ships with

@@ -116,13 +116,10 @@ into a shape the `tt.dot` pointer-advance check had not anticipated:
   now folded into an inline uniform expression (`uniformExpression` in
   `MSLEmitter.swift`), which also covers `+ - * / % << >>` over such operands.
 
-One real constraint survives, and the matmul tutorial hits it: the emitter
-identifies a block axis **by its extent**, so `BLOCK_M == BLOCK_N` (or either
-equal to `BLOCK_K`) makes a row index indistinguishable from a column index. The
-kernel is refused by name and line rather than mis-compiled. Pairwise-distinct
-block sizes work: `(128, 64, 32)` runs and matches numpy; `(64, 64, 32)` is
-rejected. Lifting this means carrying axis identity independently of extent
-through `LayoutInference` — the next real piece of work in the layout model.
+Block sizes may collide. `(128, 64, 32)`, `(64, 64, 32)`, `(64, 64, 64)`,
+`(32, 32, 32)` and `(64, 32, 32)` all run and agree with numpy exactly; what makes
+equal block sizes work is §Sharing one range between two axes, and it is entirely
+about the shape of the IR a release prints rather than about the layout model.
 
 ## Lowering pipeline
 
@@ -254,6 +251,50 @@ spilled (all lowered ops are pure). Softmax therefore emits three lane loops ove
 the same row — the redundancy is real, and cheaper than 3 x BLOCK floats of
 threadgroup memory. Recomputation is refused with a precise error when the
 recomputed region would contain a store or an `scf` region.
+
+### Sharing one range between two axes
+
+The emitter has never identified a block axis by its extent: `Layout.swift`
+unifies axis *variables*, and two axes of the same size are two axes. What made
+equal block sizes fail was upstream of that, in Triton's CSE, and the distinction
+matters because the fix is a rewrite rather than a weakening of the inference.
+
+With `BLOCK_M == BLOCK_N`, `tl.arange(0, BLOCK_M)` and `tl.arange(0, BLOCK_N)`
+are the *same expression*, so the matmul tutorial's ttir contains one
+`tt.make_range` with both `offs_am` and `offs_bn` as `arith.addi`s over it. The
+elementwise relation unifies all three onto one axis variable, and expanding one
+at dimension 1 and the other at dimension 0 then declares the row axis and the
+column axis to be the same one. The accumulator becomes a diagonal of itself and
+is refused by name — correctly, because that *is* what the unified layout says.
+
+The sharing, though, is an artefact. Every operation on the path is pure, so
+`AxisCloning` gives each placement its own copy of the arithmetic — a few integer
+instructions per program — and re-runs the inference. It fires only on
+`CoreError.axisCollapse`, the one diagnostic it can address; every other layout
+failure means what it says and rewriting the kernel to make it go away would
+change what the kernel computes.
+
+Two phases, because two equal block sizes and three equal block sizes fail
+differently.
+
+* **Each `tt.expand_dims` of a conflicted rank-1 class gets its own producer
+  cone.** Not just the ones at the second dimension: with all three sizes equal
+  the same `tt.make_range` is the row index, the column index *and* the
+  contraction index, and two expansions at the same dimension still have to land
+  on two different axes.
+* **Each consumer of a multiply-used `tt.broadcast` gets its own copy of the
+  widening.** This is what `(64, 64, 64)` needs on its own:
+  `tt.broadcast %b_cols : tensor<1x64xi32> -> tensor<64x64xi32>` is CSE'd between
+  `B`'s column offsets, where the leading dimension is the contraction, and `C`'s,
+  where it is the row block. A `tt.broadcast` emits no code at all, and it unifies
+  only the dimensions that *vary* in its source, so the copy is free and the
+  widened dimension takes its identity entirely from the consumer.
+
+Nothing is invented by either phase: a copy that really is the same axis as its
+original is unified again downstream, by the `tt.dot`'s pinning or by whatever
+elementwise expression reads both. What the pass cannot fix, it declines — a
+`tt.reduce` result placed at two dimensions cannot be rebuilt, because the fold
+has already happened, and that collapse is still refused by name.
 
 ### Cross-lane regions
 
@@ -685,6 +726,12 @@ position), described by two parallel arrays:
 | 0 | buffer handle from `tm_alloc_buffer` |
 | 1 | `i32` scalar, sign-extended into the low 32 bits |
 | 2 | `f32` scalar, as its bit pattern in the low 32 bits |
+| 3 | `i64` scalar, bound as `constant long &` |
+
+There is no `f64` kind and there will not be one: Metal has no `double` type at
+all (its front end says so — `'double' is not supported in Metal`), so an `f64`
+kernel argument is refused by name rather than narrowed to a float behind the
+kernel author's back.
 
 `tm_kernel_info` returns everything the caller needs to size a launch, so the
 Python shim never computes it:
@@ -1000,6 +1047,127 @@ What is left, in the order it should be tried:
 3. **`P` is computed twice** — once materialised for the row sum, once rebuilt
    inside the second dot's staging. One extra `exp2` per element per iteration.
 
+### Attention backward throughput
+
+The three backward kernels against the strongest composite MPS can express: five
+`MPSMatrixMultiplication`s with an `MPSMatrixSoftMax` and an
+`MPSMatrixSoftMaxGradient` between them, through **two** live `S x S` f32
+matrices. Both sides are credited with the same arithmetic — `5 * 2 * S^2 * D` per
+head, the five GEMMs the mathematics needs — although the fused side performs
+*seven*, because `Q K^T` is recomputed in each direction, plus a `Delta` pass over
+`O` and `dO`. Counting the mathematics rather than the instructions is the
+comparison that flatters the fused side least. Same timing methodology as the
+forward: dispatches packed into one command buffer until each sample is ~25ms of
+GPU work, median of three after a warm-up, best configuration per shape out of
+`tmbench --attn-bwd`.
+
+#### Apple M1 Max (lab-02)
+
+| shape | best config | fused | MPS composite | ratio |
+| --- | --- | --- | --- | --- |
+| `b1 h8 s512 d64` f32 | `32x32`, `num_warps=8` | **977 GF** | 515 GF | **190%** |
+| `b1 h8 s1024 d64` f32 | `32x32`, `num_warps=8` | 1054 GF | 1519 GF | 69% |
+| `b1 h16 s2048 d64` f32 | `32x32`, `num_warps=8` | 1172 GF | 2494 GF | 47% |
+| `b1 h8 s512 d64` f16 | `32x32`, `num_warps=8` | **1293 GF** | 588 GF | **220%** |
+| `b1 h8 s1024 d64` f16 | `32x32`, `num_warps=8` | 1419 GF | 1445 GF | 98% |
+
+#### Apple M1 Pro (laptop)
+
+| shape | best config | fused | MPS composite | ratio |
+| --- | --- | --- | --- | --- |
+| `b1 h8 s512 d64` f32 | `16x32`, `num_warps=8` | **523 GF** | 178 GF | **294%** |
+| `b1 h8 s1024 d64` f32 | `32x32`, `num_warps=8` | 592 GF | 1203 GF | 49% |
+| `b1 h8 s512 d64` f16 | `16x32`, `num_warps=8` | **648 GF** | 181 GF | **357%** |
+| `b1 h8 s1024 d64` f16 | `32x32`, `num_warps=8` | 725 GF | 1042 GF | 70% |
+
+**The crossover is earlier than the forward's**, and that is what the extra
+recomputation buys the composite. The forward crosses near `s1024` on an M1 Max
+(106% there); the backward is already at 69% by `s1024` and 47% at `s2048`. Two
+reasons, in the order they matter: the fused side runs seven GEMMs' worth of
+arithmetic against the composite's five, so at large `S` — where the composite's
+GEMMs reach MPS's own peak and the score-matrix traffic stops deciding — it is
+paying a 40% arithmetic premium for traffic that no longer costs anything. And
+the `dK`/`dV` kernel is the heaviest thing this emitter has lowered: four dots and
+two register-resident accumulators, at block shapes small enough to fit two
+`BLOCK_N x HEAD_DIM` tiles and an operand arena in 32KB.
+
+The composite's own readings move: the same f32 composite measured 1519 and
+1445 GF at `s1024` in two runs minutes apart on the M1 Max, so the `s1024` ratios
+are worth about ±5 points.
+
+Where a backward pass is actually used — `s512` and below, and f16 — the fusion is
+1.9x to 3.6x ahead, which is the same shape of answer the forward gives.
+
+## FlashAttention-2 backward
+
+The forward pass made the backend useful; the backward pass is what makes it able
+to **train**. It is recompute-based, in the shape of Triton's own tutorial: the
+forward stores one `BLOCK_M`-wide vector per query block — the per-row logsumexp
+in log2 units, `m_i + log2(l_i)` — and the backward rebuilds `P` from it with the
+same `exp2(qk_scale * Q.K - M_i)` the forward evaluated. The `S x S` score matrix
+never exists on either side.
+
+```
+dP_ij   = dO_i . V_j
+Delta_i = dO_i . O_i          = sum_j P_ij dP_ij
+dS_ij   = P_ij (dP_ij - Delta_i)
+dV_j    = sum_i P_ij dO_i
+dQ_i    = sm_scale * sum_j dS_ij K_j
+dK_j    = sm_scale * sum_i dS_ij Q_i
+```
+
+**Three kernels, and why.** `dQ_i` sums over key blocks while `dK_j` and `dV_j`
+sum over query blocks; no single program owns both ends. The two ways out are a
+`tt.atomic_rmw fadd` accumulation of `dQ` from the key-block program, or running
+the two directions as separate programs. This backend takes the second — the split
+two-pass formulation — and the argument that decides it is **determinism**: an
+atomic accumulation makes `dQ` depend on the order threadgroups reach each address
+(§Atomics), which is a poor default for a training loop. It also keeps each
+accumulator in simdgroup registers rather than turning it into a stream of
+read-modify-writes to device memory. The cost is that `Q K^T` is recomputed in
+both directions: seven dot-products' worth of arithmetic where the mathematics
+needs five.
+
+| kernel | grid | carries | dots per iteration |
+| --- | --- | --- | --- |
+| `attn_bwd_preprocess` | query blocks | — | none (one row reduction) |
+| `attn_bwd_dq` | query blocks | `dQ` (`BLOCK_M x HEAD_DIM`) | 3: `Q K^T`, `dO V^T`, `dS K` |
+| `attn_bwd_dkdv` | key blocks | `dK`, `dV` (`BLOCK_N x HEAD_DIM`) | 4: `K Q^T`, `P^T dO`, `V dO^T`, `dS^T Q` |
+
+**What the lowering needed that the forward did not.** Exactly one thing, and it
+is a generalisation of something the forward already had. A loop that puts an
+accumulator in simdgroup registers frees that accumulator's tile for the whole
+loop, and the emitter used to let only *that dot* stage into it, sizing the arena
+as the **sum** of every dot's operand tiles. Now every dot in the loop stages
+there and the arena is the largest single dot's footprint — sound for the same
+reason the kernel-wide shared arena is: a dot ends with a `threadgroup_barrier`
+after its arithmetic and the next one begins by staging, so two dots' operand
+tiles are never live at once. Summing overran Metal's 32KB at every block shape
+worth having. Double buffering still sums, because it needs each tile's two halves
+disjoint. A loop carrying two resident accumulators — `dK` and `dV` — lends the
+arena from the first of them only.
+
+Everything else the backward needs, the forward had already forced: three block
+axes, `tt.trans` as a relabelling, dots whose operands are other dots' result
+tiles, and loop-carried `tt.dot` accumulators. In the `dQ` kernel *nothing*
+between the first two dots and the third is materialised — the rescale, the
+exponential and the `dP - Delta` correction are all rebuilt inside the third dot's
+staging loops, reading the first two dots' result tiles where they sit.
+
+**One block shape does not fit.** `attn_bwd_dkdv` at `BLOCK_N = 32` and
+`HEAD_DIM = 64` needs more than 32KB at `num_warps = 1`: with one simdgroup the
+register blocking is chosen to hand that simdgroup many fragments, and every tile
+is then padded up to whole blocks of them. Two simdgroups is enough, and the
+refusal names the byte count. It is the same narrow-tile/blocking interaction
+§Where the remaining gap is lists for the GEMM.
+
+**Correctness.** Gradients are checked twice and independently: against an
+analytic CPU reference in `Double`, and against central **finite differences** of
+the forward pass, which knows nothing of the backward formulas. Tolerances are
+derived rather than tuned — `n * u * A`, where `n` is the length of the summation,
+`u` is `2^-24` (f32) or `2^-11` (the f16 dot operands), and `A` is the
+cancellation amplification computed from the reference itself.
+
 ## Hard parts, ranked
 
 1. ~~**`tl.dot`**, and the value model it needs.~~ Done — see §`tt.dot`. The
@@ -1029,17 +1197,22 @@ What is left, in the order it should be tried:
    later `tt.dot`'s staging loops have to read. See §Execution model and
    §Cross-lane regions.
 4. ~~**Atomics coverage**: Metal lacks some of CUDA's atomic dtypes (e.g. fp16
-   atomics).~~ Done for `f32` and `i32` — see §Atomics. The note was right about
-   the shape of the problem and wrong about which dtype bites: `f16` atomics are
-   indeed missing, but so are **64-bit** ones, and the gap that actually cost
-   code was float `max`/`min`, which CUDA has had since Kepler and Metal does not
-   have at all. Two things it did not anticipate: MSL has exactly one memory
-   order, so Triton's `sem`/`scope` are dropped rather than mapped; and an atomic
-   in a threadgroup-uniform nest needs the single-writer guard as a *correctness*
-   requirement rather than the optimisation it is for a store.
+   atomics).~~ Done for `f32` and `i32` — see §Atomics. Metal's coverage is
+   narrower than the dtype question suggests: no 16-bit *and* no 64-bit atomics,
+   no float `fetch_max`/`fetch_min` at all (CUDA has had those since Kepler), one
+   memory order, and no strong compare-exchange. Two of those shape the lowering
+   rather than just its refusals — Triton's `sem`/`scope` are dropped rather than
+   mapped, and an atomic in a threadgroup-uniform nest needs the single-writer
+   guard as a *correctness* requirement rather than the optimisation it is for a
+   store.
 5. **num_warps > actual concurrency**: occupancy model differs; autotune must
    re-learn its search space (feeds metalscope's roofline data back in here).
-6. **Occupancy of outer block dimensions**: only the innermost dimension is spread
+6. ~~**Equal block sizes.**~~ Done. The inference unifies axis *variables*, so
+   two axes of the same size are two axes; what collided was one `tt.make_range`
+   that Triton's CSE shares between a row index and a column index. The rewrite
+   that un-shares it belongs in front of the inference rather than inside it —
+   §Sharing one range between two axes.
+7. **Occupancy of outer block dimensions**: only the innermost dimension is spread
    across threads, so a `BLOCK_M x BLOCK_N` tile with a small `BLOCK_N` leaves most
    of the threadgroup idle. Half done: a `tt.dot`'s staging loops always spread
    over both tile dimensions, and *its* per-lane block loops now do too, which is
@@ -1048,7 +1221,7 @@ What is left, in the order it should be tried:
    contractually launched at the exact `threads_per_threadgroup` the two-dimensional
    split has to bake in, and because a `tt.reduce` folds across the whole
    threadgroup and so needs every thread in the same row.
-7. ~~**`tt.trans`**, which FlashAttention needs for `K^T`.~~ Done, and cheaper
+8. ~~**`tt.trans`**, which FlashAttention needs for `K^T`.~~ Done, and cheaper
    than even the `transpose_matrix` route this note proposed: a transpose is a
    relabelling of which block axis each dimension indexes, so `K^T`'s tile is
    staged over `(HEAD_DIM, BLOCK_N)` directly and **no code is emitted for the
@@ -1107,7 +1280,8 @@ What is left, in the order it should be tried:
    stores don't write out of bounds; the same kernel at `num_warps` 1..32.
 9. **C ABI** — the whole spine (emit -> compile -> load -> alloc -> write -> launch
    -> read -> release) through `tm_*` only, plus handle-validity, bounds and
-   leak checks.
+   leak checks; an `i64` scalar argument carried end to end with a value that does
+   not survive 32 bits; and `f64` refused by name rather than narrowed.
 
 10. **FlashAttention-2 forward** — the fused kernel against a CPU reference at
     five shapes (`h2 s127 d64`, `h1 s512 d64`, `h1 s96 d80`, `h3 s33 d64`,
@@ -1138,6 +1312,30 @@ What is left, in the order it should be tried:
     pointers and `fadd` on integer pointers. Every emitted atomic kernel is also
     put through Metal's own front end.
 
+12. **FlashAttention-2 backward** — the three kernels against an analytic CPU
+    reference in `Double` at eight shapes (`s127`, `s33`, `s50`, `d80`, `d20` and
+    two f16-in/f32-accumulate ones, so that neither the sequence length nor the
+    head dimension divides the block shape or the 8x8 fragment); against central
+    **finite differences** of the forward, which owe nothing to the backward
+    formulas, at twelve sampled coordinates of each of `dQ`, `dK` and `dV`; the
+    real forward's own logsumexp and output feeding the backward end to end; and
+    `num_warps` 1..8. Every tolerance is derived — `n * u * A` with `A` the
+    cancellation amplification computed from the reference — and reported with the
+    observed error when it fails. Plus assertions on what the lowering had to do:
+    every dot in the loop staging into the resident accumulator's arena, two
+    register-resident accumulators in the `dK`/`dV` loop with only the first
+    lending its storage, the probabilities recomputed from a logsumexp the forward
+    writes, and the one block-shape-and-warp combination that does not fit,
+    refused with its byte count.
+
+13. **Axis cloning** — the matmul tutorial *as Triton 3.7.1 prints it* when the
+    block sizes collide, on the GPU against a CPU reference at `(64, 64, 32)`,
+    `(32, 32, 16)`, `(64, 64, 64)` and `(32, 32, 32)`; that the shared
+    `tt.make_range` really is duplicated and the orphaned chain removed; that a
+    kernel which already lowers is never rewritten; and that the collapse the pass
+    cannot fix — a `tt.reduce` result placed at two dimensions — is still refused
+    by name.
+
 `MatmulBenchmark` is a further suite that stays off unless `TM_BENCH=1` is set: it
 measures a machine, not a contract. The measurement itself lives in the
 `TritonMetalBench` library and is shared with the **`tmbench`** executable
@@ -1151,9 +1349,12 @@ shapes before reporting them.
 
 `tmbench --attn` is the same measurement for attention, against the unfused MPS
 composite, and verifies its winners against a CPU reference before reporting them.
+`tmbench --attn-bwd` does the same for the backward pass, against five MPS GEMMs
+with a softmax and a softmax gradient between them, and checks `dQ`, `dK` and `dV`
+against a CPU reference before believing a timing.
 
 Next: port Triton's own backend conformance tests (`test_core.py` subset) against
-numpy references, and the FA-2 **backward** pass.
+numpy references, and `bf16`.
 
 ## Milestones
 
@@ -1173,7 +1374,7 @@ numpy references, and the FA-2 **backward** pass.
    simdgroup share one operand fragment, and vector staging runs. §Matmul
    throughput has the per-change attribution, what did *not* help on Apple silicon,
    and what is left.
-   `tt.atomic_*` and `tt.trans` still open.
+   `tt.trans` is done; `tt.atomic_*` landed with milestone 11.
 8. ~~Reductions inside an `scf.for`.~~ Done, for loop-carried scalars *and*
    tensors — the latter spilled to threadgroup tiles (§Cross-lane regions).
 9. ~~FlashAttention-2 forward.~~ Done — correct on the GPU against a CPU reference
@@ -1186,5 +1387,20 @@ numpy references, and the FA-2 **backward** pass.
    unfused MPS composite** at `b1 h8 s512 d64` and 107% at `s1024` on an M1 Max,
    falling to 68% at `s2048` where MPS's GEMMs reach their own peak
    (§Attention throughput).
-10. **Next up**: the FA-2 **backward** pass, `tt.atomic_*`, and pinning a Triton
-    release.
+10. ~~Pinning a Triton release.~~ Done — v3.7.1, built from source with this
+    repository as an out-of-tree plugin, driving the backend with real
+    `@triton.jit` source (§Compatibility).
+11. ~~`tt.atomic_*`.~~ Done for `f32` and `i32` device pointers, masked, with the
+    old value returned, and with the four gaps Metal actually has refused by name
+    rather than mis-lowered (§Atomics).
+12. ~~FlashAttention-2 **backward**.~~ Done — three kernels, recompute-based,
+    gradients verified against an analytic reference *and* against finite
+    differences, in f32 and f16-in/f32-accumulate, at sequence lengths and head
+    dimensions that divide neither the block shape nor the fragment. A real
+    `@triton.jit` attention layer trains through Triton 3.7.1 on the GPU
+    (`python/examples/attention_training.py`). Throughput is **190% of the MPS
+    composite** at `b1 h8 s512 d64` on an M1 Max, crossing over near `s1024`
+    (§Attention backward throughput).
+13. ~~Equal block sizes.~~ Done (§Sharing one range between two axes).
+14. **Next up**: `bf16`, a subset of Triton's own `test_core.py` against numpy
+    references, and re-measuring everything on silicon newer than M1.

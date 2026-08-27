@@ -1,6 +1,6 @@
 # triton-metal vs. Triton-on-CUDA: a measured comparison
 
-*2026-08-26 (two optimisation rounds, same day). Local numbers from tmbench on a
+*2026-08-27 (two optimisation rounds plus the backward pass). Local numbers from tmbench on a
 Mac Studio M1 Max (measured peaks 6.2 TF fp32 / 371.5 GB/s) and a MacBook M1 Pro
 (3.45 TF / 166.4 GB/s); CUDA numbers cited. The comparison is efficiency fractions
 against each platform's vendor library.*
@@ -99,6 +99,38 @@ score matrix starts fitting in cache. [ARCHITECTURE.md](ARCHITECTURE.md)
 §Attention throughput has the M1 Pro numbers, the run-to-run variance on the
 composite side, and a note that a better-written composite (metalscope measured
 ~744 GF for the same shape on an M1 Pro) would narrow the `s512` margin.
+
+## Attention backward: the same comparison, one step harder
+
+The backward pass is where a Triton backend stops being an inference target. The
+composite MPS can express for it is five `MPSMatrixMultiplication`s with an
+`MPSMatrixSoftMax` and an `MPSMatrixSoftMaxGradient` between them, through **two**
+live `S x S` f32 matrices — six passes over a score matrix the fused version never
+materialises. Both sides are credited with the same `5 * 2 * S^2 * D` per head,
+the five GEMMs the mathematics needs, although the fused side performs seven:
+`Q K^T` is recomputed in the `dQ` direction and again in the `dK`/`dV` one, which
+is the price of keeping every gradient deterministic and every accumulator in
+simdgroup registers.
+
+| shape | fused | MPS composite | ratio |
+| --- | --- | --- | --- |
+| `b1 h8 s512 d64` f32 | 977 GF | 515 GF | **190%** |
+| `b1 h8 s1024 d64` f32 | 1054 GF | 1519 GF | 69% |
+| `b1 h16 s2048 d64` f32 | 1172 GF | 2494 GF | 47% |
+| `b1 h8 s512 d64` f16 | 1293 GF | 588 GF | **220%** |
+| `b1 h8 s1024 d64` f16 | 1419 GF | 1445 GF | 98% |
+
+The crossover is earlier than the forward's — 69% at `s1024` where the forward is
+at 107% — and the 40% arithmetic premium is most of the reason. It is the same
+shape of result: fusion wins where the composite's dispatches and traffic dominate
+and loses where its GEMMs reach MPS's peak. `tl.atomic_add` for `dQ` would remove
+one of the two recomputations at the cost of a non-deterministic gradient; the
+atomics exist for it, the trade has not been measured, and the crossover is the
+number that would decide it.
+
+Also M1-generation, and the composite's own readings move: the same f32 composite
+measured 1519 and 1445 GF at `s1024` minutes apart, so those ratios are worth
+about ±5 points. `tmbench --attn-bwd` re-runs the whole thing in one command.
 
 ## Where it sits now
 
