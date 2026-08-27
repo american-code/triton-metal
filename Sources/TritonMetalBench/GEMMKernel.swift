@@ -17,8 +17,10 @@ public enum GEMMKernel {
     /// clip the ragged edges in all three dimensions. `inputPrecision` is spelled
     /// the way Triton 3.x prints it.
     ///
-    /// The f16 form loads half operands and accumulates in f32 — the shape that
-    /// matters for ML — and truncates on the way out.
+    /// The `f16` and `bf16` forms load 16-bit operands and accumulate in f32 —
+    /// the shape that matters for ML — and truncate on the way out. Metal has
+    /// `bfloat` and `simdgroup_matrix<bfloat, 8, 8>` in hardware on Apple
+    /// silicon, so bf16 is a real simdgroup matrix multiply, not a widen first.
     /// `seed` is the accumulator's initial value. Triton always writes `0.0`, and
     /// the emitter has a fast path for exactly that (the fragments start zero in
     /// registers instead of being staged through the tile); the parameter exists
@@ -27,11 +29,11 @@ public enum GEMMKernel {
         blockM: Int, blockN: Int, blockK: Int, element: String = "f32",
         seed: String = "0.000000e+00"
     ) -> String {
-        let isHalf = element == "f16"
-        let store = isHalf
+        let isNarrow = element == "f16" || element == "bf16"
+        let store = isNarrow
             ? """
                   %52 = arith.truncf %51 : tensor<\(blockM)x\(blockN)xf32> to \
-                tensor<\(blockM)x\(blockN)xf16>
+                tensor<\(blockM)x\(blockN)x\(element)>
             """
             : "      %52 = arith.mulf %51, %cone : tensor<\(blockM)x\(blockN)xf32>"
 

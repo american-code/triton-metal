@@ -691,13 +691,22 @@ public struct TritonIRParser {
                 loc)
         }
         for element in [lhsElement, resultElement] {
-            guard element == .float(width: 16) || element == .float(width: 32) else {
+            guard element == .float(width: 16) || element == .float(width: 32)
+                || element == .bfloat
+            else {
                 throw CoreError.unsupportedOp(
-                    "tt.dot on \(element) (Metal's simdgroup matrices are half or float)", loc)
+                    "tt.dot on \(element) (Metal's simdgroup matrices are half, bfloat or float)",
+                    loc)
             }
         }
-        guard resultElement != .float(width: 16) || lhsElement == .float(width: 16) else {
-            throw CoreError.lowering("tt.dot cannot accumulate f32 operands into an f16 result", loc)
+        // A 16-bit accumulator only makes sense for 16-bit operands of the same
+        // kind: Metal's `simdgroup_multiply_accumulate` takes one matrix type
+        // for the product and one for the accumulator, and widening in the
+        // other direction is what f32 accumulation already is.
+        guard !resultElement.isNarrowFloat || resultElement == lhsElement else {
+            throw CoreError.lowering(
+                "tt.dot cannot accumulate \(lhsElement) operands into a \(resultElement) result",
+                loc)
         }
 
         return DotOp(
@@ -982,7 +991,15 @@ public struct TritonIRParser {
             return .constant(result: result, type: .integer(width: 1), value: value)
         }
         let type = try parseType()
-        if case .float(let width) = type.scalarized {
+        if type.scalarized == .bfloat {
+            if let bits = bitPattern {
+                // A bf16 bit pattern is the top half of the f32 one.
+                value = .float(
+                    Double(Float(bitPattern: UInt32(truncatingIfNeeded: bits) << 16)))
+            } else if case .integer(let i) = value {
+                value = .float(Double(i))
+            }
+        } else if case .float(let width) = type.scalarized {
             if let bits = bitPattern {
                 // MLIR spells non-finite floats as raw bit patterns.
                 value = .float(
@@ -1125,6 +1142,8 @@ public struct TritonIRParser {
             }
             return .integer(width: width)
         }
+        // Before the `f<width>` rule, because `bf16` also ends in a number.
+        if name == "bf16" { return .bfloat }
         if name.hasPrefix("f"), let width = Int(name.dropFirst()) {
             guard [16, 32].contains(width) else {
                 throw CoreError.unsupportedType(

@@ -17,12 +17,15 @@ from . import _core
 
 #: Element sizes for the dtype names Triton canonicalizes to (`fp32`, `i32`, ...).
 _ITEMSIZE = {
-    "float16": 2, "float32": 4, "int8": 1, "int16": 2, "int32": 4, "int64": 8,
-    "uint8": 1, "uint16": 2, "uint32": 4, "uint64": 8,
+    "float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int16": 2, "int32": 4,
+    "int64": 8, "uint8": 1, "uint16": 2, "uint32": 4, "uint64": 8,
 }
 
+# `float16` and `bfloat16` are handed out as raw 16-bit words: ctypes has
+# neither, and the shim only ever moves the bytes (`numpy()` reinterprets them).
 _CTYPE = {
-    "float16": ctypes.c_uint16, "float32": ctypes.c_float, "int8": ctypes.c_int8,
+    "float16": ctypes.c_uint16, "bfloat16": ctypes.c_uint16,
+    "float32": ctypes.c_float, "int8": ctypes.c_int8,
     "int16": ctypes.c_int16, "int32": ctypes.c_int32, "int64": ctypes.c_int64,
     "uint8": ctypes.c_uint8, "uint16": ctypes.c_uint16, "uint32": ctypes.c_uint32,
     "uint64": ctypes.c_uint64,

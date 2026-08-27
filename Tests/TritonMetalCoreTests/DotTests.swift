@@ -505,6 +505,81 @@ final class DotTests: XCTestCase {
             tolerance: 5e-3, "f16 \(m)x\(n)x\(k)")
     }
 
+    /// bf16 operands accumulating in f32 — the dtype ML training actually uses,
+    /// and the one Triton treats as table stakes on CUDA.
+    ///
+    /// Metal has `bfloat` (MSL 3.1) and `simdgroup_matrix<bfloat, 8, 8>` in
+    /// hardware on Apple silicon, so this is a real simdgroup matrix multiply
+    /// rather than a widen-to-float-and-multiply.
+    func testBFloat16OperandsAccumulateInFloat() throws {
+        try skipWithoutMetal()
+        let source = try MetalCompiler.emitMSL(
+            ttir: DotFixtures.tutorial(blockM: 32, blockN: 32, blockK: 32, element: "bf16"),
+            options: .init())
+        XCTAssertTrue(source.contains("device bfloat *varg0"), source)
+        XCTAssertTrue(
+            source.contains("threadgroup bfloat *tm_dot_a1 = (threadgroup bfloat *)(tm_dot_c0);"),
+            source)
+        XCTAssertTrue(
+            source.contains(
+                "simdgroup_matrix<bfloat, 8, 8> tm_a0_0_0, tm_a0_0_1, tm_b0_0_0;"), source)
+        // The accumulator is still f32: bf16 in, f32 across the contraction,
+        // bf16 out.
+        XCTAssertTrue(
+            source.contains(
+                "simdgroup_float8x8 tm_dot_c0_r_0_0_0 = "
+                    + "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"), source)
+
+        // Against an f32 CPU reference computed from the *rounded* inputs, so
+        // the only error being measured is the accumulation, not the input
+        // rounding. bf16 keeps 8 mantissa bits, hence the 2^-8 tolerance.
+        let (m, n, k) = (70, 66, 34)
+        let a = (0..<(m * k)).map { Float($0 % 11) * 0.125 - 0.5 }
+        let b = (0..<(k * n)).map { Float($0 % 7) * 0.25 - 0.75 }
+        let run = try GPU.run(
+            ir: DotFixtures.tutorial(blockM: 32, blockN: 32, blockK: 32, element: "bf16"),
+            grid: (GPU.cdiv(m, 32), GPU.cdiv(n, 32), 1),
+            args: [
+                .bfloats(a), .bfloats(b), .output(count: m * n, stride: 2),
+                .int32(Int32(m)), .int32(Int32(n)), .int32(Int32(k)),
+                .int32(Int32(k)), .int32(1), .int32(Int32(n)), .int32(1),
+                .int32(Int32(n)), .int32(1),
+            ])
+        let rounded: ([Float]) -> [Float] = { $0.map { BFloat16.decode(BFloat16.encode($0)) } }
+        let expected = reference(
+            rounded(a), rounded(b), m: m, n: n, k: k, lda: k, ldb: n)
+        assertClose(
+            GPU.read(run.outputs[0], UInt16.self, m * n).map(BFloat16.decode), expected,
+            tolerance: 1.0 / 256, "bf16 \(m)x\(n)x\(k)")
+    }
+
+    /// bf16 is not f16, and the emitter must not let one stand in for the other:
+    /// they are the same width, so neither `truncf` nor `extf` connects them and
+    /// a dot cannot accumulate one into the other.
+    func testBFloat16IsNotInterchangeableWithFloat16() throws {
+        XCTAssertEqual(try MSLEmitter.metalTypeName(.bfloat), "bfloat")
+        XCTAssertEqual(try MSLEmitter.metalTypeName(.float(width: 16)), "half")
+        XCTAssertNotEqual(TMType.bfloat, TMType.float(width: 16))
+        XCTAssertEqual(TMType.bfloat.scalarByteWidth, 2)
+        XCTAssertEqual("\(TMType.bfloat)", "bf16")
+
+        let ir = """
+            module {
+              tt.func public @k(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<f16>) {
+                %0 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<8x!tt.ptr<bf16>>
+                %1 = tt.load %0 : tensor<8xbf16>
+                %2 = arith.extf %1 : tensor<8xbf16> to tensor<8xf16>
+                %3 = tt.splat %arg1 : !tt.ptr<f16> -> tensor<8x!tt.ptr<f16>>
+                tt.store %3, %2 : tensor<8x!tt.ptr<f16>>
+                tt.return
+              }
+            }
+            """
+        XCTAssertThrowsError(try MetalCompiler.emitMSL(ttir: ir, options: .init())) {
+            XCTAssertTrue("\($0)".contains("must widen"), "\($0)")
+        }
+    }
+
     /// Reductions fold within a simdgroup, so a dot kernel must still be correct
     /// at every threadgroup size the backend will report.
     func testMatmulAtEveryNumWarps() throws {
@@ -663,7 +738,7 @@ final class DotTests: XCTestCase {
                     %b = arith.constant dense<1> : tensor<8x16xi32>
                     %c = arith.constant dense<0> : tensor<16x16xi32>
                     %d = tt.dot %a, %b, %c : tensor<16x8xi32> * tensor<8x16xi32> -> tensor<16x16xi32>
-                """), contains: "Metal's simdgroup matrices are half or float")
+                """), contains: "Metal's simdgroup matrices are half, bfloat or float")
     }
 
     func testDotInsideAnIfIsRejectedWithItsReason() {

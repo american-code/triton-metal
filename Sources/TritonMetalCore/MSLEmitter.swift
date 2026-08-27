@@ -429,9 +429,12 @@ private struct AccumulatorRegisters {
     /// A zero-filled fragment, for an accumulator seeded with `dense<0.0>` — it
     /// never has to exist in threadgroup memory at all.
     var zeroFragment: String {
-        matrix == "simdgroup_half8x8"
-            ? "make_filled_simdgroup_matrix<half, 8, 8>(0.0h)"
-            : "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
+        switch matrix {
+        case "simdgroup_half8x8": return "make_filled_simdgroup_matrix<half, 8, 8>(0.0h)"
+        case "simdgroup_matrix<bfloat, 8, 8>":
+            return "make_filled_simdgroup_matrix<bfloat, 8, 8>(bfloat(0.0f))"
+        default: return "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
+        }
     }
     func live(_ wave: Int) -> String { "\(prefix)_live\(wave)" }
     func register(_ wave: Int, _ row: Int, _ column: Int) -> String {
@@ -667,7 +670,7 @@ private struct FunctionEmitter {
                         + "[[buffer(\(argument.index))]]")
                 arguments.append(
                     KernelArgument(index: argument.index, kind: .pointer, dtype: "\(pointee)"))
-            case .integer, .float:
+            case .integer, .float, .bfloat:
                 parameters.append(
                     "constant \(try scalarTypeName(argument.type, argument.loc)) &\(name) "
                         + "[[buffer(\(argument.index))]]")
@@ -1096,6 +1099,11 @@ private struct FunctionEmitter {
             default: throw CoreError.unsupportedType(
                 "f\(width) (Metal has no double; f64 is not a Metal type)", loc)
             }
+        // MSL 3.1 and later. Apple silicon has it in hardware, including
+        // `simdgroup_matrix<bfloat, 8, 8>`, so a bf16 `tt.dot` is a real
+        // simdgroup matrix multiply rather than a widen-and-multiply.
+        case .bfloat:
+            return "bfloat"
         case .pointer(let pointee):
             return "device \(try scalarTypeName(pointee, loc)) *"
         case .tensor:
@@ -1112,6 +1120,19 @@ private struct FunctionEmitter {
             return "device \(try scalarTypeName(pointee, loc)) *\(name)"
         }
         return "\(try scalarTypeName(element, loc)) \(name)"
+    }
+
+    /// Widens a bf16 operand to `float` for a call MSL has no `bfloat` overload
+    /// of; every other type passes through untouched.
+    private func promote(_ value: String, _ type: TMType) -> String {
+        type.scalarized == .bfloat ? "float(\(value))" : value
+    }
+
+    /// Narrows a `float`-returning call back to `type` when that type is bf16 —
+    /// MSL will not implicitly convert `float` to `bfloat`. Only for calls:
+    /// `bfloat + bfloat` is already a `bfloat`.
+    private func narrow(_ expression: String, to type: TMType) -> String {
+        type.scalarized == .bfloat ? "bfloat(\(expression))" : expression
     }
 
     private func unsignedName(_ type: TMType, _ loc: SourceLoc) throws -> String {
@@ -1318,8 +1339,13 @@ private struct FunctionEmitter {
             case .sub: expression = "\(l) - \(r)"
             case .mul: expression = "\(l) * \(r)"
             case .div: expression = "\(l) / \(r)"
-            case .maximum: expression = "max(\(l), \(r))"
-            case .minimum: expression = "min(\(l), \(r))"
+            // MSL has no `max(bfloat, bfloat)` — the call is ambiguous between
+            // the float and integer overloads — so bf16 goes through float and
+            // comes back, which is what the hardware does anyway.
+            case .maximum:
+                expression = narrow("max(\(promote(l, type)), \(promote(r, type)))", to: type)
+            case .minimum:
+                expression = narrow("min(\(promote(l, type)), \(promote(r, type)))", to: type)
             }
             try define(result, type: type, expression: expression, operands: [lhs, rhs], loc: loc)
 
@@ -1369,9 +1395,14 @@ private struct FunctionEmitter {
         case .unary(let result, let op, let source):
             let sourceType = try type(of: source, loc)
             let function = try FunctionEmitter.mathFunction(op, sourceType, loc)
+            // Metal's math library has no `bfloat` overloads: every one of these
+            // takes and returns `float`, so a bf16 value is widened into the
+            // call and narrowed back out of it. That is not a loss of precision
+            // over the alternative — there is no bf16 transcendental unit.
+            let expression = narrow(
+                "\(function)(\(promote(try name(of: source, loc), sourceType)))", to: sourceType)
             try define(
-                result, type: sourceType,
-                expression: "\(function)(\(try name(of: source, loc)))", operands: [source], loc: loc)
+                result, type: sourceType, expression: expression, operands: [source], loc: loc)
 
         case .select(let result, let condition, let whenTrue, let whenFalse):
             let valueType = try binaryOperandType(whenTrue, whenFalse, "arith.select", loc)
@@ -1568,15 +1599,22 @@ private struct FunctionEmitter {
             }
         }
         func requireFloatWidths(widen: Bool) throws {
-            guard case .float(let a) = from, case .float(let b) = to else {
+            guard from.isFloatLike, to.isFloatLike else {
                 throw CoreError.lowering(
                     "arith.\(op.rawValue) expects float operands, found \(sourceType) to "
                         + "\(resultType)", loc)
             }
+            // `bf16` and `f16` are the same width and neither is a widening of
+            // the other, so a conversion between them is neither a `truncf` nor
+            // an `extf` — Triton emits `arith.bitcast`-free pairs through f32
+            // instead, and refusing the direct form keeps the two 16-bit types
+            // from being silently interchanged.
+            let a = from.scalarByteWidth ?? 0
+            let b = to.scalarByteWidth ?? 0
             guard widen ? b > a : b < a else {
                 throw CoreError.lowering(
-                    "arith.\(op.rawValue) must \(widen ? "widen" : "narrow"), found f\(a) to f\(b)",
-                    loc)
+                    "arith.\(op.rawValue) must \(widen ? "widen" : "narrow"), found \(from) to "
+                        + "\(to)", loc)
             }
         }
 
@@ -2025,11 +2063,13 @@ private struct FunctionEmitter {
         switch (op, element) {
         case (.add, .float(let width)):
             return width == 16 ? "0.0h" : "0.0f"
+        case (.add, .bfloat):
+            return "bfloat(0.0f)"
         case (.add, _):
             return "0"
-        case (.max, .float):
+        case (.max, .float), (.max, .bfloat):
             return "-INFINITY"
-        case (.min, .float):
+        case (.min, .float), (.min, .bfloat):
             return "INFINITY"
         case (.max, .integer(let width)):
             return width == 1 ? "false" : FunctionEmitter.integerBounds[width]?.min ?? "0"
@@ -2755,14 +2795,22 @@ private struct FunctionEmitter {
                 loc)
         }
         for element in [lhsElement, resultElement] {
-            guard element == .float(width: 16) || element == .float(width: 32) else {
+            guard element == .float(width: 16) || element == .float(width: 32)
+                || element == .bfloat
+            else {
                 throw CoreError.unsupportedOp(
-                    "tt.dot on \(element) (Metal's simdgroup matrices are half or float)", loc)
+                    "tt.dot on \(element) (Metal's simdgroup matrices are half, bfloat or float)",
+                    loc)
             }
         }
-        guard resultElement != .float(width: 16) || lhsElement == .float(width: 16) else {
+        // A 16-bit accumulator only makes sense for 16-bit operands of the same
+        // kind: Metal's `simdgroup_multiply_accumulate` takes one matrix type
+        // for the product and one for the accumulator, and widening in the
+        // other direction is what f32 accumulation already is.
+        guard !resultElement.isNarrowFloat || resultElement == lhsElement else {
             throw CoreError.lowering(
-                "tt.dot cannot accumulate f32 operands into an f16 result", loc)
+                "tt.dot cannot accumulate \(lhsElement) operands into a \(resultElement) result",
+                loc)
         }
         // A deferred accumulator (the usual `dense<0.0>` seed) has no type here
         // yet — it is rebuilt inside the staging loops below.
@@ -3011,11 +3059,24 @@ private struct FunctionEmitter {
         return slots
     }
 
+    /// The MSL simdgroup matrix type for a tile element.
+    ///
+    /// `simdgroup_float8x8` and `simdgroup_half8x8` are the two spelled-out
+    /// aliases MSL provides; `bfloat` has no alias and is written out as the
+    /// template it is (MSL 3.1 and later).
+    static func simdgroupMatrix(_ element: TMType) -> String {
+        switch element {
+        case .float(width: 16): return "simdgroup_half8x8"
+        case .bfloat: return "simdgroup_matrix<bfloat, 8, 8>"
+        default: return "simdgroup_float8x8"
+        }
+    }
+
     private func registers(_ index: Int, for tile: Tile, element: TMType) -> AccumulatorRegisters {
         let blocking = self.blocking(rows: tile.rows, columns: tile.columns)
         return AccumulatorRegisters(
             tile: tile, blocking: blocking,
-            matrix: element == .float(width: 16) ? "simdgroup_half8x8" : "simdgroup_float8x8",
+            matrix: FunctionEmitter.simdgroupMatrix(element),
             prefix: "tm_acc\(index)",
             sharedColumns: FunctionEmitter.sharesColumns(blocking))
     }
@@ -3327,8 +3388,7 @@ private struct FunctionEmitter {
         let size = FunctionEmitter.fragment
         let steps = lhs.paddedColumns / size
         let blocking = registers.blocking
-        let operandMatrix =
-            lhs.element == .float(width: 16) ? "simdgroup_half8x8" : "simdgroup_float8x8"
+        let operandMatrix = FunctionEmitter.simdgroupMatrix(lhs.element)
         let step = "tm_step\(index)"
 
         var body: [Stmt] = []
@@ -3806,8 +3866,7 @@ private struct FunctionEmitter {
                 usesSimdgroups = true
                 let registers = AccumulatorRegisters(
                     tile: tile, blocking: blocking,
-                    matrix: element == .float(width: 16)
-                        ? "simdgroup_half8x8" : "simdgroup_float8x8",
+                    matrix: FunctionEmitter.simdgroupMatrix(element),
                     prefix: "\(tile.name)_r",
                     sharedColumns: FunctionEmitter.sharesColumns(blocking))
                 if !zeroed {
@@ -4327,6 +4386,11 @@ private struct FunctionEmitter {
             return floatLiteral(Double(v), width: width)
         case (.float(let v), .float(let width)):
             return floatLiteral(v, width: width)
+        // MSL has no bfloat literal suffix; a float literal converts.
+        case (.integer(let v), .bfloat):
+            return "bfloat(\(floatLiteral(Double(v), width: 32)))"
+        case (.float(let v), .bfloat):
+            return "bfloat(\(floatLiteral(v, width: 32)))"
         case (.float(let v), .integer):
             return "\(Int64(v))"
         default:

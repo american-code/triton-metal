@@ -8,6 +8,10 @@ public indirect enum TMType: Equatable, Sendable, CustomStringConvertible {
     case integer(width: Int)
     /// `f16`, `f32`
     case float(width: Int)
+    /// `bf16` — the same 8-bit exponent as `f32` with 7 mantissa bits, which is
+    /// why ML training uses it and why it is not `f16`. Metal spells it
+    /// `bfloat` (MSL 3.1 and later) and has `simdgroup_matrix<bfloat, 8, 8>`.
+    case bfloat
     /// `!tt.ptr<T>` — always a device-address-space pointer in Metal.
     case pointer(TMType)
     /// `tensor<D0x...xDNxT>` — rank >= 1, one entry per dimension.
@@ -17,6 +21,7 @@ public indirect enum TMType: Equatable, Sendable, CustomStringConvertible {
         switch self {
         case .integer(let w): return "i\(w)"
         case .float(let w): return "f\(w)"
+        case .bfloat: return "bf16"
         case .pointer(let p): return "!tt.ptr<\(p)>"
         case .tensor(let s, let e): return "tensor<\(s.map(String.init).joined(separator: "x"))x\(e)>"
         }
@@ -57,8 +62,20 @@ public indirect enum TMType: Equatable, Sendable, CustomStringConvertible {
     }
 
     public var isFloatLike: Bool {
-        if case .float = scalarized { return true }
-        return false
+        switch scalarized {
+        case .float, .bfloat: return true
+        default: return false
+        }
+    }
+
+    /// True for the two 16-bit float types, which share every rule that is about
+    /// width rather than about precision.
+    public var isNarrowFloat: Bool {
+        switch scalarized {
+        case .float(let w): return w == 16
+        case .bfloat: return true
+        default: return false
+        }
     }
 
     /// Size in bytes of the scalar element (used for buffer math and `setBytes`).
@@ -66,6 +83,7 @@ public indirect enum TMType: Equatable, Sendable, CustomStringConvertible {
         switch scalarized {
         case .integer(let w): return w == 1 ? 1 : w / 8
         case .float(let w): return w / 8
+        case .bfloat: return 2
         case .pointer: return 8
         case .tensor: return nil
         }

@@ -3,10 +3,27 @@ import XCTest
 
 @testable import TritonMetalCore
 
+/// bf16 on the host. Swift has no `BFloat16` and this side only has to move
+/// bytes: a bf16 is the top 16 bits of the f32 with the same value, rounded to
+/// nearest even, which is exactly why bf16 and f32 interconvert for free on the
+/// GPU as well.
+enum BFloat16 {
+    static func encode(_ value: Float) -> UInt16 {
+        if value.isNaN { return 0x7FC0 }
+        let bits = value.bitPattern
+        let rounding: UInt32 = ((bits >> 16) & 1) &+ 0x7FFF
+        return UInt16(truncatingIfNeeded: (bits &+ rounding) >> 16)
+    }
+
+    static func decode(_ bits: UInt16) -> Float { Float(bitPattern: UInt32(bits) << 16) }
+}
+
 /// One host-side kernel argument.
 enum HostArg {
     case floats([Float])
     case halves([Float16])
+    /// bf16 values given as `Float`; encoded on the way to the buffer.
+    case bfloats([Float])
     case ints([Int32])
     case shorts([Int16])
     /// An output buffer of `count` elements of `stride` bytes, zero-filled.
@@ -51,6 +68,7 @@ enum GPU {
             switch arg {
             case .floats(let values): buffer = try upload(values)
             case .halves(let values): buffer = try upload(values)
+            case .bfloats(let values): buffer = try upload(values.map(BFloat16.encode))
             case .ints(let values): buffer = try upload(values)
             case .shorts(let values): buffer = try upload(values)
             case .output(let count, let stride):

@@ -14,6 +14,79 @@ final class CastMathTests: XCTestCase {
 
     private let count = 200  // 3.125 blocks of 64 — the tail block is masked
 
+    // MARK: - bf16
+
+    /// bf16 arithmetic, `math.*`, a reduction and both conversions to and from
+    /// f32, in one kernel.
+    ///
+    /// Metal has `bfloat` as a storage and arithmetic type but *no* `bfloat`
+    /// overloads in its math library and no unambiguous `max(bfloat, bfloat)`,
+    /// so the emitter widens into those calls and narrows back out — which is
+    /// what the hardware does anyway, there being no bf16 transcendental unit.
+    /// This checks that the widening is where it has to be and nowhere else.
+    func testBFloat16ElementwiseAndReduction() throws {
+        let ir = """
+            module {
+              tt.func public @bf(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<bf16>,
+                                 %arg2: !tt.ptr<f32>, %arg3: i32) {
+                %c64 = arith.constant 64 : i32
+                %half = arith.constant dense<5.000000e-01> : tensor<64xbf16>
+                %0 = tt.get_program_id x : i32
+                %1 = arith.muli %0, %c64 : i32
+                %2 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+                %3 = tt.splat %1 : i32 -> tensor<64xi32>
+                %4 = arith.addi %3, %2 : tensor<64xi32>
+                %5 = tt.splat %arg3 : i32 -> tensor<64xi32>
+                %6 = arith.cmpi slt, %4, %5 : tensor<64xi32>
+                %7 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+                %8 = tt.addptr %7, %4 : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+                %9 = tt.load %8, %6 : tensor<64xbf16>
+                %10 = arith.mulf %9, %9 : tensor<64xbf16>
+                %11 = arith.maximumf %10, %half : tensor<64xbf16>
+                %12 = math.sqrt %11 : tensor<64xbf16>
+                %13 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+                %14 = tt.addptr %13, %4 : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+                tt.store %14, %12, %6 : tensor<64x!tt.ptr<bf16>>
+                %15 = arith.extf %12 : tensor<64xbf16> to tensor<64xf32>
+                %16 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+                %17 = tt.addptr %16, %4 : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+                tt.store %17, %15, %6 : tensor<64x!tt.ptr<f32>>
+                tt.return
+              }
+            }
+            """
+        let source = try MetalCompiler.emitMSL(ttir: ir, options: .init())
+        XCTAssertTrue(source.contains("device bfloat *varg0"), source)
+        // Plain arithmetic stays in bfloat; only the calls widen.
+        XCTAssertTrue(source.contains("bfloat v10 = v9 * v9;"), source)
+        XCTAssertTrue(
+            source.contains("bfloat v11 = bfloat(max(float(v10), float(vhalf)));"), source)
+        XCTAssertTrue(
+            source.contains("bfloat v12 = bfloat(precise::sqrt(float(v11)));"), source)
+        XCTAssertTrue(source.contains("float v15 = float(v12);"), source)
+
+        let input = ramp(count, in: -4...4)
+        let result = try GPU.run(
+            ir: ir, grid: (GPU.cdiv(count, 64), 1, 1),
+            args: [
+                .bfloats(input), .output(count: count, stride: 2), .output(count: count),
+                .int32(Int32(count)),
+            ])
+        // The reference rounds at every step the GPU does: bf16 in, bf16 after
+        // the square, bf16 after the max, bf16 after the sqrt.
+        func bf(_ value: Float) -> Float { BFloat16.decode(BFloat16.encode(value)) }
+        let expected = input.map { value -> Float in
+            let x = bf(value)
+            return bf(sqrt(bf(max(bf(x * x), bf(0.5)))))
+        }
+        assertClose(
+            GPU.read(result.outputs[0], UInt16.self, count).map(BFloat16.decode), expected,
+            tolerance: 0, "bf16 round trip")
+        // ...and `extf` to f32 is exact, because every bf16 is an f32.
+        assertClose(
+            GPU.read(result.outputs[1], Float.self, count), expected, tolerance: 0, "bf16 -> f32")
+    }
+
     // MARK: - math.*
 
     /// One kernel per op, so a failure names the function that drifted.

@@ -308,6 +308,46 @@ def test_metal_buffer_rejects_a_dtype_the_emitter_has_no_type_for():
         MetalBuffer(4, "float64")
 
 
+def test_bfloat16_lowers_and_allocates():
+    """bf16 end to end through the shim: the type reaches the emitter as Metal's
+    `bfloat`, the launch metadata names it, and a buffer of it is two bytes an
+    element. The arithmetic itself is covered in the Swift suite."""
+    ir = """
+    module {
+      tt.func public @bf_kernel(%arg0: !tt.ptr<bf16>, %arg1: !tt.ptr<bf16>, %arg2: i32) {
+        %c64 = arith.constant 64 : i32
+        %0 = tt.get_program_id x : i32
+        %1 = arith.muli %0, %c64 : i32
+        %2 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+        %3 = tt.splat %1 : i32 -> tensor<64xi32>
+        %4 = arith.addi %3, %2 : tensor<64xi32>
+        %5 = tt.splat %arg2 : i32 -> tensor<64xi32>
+        %6 = arith.cmpi slt, %4, %5 : tensor<64xi32>
+        %7 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+        %8 = tt.addptr %7, %4 : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+        %9 = tt.load %8, %6 : tensor<64xbf16>
+        %10 = arith.addf %9, %9 : tensor<64xbf16>
+        %11 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+        %12 = tt.addptr %11, %4 : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+        tt.store %12, %10, %6 : tensor<64x!tt.ptr<bf16>>
+        tt.return
+      }
+    }
+    """
+    source = _core.emit_msl(ir, 4)
+    assert "device bfloat *varg0 [[buffer(0)]]" in source
+
+    kernel = json.loads(_core.kernel_info(ir, 4))["kernels"][0]
+    assert [a["dtype"] for a in kernel["args"]] == ["bf16", "bf16", "i32"]
+
+    buffer = MetalBuffer(8, "bfloat16")
+    try:
+        assert buffer.itemsize == 2
+        assert buffer.nbytes == 16
+    finally:
+        buffer.free()
+
+
 def test_invalid_handles_raise_with_the_core_message():
     with pytest.raises(RuntimeError, match="is not live"):
         _core.load_kernel(999_999, "add_kernel")
