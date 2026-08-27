@@ -116,6 +116,30 @@ public enum ReduceOp: String, Sendable {
     case add, max, min
 }
 
+/// `tt.atomic_rmw`'s kind attribute, spelled as Triton prints it
+/// (`TT_AtomicRMWAttr` in TritonAttrDefs.td — note `XCHG` prints as `exch`).
+public enum AtomicRMWOp: String, Sendable, CaseIterable {
+    case and, or, xor, add, fadd, max, min, umax, umin, exch
+
+    static var allSpellings: String {
+        allCases.map(\.rawValue).joined(separator: ", ")
+    }
+}
+
+/// `tt.atomic_rmw`'s memory-semantics and sync-scope attributes.
+///
+/// Both are parsed and **ignored**: MSL exposes exactly one memory order for
+/// device atomics (`memory_order_relaxed`; `memory_order_acq_rel` is not even a
+/// declared identifier in Metal 3), and one scope. They are kept on the op so
+/// diagnostics can name what was asked for.
+public enum AtomicSemantic: String, Sendable {
+    case relaxed, acquire, release, acq_rel
+}
+
+public enum AtomicScope: String, Sendable {
+    case cta, gpu, sys
+}
+
 public enum ConstantValue: Equatable, Sendable {
     case integer(Int64)
     case float(Double)
@@ -149,6 +173,11 @@ public enum OpKind: Sendable {
     case dot(DotOp)
     case load(result: String, pointer: String, mask: String?, other: String?)
     case store(pointer: String, value: String, mask: String?)
+    /// `tt.atomic_rmw <op>, <sem>, <scope>, %ptr, %val[, %mask]` — reads,
+    /// modifies and writes back one device location, returning the **old** value.
+    case atomicRMW(AtomicRMW)
+    /// `tt.atomic_cas <sem>, <scope>, %ptr, %cmp, %val` — returns the old value.
+    case atomicCAS(AtomicCAS)
     case forLoop(ForLoop)
     case ifOp(IfOp)
     case yield(values: [String])
@@ -169,6 +198,35 @@ public struct DotOp: Sendable {
     public var lhsType: TMType
     public var rhsType: TMType
     public var resultType: TMType
+}
+
+/// `%old = tt.atomic_rmw fadd, acq_rel, gpu, %ptr, %val, %mask : (...) -> ...`
+///
+/// One device read-modify-write per block point, returning the value that was
+/// there before. Every operand has the pointer's shape; `mask` is the `i1` tensor
+/// Triton builds from the same bounds test a `tt.store` would use, and a lane
+/// whose mask is false performs no access at all and reads back zero.
+public struct AtomicRMW: Sendable {
+    public var result: String
+    public var op: AtomicRMWOp
+    public var pointer: String
+    public var value: String
+    public var mask: String?
+    /// Parsed and ignored — see `AtomicSemantic`.
+    public var semantic: AtomicSemantic
+    public var scope: AtomicScope
+}
+
+/// `%old = tt.atomic_cas acq_rel, gpu, %ptr, %cmp, %val : (...) -> ...`
+///
+/// Unmasked in Triton's own op definition: `tt.atomic_cas` takes no mask.
+public struct AtomicCAS: Sendable {
+    public var result: String
+    public var pointer: String
+    public var compare: String
+    public var value: String
+    public var semantic: AtomicSemantic
+    public var scope: AtomicScope
 }
 
 /// `scf.for %iv = %lb to %ub step %st iter_args(%a = %init) -> (T) { ... }`
@@ -218,6 +276,10 @@ extension OpKind {
             return [pointer, mask, other].compactMap { $0 }
         case .store(let pointer, let value, let mask):
             return [pointer, value, mask].compactMap { $0 }
+        case .atomicRMW(let atomic):
+            return [atomic.pointer, atomic.value, atomic.mask].compactMap { $0 }
+        case .atomicCAS(let atomic):
+            return [atomic.pointer, atomic.compare, atomic.value]
         case .yield(let values):
             return values
         case .forLoop(let loop):
@@ -240,6 +302,10 @@ extension OpKind {
             return [r]
         case .dot(let dot):
             return [dot.result]
+        case .atomicRMW(let atomic):
+            return [atomic.result]
+        case .atomicCAS(let atomic):
+            return [atomic.result]
         case .forLoop(let loop):
             return loop.results + [loop.inductionVariable] + loop.iterArguments.map(\.name)
         case .ifOp(let branch):

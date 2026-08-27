@@ -404,6 +404,51 @@ public struct TritonIRParser {
             return .store(
                 pointer: operands[0], value: operands[1], mask: operands.count > 2 ? operands[2] : nil)
 
+        case "tt.atomic_rmw":
+            let result = try single(results, mnemonic, loc)
+            let kindText = try expectIdent().text
+            guard let kind = AtomicRMWOp(rawValue: kindText) else {
+                throw CoreError.parse(
+                    "unknown tt.atomic_rmw kind '\(kindText)'; Triton spells them "
+                        + AtomicRMWOp.allSpellings, loc)
+            }
+            try expect(punct: ",")
+            let semantic = try parseAtomicSemantic(loc)
+            try expect(punct: ",")
+            let scope = try parseAtomicScope(loc)
+            try expect(punct: ",")
+            let operands = try parseOperandList()
+            skipAttrDictIfPresent()
+            _ = try parseOptionalTrailingTypes()
+            guard (2...3).contains(operands.count) else {
+                throw CoreError.parse(
+                    "tt.atomic_rmw takes 2-3 operands (ptr, val[, mask]), found \(operands.count)",
+                    loc)
+            }
+            return .atomicRMW(
+                AtomicRMW(
+                    result: result, op: kind, pointer: operands[0], value: operands[1],
+                    mask: operands.count > 2 ? operands[2] : nil, semantic: semantic, scope: scope))
+
+        case "tt.atomic_cas":
+            let result = try single(results, mnemonic, loc)
+            let semantic = try parseAtomicSemantic(loc)
+            try expect(punct: ",")
+            let scope = try parseAtomicScope(loc)
+            try expect(punct: ",")
+            let operands = try parseOperandList()
+            skipAttrDictIfPresent()
+            _ = try parseOptionalTrailingTypes()
+            guard operands.count == 3 else {
+                throw CoreError.parse(
+                    "tt.atomic_cas takes three operands (ptr, cmp, val), found \(operands.count)",
+                    loc)
+            }
+            return .atomicCAS(
+                AtomicCAS(
+                    result: result, pointer: operands[0], compare: operands[1], value: operands[2],
+                    semantic: semantic, scope: scope))
+
         case "tt.dot":
             return .dot(try parseDot(result: try single(results, mnemonic, loc), loc: loc))
 
@@ -539,6 +584,28 @@ public struct TritonIRParser {
                 "expected 'to' in \(mnemonic)'s type signature, found '\(peek().text)'", currentLoc)
         }
         return try parseType()
+    }
+
+    /// The `sem` and `scope` attributes Triton prints as bare keywords in front of
+    /// an atomic's operands. Both are accepted and carried; the emitter ignores
+    /// them, because Metal has exactly one memory order for device atomics.
+    private mutating func parseAtomicSemantic(_ loc: SourceLoc) throws -> AtomicSemantic {
+        let text = try expectIdent().text
+        guard let semantic = AtomicSemantic(rawValue: text) else {
+            throw CoreError.parse(
+                "unknown atomic memory semantics '\(text)'; expected one of relaxed, acquire, "
+                    + "release, acq_rel", loc)
+        }
+        return semantic
+    }
+
+    private mutating func parseAtomicScope(_ loc: SourceLoc) throws -> AtomicScope {
+        let text = try expectIdent().text
+        guard let scope = AtomicScope(rawValue: text) else {
+            throw CoreError.parse(
+                "unknown atomic sync scope '\(text)'; expected one of cta, gpu, sys", loc)
+        }
+        return scope
     }
 
     private mutating func parseOperandList() throws -> [String] {

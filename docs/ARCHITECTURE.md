@@ -499,6 +499,77 @@ step's staging need not wait on the previous step's arithmetic. A third,
 `dotVectorStaging`, is **on** by default and exists to be turned off — it is worth
 about 20% and the sweep measures it both ways.
 
+### Atomics
+
+`tt.atomic_rmw` and `tt.atomic_cas` lower to Metal's `device` atomics: the
+Triton pointer is already a `device T *`, so the lowering is a cast of the
+address and a call. What each spelling costs, and what is missing, was
+established by compiling every candidate against Metal's own front end on an
+**M1 Pro (Metal 3, macOS 26.5)** rather than read off the specification:
+
+| Triton | f32 | i32 |
+| --- | --- | --- |
+| `add` / `fadd` | `atomic_fetch_add_explicit` on `atomic_float` | `atomic_fetch_add_explicit` on `atomic_int` |
+| `max` / `min` | **no such intrinsic** — `tm_atomic_fmax`/`fmin`, a compare-exchange loop | `atomic_fetch_max_explicit` / `min` on `atomic_int` |
+| `umax` / `umin` | — (integer only) | the same on `atomic_uint`, operand and result cast |
+| `and` / `or` / `xor` | — (integer only) | `atomic_fetch_and/or/xor_explicit` on `atomic_int` |
+| `exch` | `atomic_exchange_explicit` | `atomic_exchange_explicit` |
+| `tt.atomic_cas` | `tm_atomic_cas` | `tm_atomic_cas` |
+
+Four gaps, each refused by name rather than lowered to something that is not
+atomic:
+
+* **No float `atomic_fetch_max_explicit`.** The template exists but
+  `_valid_fetch_max_type` is not satisfied for `device float *`, so the call does
+  not resolve. Float max and min therefore go through a compare-exchange loop on
+  the bit pattern (`tm_atomic_fmax`), which compares *as floats* so that negative
+  values order correctly. The cost is honest and bounded: an extra
+  `atomic_load` before the loop, and one retry per thread that loses a race on
+  the same address — an uncontended max is a load plus one CAS, about twice a
+  native fetch-max, and contention degrades linearly in the number of contending
+  threads rather than in whatever the hardware does for a native one.
+* **No 16-bit or 64-bit atomics.** `atomic<half>` does not exist and
+  `atomic_fetch_add_explicit` has no `unsigned long` overload, so `f16` and `i64`
+  atomics are refused.
+* **One memory order.** MSL declares `memory_order_relaxed` and nothing else —
+  `memory_order_acq_rel` is not even a declared identifier, and
+  `memory_order_seq_cst` does not resolve. Triton's `sem` (`relaxed`/`acquire`/
+  `release`/`acq_rel`) and `scope` (`cta`/`gpu`/`sys`) are parsed and dropped.
+  The operation itself is atomic; **nothing else about it is ordered**, so a
+  kernel that relies on an atomic's release edge to publish ordinary stores is
+  not correctly lowered here.
+* **No strong compare-exchange.** Metal has only
+  `atomic_compare_exchange_weak_explicit`, which may fail spuriously, so
+  `tt.atomic_cas` — which fails only on a value mismatch — is a small loop that
+  retries exactly when the observed value still equals the comparand
+  (`tm_atomic_cas`).
+
+Two things the *lowering* has to do that a `tt.store` does not.
+
+**A uniform nest performs the atomic once.** Only a nest's innermost loop is
+distributed over threads, so a statement whose nest ends on a uniform axis runs
+in every thread. For a store that writes the same bytes twice; for an atomic add
+it would add the same contribution `threads_per_threadgroup` times. The same
+single-writer guard a store gets is therefore a *correctness* requirement here,
+and it has a consequence: only one thread performs the access, so only that
+thread can be told what was there before. An atomic in such a nest **whose
+result is used** is refused by name.
+
+**A masked lane performs no access at all.** `mask ? atomic : nothing`, with the
+result reading back zero — not a masked store of the result of an unconditional
+atomic, which would corrupt the accumulator.
+
+**Determinism.** Float atomics reorder, and the backend does not pretend
+otherwise: the order in which threadgroups reach an address is not defined, and
+floating-point addition is not associative, so a `tl.atomic_add` reduction is
+run-to-run non-deterministic. The test suite measures the spread rather than
+hiding it — five runs over contributions spanning `1e6` and `1e-3` are asserted
+to agree within the standard recursive-summation bound
+`(k-1) * 2^-24 * sum|x_i|`, and to agree with an in-order CPU sum within the same
+bound. Where a test needs equality it uses contributions that are exactly
+representable, so that any order gives the same total and a single lost update is
+visible.
+
 ### Floating-point policy
 
 Fast math is **off** (`MTLCompileOptions.mathMode = .safe`), which Metal does not
@@ -540,6 +611,8 @@ higher ranks lower through the same nested-loop machinery but are untested.
 | `tt.addptr` | Pointer + integer offset, scalar or tensor, any rank. |
 | `tt.load` | `ptr[, mask[, other]]`, any rank. Masked loads become `mask ? *p : other` (`other` defaults to zero). Cache/eviction attributes are parsed and ignored. |
 | `tt.store` | `ptr, value[, mask]` -> `if (mask) { *p = v; }`, any rank. |
+| `tt.atomic_rmw` | `<kind>, <sem>, <scope>, %ptr, %val[, %mask]`, any rank, on `f32` and `i32` device pointers. Kinds: `add`, `fadd`, `and`, `or`, `xor`, `max`, `min`, `umax`, `umin`, `exch`. Returns the old value. `sem` and `scope` are parsed and ignored — Metal has one memory order (§Atomics). |
+| `tt.atomic_cas` | `<sem>, <scope>, %ptr, %cmp, %val`, `f32` and `i32`. Strong, via a retry loop around Metal's weak compare-exchange (§Atomics). |
 | `tt.reduce` | Single-operand, **last axis only** (the distributed one), combiner `add`/`max`/`min`. With an axis outside the reduced one it folds with `simd_shuffle_down` across the row's lane group and broadcasts back with `simd_shuffle`; a rank-1 reduction folds within each simdgroup and then across them through threadgroup memory (§Cross-lane regions). Parsed in MLIR's generic form, which is how Triton prints ops with regions. Allowed inside an `scf.for` (see §Cross-lane regions), not inside an `scf.if`. |
 | `tt.dot` | `%d = tt.dot %a, %b, %acc[, inputPrecision = ...] : tensor<MxKxT> * tensor<KxNxT> -> tensor<MxNxU>`, rank 2, `T`/`U` in `{f16, f32}` with `U` at least as wide. `M`, `N`, `K` need not be multiples of 8. Lowers to threadgroup tiles + `simdgroup_multiply_accumulate` over 8x8 fragments (see §`tt.dot`). The old `{allowTF32}` attribute spelling is accepted and ignored — Metal has one precision per element type. |
 | `arith.constant` | Scalar and `dense<...>` splat integer/float constants, including MLIR's `0xFF800000` bit-pattern spelling of non-finite floats. |
@@ -557,8 +630,10 @@ higher ranks lower through the same nested-loop machinery but are untested.
 | `scf.if` | With or without results; results need an `else` region. |
 | `scf.yield`, `tt.reduce.return` | Region terminators. |
 
-Not supported (each fails with the op name): `tt.cat`, `tt.atomic_*`,
+Not supported (each fails with the op name): `tt.cat`,
 `tt.call`, `tt.histogram`, `tt.scan`, multi-operand `tt.reduce` (argmax/argmin),
+`f16`/`i64` atomics and an atomic whose returned old value is read in a
+threadgroup-uniform nest (§Atomics),
 reductions over a non-innermost axis, cross-lane operations inside an `scf.if`, a
 carried tensor spanning more than two block axes, a `tt.trans` whose result is
 materialised, a `tl.arange` expanded into both a row and a column index of the
@@ -953,7 +1028,15 @@ What is left, in the order it should be tried:
    FA-2 needs **three** block axes rather than two, and a reduction result that a
    later `tt.dot`'s staging loops have to read. See §Execution model and
    §Cross-lane regions.
-4. **Atomics coverage**: Metal lacks some of CUDA's atomic dtypes (e.g. fp16 atomics).
+4. ~~**Atomics coverage**: Metal lacks some of CUDA's atomic dtypes (e.g. fp16
+   atomics).~~ Done for `f32` and `i32` — see §Atomics. The note was right about
+   the shape of the problem and wrong about which dtype bites: `f16` atomics are
+   indeed missing, but so are **64-bit** ones, and the gap that actually cost
+   code was float `max`/`min`, which CUDA has had since Kepler and Metal does not
+   have at all. Two things it did not anticipate: MSL has exactly one memory
+   order, so Triton's `sem`/`scope` are dropped rather than mapped; and an atomic
+   in a threadgroup-uniform nest needs the single-writer guard as a *correctness*
+   requirement rather than the optimisation it is for a store.
 5. **num_warps > actual concurrency**: occupancy model differs; autotune must
    re-learn its search space (feeds metalscope's roofline data back in here).
 6. **Occupancy of outer block dimensions**: only the innermost dimension is spread
@@ -1039,7 +1122,23 @@ What is left, in the order it should be tried:
     read, the two dots' operand tiles sharing one arena, and an over-large block
     shape refused with its byte count.
 
-`MatmulBenchmark` is an eleventh suite that stays off unless `TM_BENCH=1` is set: it
+11. **Atomics** — concurrent `fadd` accumulation across a grid large enough that
+    every output slot is contended by hundreds of threads in many threadgroups,
+    against a CPU reference, at four shapes and at `num_warps` 1..32; masked
+    variants at counts that are not multiples of the block, where one spurious
+    add is visible in the total; every integer kind (`add`, `max`, `min`,
+    `umax`, `umin`, `and`, `or`, `xor`) against an order-independent reference,
+    with a value spread that makes signed and unsigned disagree; `exch`'s
+    invariant that the surviving value is one some lane wrote; f32 `max`/`min`
+    through the compare-exchange loop, including negatives; the *returned old
+    value* as a permutation of `0..<k` (order-independent by construction);
+    `tt.atomic_cas`'s one-winner-per-slot property; the reordering bound
+    (§Atomics); that a uniform nest performs the atomic once and refuses a used
+    result; and the refusals — `f16`, `i64`, integer-only kinds on float
+    pointers and `fadd` on integer pointers. Every emitted atomic kernel is also
+    put through Metal's own front end.
+
+`MatmulBenchmark` is a further suite that stays off unless `TM_BENCH=1` is set: it
 measures a machine, not a contract. The measurement itself lives in the
 `TritonMetalBench` library and is shared with the **`tmbench`** executable
 (`swift run -c release tmbench`), because XCTest does not exist on a machine with

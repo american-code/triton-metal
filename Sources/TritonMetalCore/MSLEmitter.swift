@@ -70,6 +70,82 @@ enum MSLEmitter {
         }
         """
 
+    /// Metal has no float `atomic_fetch_max_explicit`/`min`. Verified on an M1 Pro
+    /// (Metal 3, macOS 26.5): the templates exist but `_valid_fetch_max_type` is
+    /// not satisfied for `device float *`, so the call does not resolve, while
+    /// `atomic_fetch_add_explicit` on `atomic_float` compiles and runs. Float
+    /// max/min therefore go through a compare-exchange loop on the bit pattern.
+    ///
+    /// Cost, honestly: one extra `atomic_load` before the loop, and one retry per
+    /// thread that loses a race on the same address. The uncontended path is a
+    /// load plus one CAS — about twice a native fetch-max — and contention on a
+    /// hot address degrades linearly in the number of contending threads, where a
+    /// native fetch-max degrades in whatever the hardware does. Emitted only when
+    /// a kernel actually asks for a float max or min.
+    static let atomicFloatMinMaxHelper = """
+        // tt.atomic_rmw max/min on f32. Metal has no float atomic_fetch_max_explicit
+        // (see docs/ARCHITECTURE.md §Atomics), so this is a compare-exchange loop
+        // over the bit pattern. Returns the old value, as tt.atomic_rmw must.
+        // NaN never wins the comparison, so a NaN already in memory is left alone
+        // and a NaN operand is dropped.
+        inline float tm_atomic_fmax(device float *p, float v) {
+            device atomic_uint *a = (device atomic_uint *)p;
+            uint expected = atomic_load_explicit(a, memory_order_relaxed);
+            while (as_type<float>(expected) < v) {
+                if (atomic_compare_exchange_weak_explicit(
+                        a, &expected, as_type<uint>(v),
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    break;
+                }
+            }
+            return as_type<float>(expected);
+        }
+        inline float tm_atomic_fmin(device float *p, float v) {
+            device atomic_uint *a = (device atomic_uint *)p;
+            uint expected = atomic_load_explicit(a, memory_order_relaxed);
+            while (v < as_type<float>(expected)) {
+                if (atomic_compare_exchange_weak_explicit(
+                        a, &expected, as_type<uint>(v),
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    break;
+                }
+            }
+            return as_type<float>(expected);
+        }
+        """
+
+    /// `tt.atomic_cas` is a *strong* compare-and-swap: it fails only because the
+    /// value differed. MSL provides `atomic_compare_exchange_weak_explicit` alone,
+    /// which may also fail spuriously, so the strong one is a loop that retries
+    /// exactly when the observed value still equals the comparand. The float
+    /// overload compares bit patterns so that a NaN comparand behaves like every
+    /// other bit pattern rather than never matching.
+    static let atomicCASHelper = """
+        // tt.atomic_cas. Metal has only the weak compare-exchange, so a spurious
+        // failure (observed value still == cmp) retries; a real failure returns
+        // the value that was there. Returns the old value either way.
+        inline int tm_atomic_cas(device int *p, int cmp, int val) {
+            device atomic_int *a = (device atomic_int *)p;
+            int old = cmp;
+            while (!atomic_compare_exchange_weak_explicit(
+                       a, &old, val, memory_order_relaxed, memory_order_relaxed)) {
+                if (old != cmp) { return old; }
+                old = cmp;
+            }
+            return old;
+        }
+        inline float tm_atomic_cas(device float *p, float cmp, float val) {
+            device atomic_float *a = (device atomic_float *)p;
+            float old = cmp;
+            while (!atomic_compare_exchange_weak_explicit(
+                       a, &old, val, memory_order_relaxed, memory_order_relaxed)) {
+                if (as_type<uint>(old) != as_type<uint>(cmp)) { return old; }
+                old = cmp;
+            }
+            return old;
+        }
+        """
+
     private static func usesErf(_ body: [Instruction]) -> Bool {
         body.contains { instruction in
             switch instruction.kind {
@@ -82,12 +158,14 @@ enum MSLEmitter {
     }
 
     static func emit(module: TritonModule, options: MetalCompiler.Options) throws -> EmissionResult {
-        var chunks: [String] = [preamble]
-        if module.functions.contains(where: { usesErf($0.body) }) {
-            chunks.append(erfHelper)
-        }
         var kernels: [EmittedKernel] = []
+        var bodies: [String] = []
         var seen: Set<String> = []
+        // Whether the float min/max helper is needed is only known once a kernel
+        // has been lowered far enough to type its atomic's pointee, so the
+        // helpers are composed after the kernels rather than before them.
+        var needsFloatAtomicMinMax = false
+        var needsAtomicCAS = false
 
         for function in module.functions {
             guard seen.insert(function.name).inserted else {
@@ -96,9 +174,19 @@ enum MSLEmitter {
             let layout = try LayoutInference.compute(for: function)
             var emitter = FunctionEmitter(function: function, options: options, layout: layout)
             let (source, kernel) = try emitter.run()
-            chunks.append(source)
+            needsFloatAtomicMinMax = needsFloatAtomicMinMax || emitter.usesFloatAtomicMinMax
+            needsAtomicCAS = needsAtomicCAS || emitter.usesAtomicCAS
+            bodies.append(source)
             kernels.append(kernel)
         }
+
+        var chunks: [String] = [preamble]
+        if module.functions.contains(where: { usesErf($0.body) }) {
+            chunks.append(erfHelper)
+        }
+        if needsFloatAtomicMinMax { chunks.append(atomicFloatMinMaxHelper) }
+        if needsAtomicCAS { chunks.append(atomicCASHelper) }
+        chunks.append(contentsOf: bodies)
 
         return EmissionResult(source: chunks.joined(separator: "\n\n") + "\n", kernels: kernels)
     }
@@ -351,6 +439,16 @@ private struct FunctionEmitter {
     private var usesSimdgroups = false
     private var declaredSimdCount = false
     private var reductionCount = 0
+    /// True once a `tt.atomic_rmw max`/`min` on f32 has been lowered, which is
+    /// what pulls `tm_atomic_fmax`/`tm_atomic_fmin` into the module.
+    private(set) var usesFloatAtomicMinMax = false
+    /// True once a `tt.atomic_cas` has been lowered. MSL has only the *weak*
+    /// compare-exchange, so the strong one Triton's op means is a small loop.
+    private(set) var usesAtomicCAS = false
+    /// Every SSA value read by some operation in this function. An atomic that has
+    /// to be performed by one thread of a uniform nest can only return a
+    /// meaningful old value *to that thread*, so a used result is refused there.
+    private let readValues: Set<String>
 
     // MARK: tt.dot state
 
@@ -433,12 +531,31 @@ private struct FunctionEmitter {
         self.spilledReductions = layout.hasDot
             ? FunctionEmitter.reductionsReadByADot(in: function, layout: layout) : []
         self.dotTotal = FunctionEmitter.countDots(function.body)
+        self.readValues = FunctionEmitter.valuesRead(in: function.body)
         self.hoistsUniformRegions = function.body.contains {
             if case .forLoop(let loop) = $0.kind {
                 return FunctionEmitter.containsCrossLane(loop.body)
             }
             return false
         }
+    }
+
+    /// Every value some operation reads, regions included.
+    private static func valuesRead(in body: [Instruction]) -> Set<String> {
+        var result: Set<String> = []
+        for instruction in body {
+            result.formUnion(instruction.kind.operandNames)
+            switch instruction.kind {
+            case .forLoop(let loop):
+                result.formUnion(valuesRead(in: loop.body))
+            case .ifOp(let branch):
+                result.formUnion(valuesRead(in: branch.thenBody))
+                result.formUnion(valuesRead(in: branch.elseBody))
+            default:
+                continue
+            }
+        }
+        return result
     }
 
     private var rank: Int { layout.rank }
@@ -1269,6 +1386,12 @@ private struct FunctionEmitter {
                 .line(line), level: level, recomputable: false, sideEffecting: true,
                 reason: "a tt.store cannot be recomputed", loc)
 
+        case .atomicRMW(let atomic):
+            try emitAtomicRMW(atomic, loc: loc)
+
+        case .atomicCAS(let atomic):
+            try emitAtomicCAS(atomic, loc: loc)
+
         case .forLoop(let loop):
             try emitFor(loop, loc: loc)
 
@@ -1447,6 +1570,205 @@ private struct FunctionEmitter {
         case .ceil: return "ceil"
         case .absf: return "fabs"
         case .absi: return "abs"
+        }
+    }
+
+    // MARK: - Atomics
+
+    /// `tt.atomic_rmw` — one device read-modify-write per block point, returning
+    /// the old value.
+    ///
+    /// Metal's atomics are 32-bit and live in the `device` (or `threadgroup`)
+    /// address space; a Triton `!tt.ptr<f32>` is already a `device float *`, so
+    /// the lowering is a cast of the address and a call. What it is *not* is
+    /// ordered: MSL declares exactly one memory order for these
+    /// (`memory_order_relaxed` — `memory_order_acq_rel` is not a declared
+    /// identifier at all), so Triton's `sem` and `scope` are parsed and dropped.
+    /// The operation itself is atomic; nothing else about it is ordered.
+    private mutating func emitAtomicRMW(_ atomic: AtomicRMW, loc: SourceLoc) throws {
+        let pointerType = try type(of: atomic.pointer, loc)
+        guard case .pointer(let pointee) = pointerType.scalarized else {
+            throw CoreError.lowering(
+                "tt.atomic_rmw expects a pointer, found \(pointerType)", loc)
+        }
+        let valueType = try type(of: atomic.value, loc)
+        guard valueType.scalarized == pointee else {
+            throw CoreError.lowering(
+                "tt.atomic_rmw value type \(valueType) does not match pointee \(pointee)", loc)
+        }
+        guard valueType.shape == pointerType.shape else {
+            throw CoreError.lowering(
+                "tt.atomic_rmw value shape \(valueType) does not match pointer shape "
+                    + "\(pointerType)", loc)
+        }
+        let expression = try atomicRMWExpression(
+            op: atomic.op, pointee: pointee,
+            pointer: try name(of: atomic.pointer, loc), value: try name(of: atomic.value, loc),
+            loc: loc)
+
+        var operands = [atomic.pointer, atomic.value]
+        var conditions: [String] = []
+        if let mask = atomic.mask {
+            try checkShape(mask, against: pointerType, "tt.atomic_rmw mask", loc)
+            operands.append(mask)
+            conditions.append(try name(of: mask, loc))
+        }
+        try emitAtomic(
+            result: atomic.result, resultType: pointerType.withElement(pointee), pointee: pointee,
+            expression: expression, operands: operands, conditions: conditions, what: "tt.atomic_rmw",
+            loc: loc)
+    }
+
+    /// `tt.atomic_cas` — unmasked in Triton's own op definition, so this is the
+    /// same shape without the guard.
+    private mutating func emitAtomicCAS(_ atomic: AtomicCAS, loc: SourceLoc) throws {
+        let pointerType = try type(of: atomic.pointer, loc)
+        guard case .pointer(let pointee) = pointerType.scalarized else {
+            throw CoreError.lowering("tt.atomic_cas expects a pointer, found \(pointerType)", loc)
+        }
+        for (operand, role) in [(atomic.compare, "compare"), (atomic.value, "value")] {
+            let type = try type(of: operand, loc)
+            guard type.scalarized == pointee else {
+                throw CoreError.lowering(
+                    "tt.atomic_cas \(role) type \(type) does not match pointee \(pointee)", loc)
+            }
+            guard type.shape == pointerType.shape else {
+                throw CoreError.lowering(
+                    "tt.atomic_cas \(role) shape \(type) does not match pointer shape "
+                        + "\(pointerType)", loc)
+            }
+        }
+        switch pointee {
+        case .integer(32), .float(32):
+            usesAtomicCAS = true
+        default:
+            throw CoreError.unsupportedOp(
+                "tt.atomic_cas on \(pointee) (Metal's atomics cover 32-bit int and float only)",
+                loc)
+        }
+        let expression =
+            "tm_atomic_cas(\(try name(of: atomic.pointer, loc)), "
+            + "\(try name(of: atomic.compare, loc)), \(try name(of: atomic.value, loc)))"
+        try emitAtomic(
+            result: atomic.result, resultType: pointerType.withElement(pointee), pointee: pointee,
+            expression: expression, operands: [atomic.pointer, atomic.compare, atomic.value],
+            conditions: [], what: "tt.atomic_cas", loc: loc)
+    }
+
+    /// The half both atomics share: placement, the single-writer guard a
+    /// threadgroup-uniform nest needs, and the non-recomputable statement.
+    ///
+    /// The guard is a correctness requirement rather than the optimisation it is
+    /// for `tt.store`. Only a nest's innermost loop is distributed over threads,
+    /// so a statement whose nest ends on a uniform axis runs in *every* thread —
+    /// which for a store writes the same bytes twice and for an atomic add would
+    /// add the same contribution `threadsPerThreadgroup` times.
+    private mutating func emitAtomic(
+        result: String, resultType: TMType, pointee: TMType, expression: String,
+        operands: [String], conditions: [String], what: String, loc: SourceLoc
+    ) throws {
+        var axes = Set(shapeLevel(result, resultType))
+        for operand in operands { axes.formUnion(level(of: operand)) }
+        let level = axes.sorted()
+
+        var conditions = conditions
+        let uniformNest = rank > 0 && (level.last.map { layout.isUniform($0) } ?? true)
+        if uniformNest {
+            conditions.insert(
+                distributesRows && laneWidth < threadsPerThreadgroup
+                    ? "tm_thread_id.x % \(laneWidth)u == 0u" : "tm_thread_id.x == 0u",
+                at: 0)
+            // One thread performs the access, so only that thread can be told what
+            // was there before. Refused by name rather than returning zero in the
+            // other lanes.
+            if readValues.contains(result) {
+                throw CoreError.lowering(
+                    "'%\(result)' is the old value returned by a \(what) whose loop nest ends on "
+                        + "a block dimension every thread walks, so the access is performed by one "
+                        + "thread of the threadgroup and the returned value exists only there; "
+                        + "the result cannot be used. Index the atomic by the distributed block "
+                        + "dimension, or drop the result", loc)
+            }
+        }
+
+        let name = register(result, type: resultType)
+        levels[result] = level
+        let declaration = try declaration(resultType, name, loc)
+        let line: String
+        if conditions.isEmpty {
+            line = "\(declaration) = \(expression);"
+        } else {
+            // A lane whose mask is false performs no access and reads back zero,
+            // which is what Triton documents for a masked atomic.
+            let zero = literal(pointee.isFloatLike ? .float(0) : .integer(0), pointee, loc)
+            line =
+                "\(declaration) = \(zero); "
+                + "if (\(conditions.joined(separator: " && "))) { \(name) = \(expression); }"
+        }
+        try append(
+            .line(line), level: level, recomputable: false, sideEffecting: true,
+            reason: "a \(what) cannot be recomputed", loc)
+    }
+
+    /// The MSL call one `tt.atomic_rmw` kind lowers to, for one pointee type.
+    ///
+    /// Verified empirically on an M1 Pro (Metal 3): `atomic_float` supports
+    /// `fetch_add`, `fetch_sub`, `exchange` and `compare_exchange_weak` but **not**
+    /// `fetch_max`/`fetch_min`; `atomic_int`/`atomic_uint` support all of them;
+    /// there are no 16-bit or 64-bit atomics at all.
+    private mutating func atomicRMWExpression(
+        op: AtomicRMWOp, pointee: TMType, pointer: String, value: String, loc: SourceLoc
+    ) throws -> String {
+        func refuse(_ why: String) -> CoreError {
+            CoreError.unsupportedOp("tt.atomic_rmw \(op.rawValue) on \(pointee) (\(why))", loc)
+        }
+        func call(_ verb: String, _ type: String, _ operand: String) -> String {
+            "atomic_\(verb)_explicit((device \(type) *)(\(pointer)), \(operand), "
+                + "memory_order_relaxed)"
+        }
+
+        switch pointee {
+        case .float(let width):
+            guard width == 32 else {
+                throw refuse("Metal has no 16-bit atomics; there is no atomic<half>")
+            }
+            switch op {
+            // Triton spells a float add `fadd`; `add` on a float pointer is not
+            // something its frontend emits, but it means the same thing.
+            case .fadd, .add: return call("fetch_add", "atomic_float", value)
+            case .exch: return call("exchange", "atomic_float", value)
+            case .max:
+                usesFloatAtomicMinMax = true
+                return "tm_atomic_fmax(\(pointer), \(value))"
+            case .min:
+                usesFloatAtomicMinMax = true
+                return "tm_atomic_fmin(\(pointer), \(value))"
+            case .and, .or, .xor, .umax, .umin:
+                throw refuse("integer-only operation")
+            }
+
+        case .integer(let width):
+            guard width == 32 else {
+                throw refuse(
+                    width == 64
+                        ? "Metal has no 64-bit atomics" : "Metal's atomics are 32-bit; widen to i32"
+                )
+            }
+            switch op {
+            case .add: return call("fetch_add", "atomic_int", value)
+            case .and: return call("fetch_and", "atomic_int", value)
+            case .or: return call("fetch_or", "atomic_int", value)
+            case .xor: return call("fetch_xor", "atomic_int", value)
+            case .max: return call("fetch_max", "atomic_int", value)
+            case .min: return call("fetch_min", "atomic_int", value)
+            case .exch: return call("exchange", "atomic_int", value)
+            case .umax: return "int(\(call("fetch_max", "atomic_uint", "uint(\(value))")))"
+            case .umin: return "int(\(call("fetch_min", "atomic_uint", "uint(\(value))")))"
+            case .fadd: throw refuse("floating-point operation")
+            }
+
+        default:
+            throw refuse("only f32 and i32 device pointers are lowered")
         }
     }
 

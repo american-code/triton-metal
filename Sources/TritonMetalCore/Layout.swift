@@ -104,6 +104,12 @@ enum DotDeferral {
                 case .store(let pointer, let value, let mask):
                     roots.append(contentsOf: [pointer, value, mask].compactMap { $0 })
 
+                case .atomicRMW, .atomicCAS:
+                    // Side-effecting like a store, and its result is a real value:
+                    // both the operands and the old value it returns are live.
+                    roots.append(contentsOf: instruction.kind.operandNames)
+                    roots.append(contentsOf: instruction.kind.resultNames)
+
                 case .dot(let dot):
                     // The dot itself is materialised (as a tile), but reaching it
                     // through `lhs`/`rhs`/`accumulator` does not materialise them.
@@ -335,6 +341,16 @@ enum LayoutInference {
 
                 case .store(let pointer, let value, let mask):
                     relate([pointer, value, mask].compactMap { $0 })
+
+                case .atomicRMW(let atomic):
+                    define(atomic.result, shape(atomic.pointer), loc)
+                    relate(
+                        [atomic.pointer, atomic.value, atomic.mask, atomic.result]
+                            .compactMap { $0 })
+
+                case .atomicCAS(let atomic):
+                    define(atomic.result, shape(atomic.pointer), loc)
+                    relate([atomic.pointer, atomic.compare, atomic.value, atomic.result])
 
                 case .forLoop(let loop):
                     define(loop.inductionVariable, [], loc)

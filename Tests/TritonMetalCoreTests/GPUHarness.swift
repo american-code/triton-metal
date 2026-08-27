@@ -18,6 +18,10 @@ enum HostArg {
 struct KernelRun {
     /// Output buffers, in the order they appeared in the argument list.
     var outputs: [MTLBuffer]
+    /// Every buffer argument, keyed by its position in the argument list — an
+    /// atomic kernel accumulates *into* a buffer it was handed pre-filled, so the
+    /// interesting result is not always an `.output`.
+    var buffers: [Int: MTLBuffer]
     var kernel: EmittedKernel
     var source: String
 }
@@ -40,19 +44,25 @@ enum GPU {
 
         var launchArgs: [MetalRuntime.LaunchArgument] = []
         var outputs: [MTLBuffer] = []
-        for arg in args {
+        var buffers: [Int: MTLBuffer] = [:]
+        for (position, arg) in args.enumerated() {
+            var buffer: MTLBuffer? = nil
             switch arg {
-            case .floats(let values): launchArgs.append(.buffer(try upload(values)))
-            case .halves(let values): launchArgs.append(.buffer(try upload(values)))
-            case .ints(let values): launchArgs.append(.buffer(try upload(values)))
-            case .shorts(let values): launchArgs.append(.buffer(try upload(values)))
+            case .floats(let values): buffer = try upload(values)
+            case .halves(let values): buffer = try upload(values)
+            case .ints(let values): buffer = try upload(values)
+            case .shorts(let values): buffer = try upload(values)
             case .output(let count, let stride):
-                let buffer = try MetalRuntime.makeBuffer(length: max(1, count * stride))
-                memset(buffer.contents(), 0, buffer.length)
-                outputs.append(buffer)
-                launchArgs.append(.buffer(buffer))
+                let allocated = try MetalRuntime.makeBuffer(length: max(1, count * stride))
+                memset(allocated.contents(), 0, allocated.length)
+                outputs.append(allocated)
+                buffer = allocated
             case .int32(let value): launchArgs.append(.int32(value))
             case .float32(let value): launchArgs.append(.float32(value))
+            }
+            if let buffer {
+                buffers[position] = buffer
+                launchArgs.append(.buffer(buffer))
             }
         }
 
@@ -62,7 +72,8 @@ enum GPU {
             threadsPerThreadgroup: kernel.threadsPerThreadgroup,
             arguments: launchArgs)
 
-        return KernelRun(outputs: outputs, kernel: kernel, source: emission.source)
+        return KernelRun(
+            outputs: outputs, buffers: buffers, kernel: kernel, source: emission.source)
     }
 
     static func upload<T>(_ values: [T]) throws -> MTLBuffer {
