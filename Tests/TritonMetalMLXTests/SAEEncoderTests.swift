@@ -158,18 +158,26 @@ final class SAEEncoderTests: XCTestCase {
 
     /// Other block shapes lower and agree too — the IR is parameterised and the
     /// default is a choice, not a constraint.
+    ///
+    /// `64x64x16` at `num_warps = 8` is in the list because `Blocking`'s doc
+    /// comment points a caller who cares about throughput at it (it is what the
+    /// GEMM sweep settled on), and a suggestion that does not lower would be
+    /// worse than no suggestion.
     func testAlternativeBlockShapes() throws {
         try MLXRuntime.require()
-        for blocking in [
-            SAEEncoder.Blocking(m: 32, f: 32, d: 16), SAEEncoder.Blocking(m: 16, f: 64, d: 64),
-        ] {
-            let encoder = try SAEEncoder.compile(blocking: blocking)
+        let cases: [(SAEEncoder.Blocking, MetalCompiler.Options)] = [
+            (.init(m: 32, f: 32, d: 16), .init()),
+            (.init(m: 16, f: 64, d: 64), .init()),
+            (.init(m: 64, f: 64, d: 16), .init(numSimdgroups: 8)),
+        ]
+        for (blocking, options) in cases {
+            let encoder = try SAEEncoder.compile(blocking: blocking, options: options)
             let x = synthetic([50, 40], offset: 1)
             let w = synthetic([40, 90], offset: 7, modulus: 53)
             let b = synthetic([90], offset: 3, modulus: 29)
             XCTAssertLessThan(
                 maxDifference(try encoder(x, w, b), SAEEncoder.reference(x, w, b)), 1e-5,
-                "block \(blocking)")
+                "block \(blocking), \(options.numSimdgroups) simdgroups")
         }
     }
 }

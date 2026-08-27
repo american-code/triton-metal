@@ -189,8 +189,17 @@ public enum SAEEncoder {
         """
     }
 
-    /// Block shape, defaulted to what the M1 Pro measurements in
-    /// docs/ARCHITECTURE.md §Matmul throughput settled on for f32.
+    /// Block shape.
+    ///
+    /// The default is a reasonable one, **not a tuned one**: no sweep has been run
+    /// for this kernel. The nearest thing to evidence is the GEMM sweep in
+    /// docs/ARCHITECTURE.md §Matmul throughput, where `64x64x16` at
+    /// `num_warps = 8` wins at every size on both machines — so a caller who
+    /// cares about this kernel's throughput should start from
+    /// `Blocking(m: 64, f: 64, d: 16)` with `Options(numSimdgroups: 8)` and
+    /// measure, rather than trust what is written here. The numbers `tmsae`
+    /// reports are dispatch overhead and correctness, neither of which the block
+    /// shape decides.
     public struct Blocking: Sendable, Equatable {
         public var m: Int
         public var f: Int
