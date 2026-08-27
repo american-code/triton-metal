@@ -1,12 +1,11 @@
 """Triton's matmul tutorial (`tl.dot`) on a Mac GPU.
 
-One real constraint, and it is worth knowing before you read the code: **the three
-block sizes must be pairwise distinct**. The Swift emitter identifies a block axis
-by its extent (docs/ARCHITECTURE.md §Execution model), so `BLOCK_M == BLOCK_N`
-makes a row index and a column index indistinguishable and the emitter refuses the
-kernel — by name and source line — rather than emitting a diagonal. `(128, 64, 32)`
-is fine; `(64, 64, 32)` is refused. Everything else about the kernel is the
-tutorial's.
+The kernel is the tutorial's, unmodified, and every block shape works — including
+the ones where two or three of `BLOCK_M`, `BLOCK_N` and `BLOCK_K` are equal, which
+this backend used to refuse. Triton's CSE makes `tl.arange(0, BLOCK_M)` and
+`tl.arange(0, BLOCK_N)` a single value when the two are equal, and the row axis and
+the column axis then unify through it; the emitter gives each use its own copy of
+that arithmetic instead (docs/ARCHITECTURE.md §Sharing one range between two axes).
 
     python python/examples/matmul.py
 """
@@ -50,8 +49,6 @@ def matmul(a: np.ndarray, b: np.ndarray, block=(128, 64, 32)) -> np.ndarray:
     K2, N = b.shape
     assert K == K2
     block_m, block_n, block_k = block
-    assert len({block_m, block_n, block_k}) == 3, \
-        "block sizes must be pairwise distinct; see this file's docstring"
     a_buf = MetalBuffer.from_numpy(a)
     b_buf = MetalBuffer.from_numpy(b)
     c_buf = MetalBuffer((M, N), "float32")
@@ -71,12 +68,14 @@ def main():
     M = N = K = 256
     a = rng.standard_normal((M, K), dtype=np.float32)
     b = rng.standard_normal((K, N), dtype=np.float32)
-    got = matmul(a, b)
     expected = a @ b
-    error = float(np.max(np.abs(got - expected)))
     print(f"triton {triton.__version__} on {triton.runtime.driver.active.get_current_target().arch}")
-    print(f"matmul {M}x{K}x{N}: max |triton - numpy| = {error:g}")
-    assert error < 1e-3, f"matmul mismatch: {error}"
+    # Including the shapes where the block sizes collide, which is where Triton's
+    # CSE hands the backend one range serving two (or three) axes.
+    for block in ((128, 64, 32), (64, 64, 32), (64, 64, 64), (32, 32, 32)):
+        error = float(np.max(np.abs(matmul(a, b, block) - expected)))
+        print(f"matmul {M}x{K}x{N} block {block}: max |triton - numpy| = {error:g}")
+        assert error < 1e-3, f"matmul mismatch at {block}: {error}"
     print("OK")
 
 

@@ -21,6 +21,7 @@ from triton_metal import _core
 #: docs/ARCHITECTURE.md §C ABI reference). Anything wider is refused rather than
 #: silently truncated.
 _INT_DTYPES = {"i1", "i8", "i16", "i32"}
+_INT64_DTYPES = {"i64"}
 _FLOAT_DTYPES = {"f32"}
 
 
@@ -77,10 +78,15 @@ class MetalLauncher:
             elif dtype in _INT_DTYPES:
                 kinds.append(_core.ARG_I32)
                 values.append(int(arg))
+            elif dtype in _INT64_DTYPES:
+                kinds.append(_core.ARG_I64)
+                values.append(int(arg))
             else:
+                # f64 lands here and stays here: Metal has no `double`, so the
+                # Swift emitter refuses the kernel rather than narrowing it.
                 raise TypeError(
                     f"argument {index} has scalar type {dtype!r}; tm_launch carries 32-bit "
-                    "scalars only (docs/ARCHITECTURE.md §C ABI reference)")
+                    "scalars and i64 (docs/ARCHITECTURE.md §C ABI reference)")
         _core.launch(function, (grid_0, grid_1, grid_2), threads, kinds, values)
         if exit_hook is not None:
             exit_hook(launch_metadata)

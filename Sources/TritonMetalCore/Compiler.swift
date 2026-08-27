@@ -379,6 +379,11 @@ public func tm_release_library(_ library: Int64) -> Int32 {
 ///   kind 0: `values[i]` is a buffer handle from `tm_alloc_buffer`
 ///   kind 1: `values[i]` is an i32 scalar (sign-extended into the low 32 bits)
 ///   kind 2: `values[i]` is the bit pattern of an f32 scalar in the low 32 bits
+///   kind 3: `values[i]` is an i64 scalar, bound as `constant long &`
+///
+/// There is no f64 kind: Metal has no `double` at all (`'double' is not
+/// supported in Metal`), so an `f64` kernel argument is refused at emission
+/// rather than silently narrowed.
 ///
 /// Returns 0 on success, -1 on failure (see `tm_last_error`).
 @_cdecl("tm_launch")
@@ -408,6 +413,8 @@ public func tm_launch(
                 case 2:
                     arguments.append(
                         .float32(Float(bitPattern: UInt32(truncatingIfNeeded: value))))
+                case 3:
+                    arguments.append(.int64(value))
                 default:
                     throw CoreError.invalidArgument(
                         "unknown launch argument kind \(kinds[i]) at position \(i)")

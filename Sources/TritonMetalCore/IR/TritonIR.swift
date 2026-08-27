@@ -350,6 +350,12 @@ public enum CoreError: Error, CustomStringConvertible {
     case unsupportedOp(String, SourceLoc)
     case unsupportedType(String, SourceLoc)
     case lowering(String, SourceLoc)
+    /// One value indexing two block dimensions with two of its own — reported
+    /// exactly like a lowering error, but distinguished so that `MSLEmitter` can
+    /// tell the one failure `AxisCloning` might be able to rewrite away from
+    /// every other one. Widening the retry to *any* layout failure would let it
+    /// silently change what a kernel means.
+    case axisCollapse(String, SourceLoc)
     case metal(String)
     case invalidHandle(String)
     case invalidArgument(String)
@@ -365,7 +371,7 @@ public enum CoreError: Error, CustomStringConvertible {
                 + "operation yet (see docs/ARCHITECTURE.md §Supported IR subset)"
         case .unsupportedType(let name, let loc):
             return "unsupported type '\(name)' at \(loc)"
-        case .lowering(let message, let loc):
+        case .lowering(let message, let loc), .axisCollapse(let message, let loc):
             return "lowering error at \(loc): \(message)"
         case .metal(let message):
             return "metal error: \(message)"

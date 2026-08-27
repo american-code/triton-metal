@@ -224,12 +224,46 @@ private struct DisjointSet {
 /// iterates), which no fixed (M, N, fresh-K) assignment can describe.
 enum LayoutInference {
     static func compute(for function: TritonFunction) throws -> BlockLayout {
+        var built = try solver(for: function)
+        return try built.solve(function: function)
+    }
+
+    private static func solver(for function: TritonFunction) throws -> Solver {
         var solver = Solver()
         for argument in function.arguments {
             solver.define(argument.name, argument.type.shape ?? [], argument.loc)
         }
         try solver.walk(function.body)
-        return try solver.solve(function: function)
+        return solver
+    }
+
+    /// One `tt.expand_dims` whose source has to be rebuilt from its own copy of
+    /// the index arithmetic, because some *other* `tt.expand_dims` places the
+    /// same rank-1 value at a different dimension. See `AxisCloning`.
+    struct ExpansionConflict {
+        /// The `tt.expand_dims` result whose operand is rewritten.
+        var expansion: String
+        /// That operand: the root of the producer cone to clone.
+        var source: String
+        /// The dimension this expansion inserts, for diagnostics.
+        var axis: Int
+    }
+
+    /// Rank-1 values whose elementwise class reaches `tt.expand_dims` at two
+    /// different dimensions.
+    ///
+    /// This is the shape Triton's CSE hands you whenever two block sizes are
+    /// equal: `tl.arange(0, BLOCK_M)` and `tl.arange(0, BLOCK_N)` become **one**
+    /// `tt.make_range`, `offs_am` and `offs_bn` are then two `arith.addi`s over
+    /// it, and the elementwise relation unifies all four onto one axis variable —
+    /// after which expanding one at dimension 0 and the other at dimension 1
+    /// declares the row axis and the column axis to be the same one.
+    ///
+    /// The conflict is returned rather than refused: the arithmetic is pure, so
+    /// each expansion can have its own copy of it (`AxisCloning`).
+    static func expansionConflicts(in function: TritonFunction) throws -> [ExpansionConflict] {
+        var built = try self.solver(for: function)
+        return built.expansionConflicts()
     }
 
     private struct Solver {
@@ -388,6 +422,68 @@ enum LayoutInference {
         private func terminatorValues(of body: [Instruction]) -> [String]? {
             guard case .yield(let values) = body.last?.kind else { return nil }
             return values
+        }
+
+        // MARK: - Expansion conflicts
+
+        /// The elementwise classes of rank-1 values, and which `tt.expand_dims`
+        /// dimensions each class reaches. A class that reaches two of them is a
+        /// collapse waiting to happen; every expansion after the first
+        /// dimension is reported so that its producer cone can be cloned.
+        mutating func expansionConflicts() -> [ExpansionConflict] {
+            var sets = DisjointSet()
+            var variable: [String: Int] = [:]
+            for ssa in order where shape(ssa).count == 1 && shape(ssa)[0] > 1 {
+                variable[ssa] = sets.make()
+            }
+            // The same relation `solve` unifies rank-for-rank, restricted to the
+            // rank-1 members: two rank-1 values in one elementwise group share an
+            // axis variable.
+            for group in groups {
+                var representative: String? = nil
+                for member in group where variable[member] != nil {
+                    if let first = representative {
+                        sets.union(variable[first]!, variable[member]!)
+                    } else {
+                        representative = member
+                    }
+                }
+            }
+
+            var axesByClass: [Int: [Int]] = [:]
+            var expansionsByClass: [Int: [ExpansionConflict]] = [:]
+            for expansion in expansions {
+                guard let root = variable[expansion.source].map({ sets.find($0) }) else { continue }
+                if !(axesByClass[root] ?? []).contains(expansion.axis) {
+                    axesByClass[root, default: []].append(expansion.axis)
+                }
+                expansionsByClass[root, default: []].append(
+                    ExpansionConflict(
+                        expansion: expansion.result, source: expansion.source,
+                        axis: expansion.axis))
+            }
+
+            var conflicts: [ExpansionConflict] = []
+            for (root, axes) in axesByClass where axes.count > 1 {
+                // *Every* expansion of a conflicted class gets its own copy of
+                // the arithmetic, bar one arbitrary representative — not just the
+                // ones at the second dimension. With all three block sizes equal
+                // the matmul tutorial has one `tt.make_range` serving as the row
+                // index, the column index *and* the contraction index, and two
+                // expansions at the same dimension still have to end up on two
+                // different axes. Anything that really is one axis is unified
+                // again downstream, by the `tt.dot`'s pinning or by whatever
+                // elementwise expression reads both.
+                for entry in (expansionsByClass[root] ?? []).dropFirst() {
+                    conflicts.append(entry)
+                }
+            }
+            // Deterministic: definition order of the expansion results.
+            let position = Dictionary(
+                uniqueKeysWithValues: order.enumerated().map { ($0.element, $0.offset) })
+            return conflicts.sorted {
+                (position[$0.expansion] ?? 0) < (position[$1.expansion] ?? 0)
+            }
         }
 
         // MARK: - Solving
@@ -655,7 +751,7 @@ enum LayoutInference {
                 var seen: Set<Int> = []
                 for (dimension, size) in shape(ssa).enumerated() where size > 1 {
                     guard seen.insert(resolved[dimension]).inserted else {
-                        throw CoreError.lowering(
+                        throw CoreError.axisCollapse(
                             "'%\(ssa)' indexes one block dimension with two of its own "
                                 + "dimensions; a value reached both a row and a column position "
                                 + "(a tl.arange expanded along axis 0 in one place and axis 1 in "

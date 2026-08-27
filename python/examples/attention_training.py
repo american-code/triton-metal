@@ -9,12 +9,9 @@ not have.
 
     python python/examples/attention_training.py
 
-Two constraints worth knowing before reading the kernels, both documented in
+One thing worth knowing before reading the kernels, documented in
 docs/ARCHITECTURE.md:
 
-* **The block sizes must be pairwise distinct.** The emitter identifies a block
-  axis by its extent, so `BLOCK_M`, `BLOCK_N` and `HEAD_DIM` may not collide.
-  `(16, 32, 64)` is fine; `(32, 32, 64)` is refused by name.
 * **`dQ` and `dK`/`dV` are separate kernels.** `dQ_i` sums over key blocks and
   `dK_j`/`dV_j` over query blocks, and no single program owns both ends. The
   alternative is a `tl.atomic_add` accumulation of `dQ`, which the backend now
@@ -199,8 +196,6 @@ class Layer:
     """The three projections, on the GPU, plus the kernels that move them."""
 
     def __init__(self, heads, seq, dim, block_m=16, block_n=32):
-        assert len({block_m, block_n, dim}) == 3, \
-            "BLOCK_M, BLOCK_N and HEAD_DIM must be pairwise distinct (see the docstring)"
         self.heads, self.seq, self.dim = heads, seq, dim
         self.block_m, self.block_n = block_m, block_n
         self.scale = 1.0 / math.sqrt(dim)

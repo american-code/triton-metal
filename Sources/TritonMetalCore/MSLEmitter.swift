@@ -146,6 +146,14 @@ enum MSLEmitter {
         }
         """
 
+    /// The MSL spelling of a scalar type, for the tests that assert on the
+    /// refusals rather than on a lowering.
+    static func metalTypeName(_ type: TMType) throws -> String {
+        let function = TritonFunction(name: "probe", arguments: [], body: [], loc: .unknown)
+        let emitter = FunctionEmitter(function: function, options: .init(), layout: .scalar)
+        return try emitter.scalarTypeNameForTesting(type)
+    }
+
     private static func usesErf(_ body: [Instruction]) -> Bool {
         body.contains { instruction in
             switch instruction.kind {
@@ -171,8 +179,27 @@ enum MSLEmitter {
             guard seen.insert(function.name).inserted else {
                 throw CoreError.lowering("duplicate kernel name '\(function.name)'", function.loc)
             }
-            let layout = try LayoutInference.compute(for: function)
-            var emitter = FunctionEmitter(function: function, options: options, layout: layout)
+            // A kernel that does not lower may be describing a genuine diagonal
+            // — or it may be Triton's CSE having made one rank-1 value serve as
+            // both a row and a column index, which is what equal block sizes
+            // produce. Retry once with each placement given its own copy of the
+            // arithmetic; if that does not help, the first diagnostic was the
+            // honest one (see `AxisCloning`).
+            var lowered = function
+            var layout: BlockLayout
+            do {
+                layout = try LayoutInference.compute(for: function)
+            } catch let original {
+                // Only the collapse: every other layout failure means what it
+                // says, and rewriting the kernel to make one of those go away
+                // would change what it computes.
+                guard case CoreError.axisCollapse = original else { throw original }
+                let cloned = AxisCloning.rewrite(function)
+                guard let retried = try? LayoutInference.compute(for: cloned) else { throw original }
+                lowered = cloned
+                layout = retried
+            }
+            var emitter = FunctionEmitter(function: lowered, options: options, layout: layout)
             let (source, kernel) = try emitter.run()
             needsFloatAtomicMinMax = needsFloatAtomicMinMax || emitter.usesFloatAtomicMinMax
             needsAtomicCAS = needsAtomicCAS || emitter.usesAtomicCAS
@@ -1001,6 +1028,10 @@ private struct FunctionEmitter {
 
     // MARK: - Type mapping
 
+    func scalarTypeNameForTesting(_ type: TMType) throws -> String {
+        try scalarTypeName(type, .unknown)
+    }
+
     private func scalarTypeName(_ type: TMType, _ loc: SourceLoc) throws -> String {
         switch type {
         case .integer(let width):
@@ -1013,7 +1044,15 @@ private struct FunctionEmitter {
             default: throw CoreError.unsupportedType("i\(width)", loc)
             }
         case .float(let width):
-            return width == 16 ? "half" : "float"
+            switch width {
+            case 16: return "half"
+            case 32: return "float"
+            // Metal has no `double`: the front end rejects the type outright
+            // ("'double' is not supported in Metal"), so an f64 value cannot be
+            // narrowed to a float behind the kernel author's back.
+            default: throw CoreError.unsupportedType(
+                "f\(width) (Metal has no double; f64 is not a Metal type)", loc)
+            }
         case .pointer(let pointee):
             return "device \(try scalarTypeName(pointee, loc)) *"
         case .tensor:

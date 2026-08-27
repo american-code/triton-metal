@@ -12,6 +12,7 @@ enum HostArg {
     /// An output buffer of `count` elements of `stride` bytes, zero-filled.
     case output(count: Int, stride: Int = 4)
     case int32(Int32)
+    case int64(Int64)
     case float32(Float)
 }
 
@@ -58,6 +59,7 @@ enum GPU {
                 outputs.append(allocated)
                 buffer = allocated
             case .int32(let value): launchArgs.append(.int32(value))
+            case .int64(let value): launchArgs.append(.int64(value))
             case .float32(let value): launchArgs.append(.float32(value))
             }
             if let buffer {

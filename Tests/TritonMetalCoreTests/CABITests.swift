@@ -306,3 +306,77 @@ final class CABITests: XCTestCase {
         XCTAssertEqual(lastError(), "no error")
     }
 }
+
+/// 64-bit scalar kernel arguments, and the one Metal simply does not have.
+extension CABITests {
+
+    /// `out[i] = i64_arg + i` through the whole ABI: emitted as `constant long &`,
+    /// bound with launch kind 3, and read back exactly — a value that does not
+    /// survive a round trip through 32 bits.
+    func testI64ScalarArgumentsSurviveTheLaunchABI() throws {
+        try skipWithoutMetal()
+        let ir = """
+            module {
+              tt.func public @i64_kernel(%out: !tt.ptr<i64>, %base: i64, %n: i32) {
+                %c8_i32 = arith.constant 8 : i32
+                %pid = tt.get_program_id x : i32
+                %off = arith.muli %pid, %c8_i32 : i32
+                %range = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+                %off_b = tt.splat %off : i32 -> tensor<8xi32>
+                %idx = arith.addi %off_b, %range : tensor<8xi32>
+                %n_b = tt.splat %n : i32 -> tensor<8xi32>
+                %mask = arith.cmpi slt, %idx, %n_b : tensor<8xi32>
+                %idx64 = arith.extsi %idx : tensor<8xi32> to tensor<8xi64>
+                %base_b = tt.splat %base : i64 -> tensor<8xi64>
+                %value = arith.addi %base_b, %idx64 : tensor<8xi64>
+                %p = tt.splat %out : !tt.ptr<i64> -> tensor<8x!tt.ptr<i64>>
+                %ptrs = tt.addptr %p, %idx : tensor<8x!tt.ptr<i64>>, tensor<8xi32>
+                tt.store %ptrs, %value, %mask : tensor<8x!tt.ptr<i64>>
+                tt.return
+              }
+            }
+            """
+        let source = try MetalCompiler.emitMSL(ttir: ir, options: .init())
+        XCTAssertTrue(source.contains("constant long &"), source)
+
+        // A value that needs all 64 bits: truncating it to 32 gives 0.
+        let base: Int64 = 1 << 40
+        let n = 24
+        let run = try GPU.run(
+            ir: ir, grid: (3, 1, 1),
+            args: [.output(count: n, stride: 8), .int64(base), .int32(Int32(n))])
+        XCTAssertEqual(
+            GPU.read(run.outputs[0], Int64.self, n), (0..<n).map { base + Int64($0) })
+    }
+
+    /// Metal has no `double` — its front end says so outright ("'double' is not
+    /// supported in Metal") — so there is no f64 launch-argument kind and an
+    /// `f64` argument is refused by name rather than quietly narrowed to a float.
+    /// The parser refuses the *type*; `MSLEmitter.scalarTypeName` refuses it
+    /// again, so a width that reached the emitter another way cannot be widened
+    /// away either.
+    func testF64IsRefusedRatherThanNarrowed() throws {
+        let ir = """
+            module {
+              tt.func public @f64_kernel(%out: !tt.ptr<f32>, %scale: f64) {
+                %c0_i32 = arith.constant 0 : i32
+                %p = tt.addptr %out, %c0_i32 : !tt.ptr<f32>, i32
+                %v = arith.truncf %scale : f64 to f32
+                tt.store %p, %v : !tt.ptr<f32>
+                tt.return
+              }
+            }
+            """
+        do {
+            _ = try MetalCompiler.emitMSL(ttir: ir, options: .init())
+            XCTFail("expected f64 to be refused")
+        } catch {
+            XCTAssertTrue("\(error)".contains("f64"), "\(error)")
+        }
+        XCTAssertThrowsError(
+            try MSLEmitter.metalTypeName(.float(width: 64))
+        ) { error in
+            XCTAssertTrue("\(error)".contains("Metal has no double"), "\(error)")
+        }
+    }
+}

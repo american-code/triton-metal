@@ -181,6 +181,9 @@ def free_buffer(handle: int) -> None:
 ARG_BUFFER = 0
 ARG_I32 = 1
 ARG_F32 = 2
+#: A 64-bit integer scalar (`constant long &`). There is no f64 kind: Metal has
+#: no `double` type at all, so an f64 argument is refused by the Swift emitter.
+ARG_I64 = 3
 
 
 def float_bits(value: float) -> int:

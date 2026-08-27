@@ -112,6 +112,10 @@ public enum MetalRuntime {
     public enum LaunchArgument {
         case buffer(MTLBuffer)
         case int32(Int32)
+        /// A 64-bit integer scalar, bound as `constant long &`. Metal has `long`;
+        /// it has no `double`, so there is deliberately no `float64` case here
+        /// (see `MSLEmitter`'s refusal of `f64`).
+        case int64(Int64)
         case float32(Float)
     }
 
@@ -150,6 +154,8 @@ public enum MetalRuntime {
                 encoder.setBuffer(buffer, offset: 0, index: index)
             case .int32(var value):
                 encoder.setBytes(&value, length: MemoryLayout<Int32>.size, index: index)
+            case .int64(var value):
+                encoder.setBytes(&value, length: MemoryLayout<Int64>.size, index: index)
             case .float32(var value):
                 encoder.setBytes(&value, length: MemoryLayout<Float>.size, index: index)
             }
