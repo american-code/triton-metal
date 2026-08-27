@@ -7,3 +7,7 @@ build/
 dist/
 .pytest_cache/
 *.metallib
+
+# Staged into the plugin backend by Tools/bundle-wheel.sh so the Triton wheel
+# carries the Swift runtime. Built, not source.
+python/plugin/backend/libtritonmetal.dylib

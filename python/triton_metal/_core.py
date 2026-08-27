@@ -8,15 +8,44 @@ RuntimeError carrying `tm_last_error`. Nothing is computed on this side.
 import ctypes
 import os
 import struct
+import sysconfig
 from pathlib import Path
+
+#: File name of the Swift core's dynamic library, everywhere it might be.
+_LIBRARY = "libtritonmetal.dylib"
+
+
+def _installed_backend_dirs():
+    """`triton/backends/metal/` in whichever site directory Triton is installed in.
+
+    Located by path rather than by importing `triton`: this module is imported
+    *from* `triton.backends.metal.compiler`, so asking the import system for
+    `triton` here would re-enter a package that is only half initialised.
+
+    This is where a wheel built by Tools/bundle-wheel.sh puts the dylib, which is
+    what makes the Triton wheel a single self-contained artifact (docs/USAGE.md
+    §Building Triton with the Metal backend). It is searched before the
+    repo-relative dev builds so that an installed wheel uses its own runtime
+    rather than whatever a checkout happens to have lying in `.build`; a
+    developer who wants the other one says so with TRITON_METAL_CORE_LIB.
+    """
+    paths = sysconfig.get_paths()
+    roots = [paths.get(key) for key in ("purelib", "platlib")]
+    return [
+        str(Path(root) / "triton" / "backends" / "metal" / _LIBRARY) for root in roots if root
+    ]
+
 
 _SEARCH = [
     os.environ.get("TRITON_METAL_CORE_LIB"),
+    # Bundled into an installed `triton.backends.metal`.
+    *_installed_backend_dirs(),
+    # Installed alongside this package (a wheel that ships the dylib next to the
+    # shim rather than next to the backend).
+    str(Path(__file__).resolve().parent / _LIBRARY),
     # Repo-relative dev builds (swift build [-c release] at the repo root).
-    str(Path(__file__).resolve().parents[2] / ".build" / "release" / "libtritonmetal.dylib"),
-    str(Path(__file__).resolve().parents[2] / ".build" / "debug" / "libtritonmetal.dylib"),
-    # Installed alongside the wheel.
-    str(Path(__file__).resolve().parent / "libtritonmetal.dylib"),
+    str(Path(__file__).resolve().parents[2] / ".build" / "release" / _LIBRARY),
+    str(Path(__file__).resolve().parents[2] / ".build" / "debug" / _LIBRARY),
 ]
 
 
@@ -25,8 +54,9 @@ def _load() -> ctypes.CDLL:
         if path and os.path.exists(path):
             return ctypes.CDLL(path)
     raise OSError(
-        "libtritonmetal.dylib not found; run `swift build` at the repo root "
-        "or set TRITON_METAL_CORE_LIB"
+        f"{_LIBRARY} not found; run `swift build` at the repo root, install a wheel built "
+        "with Tools/bundle-wheel.sh, or set TRITON_METAL_CORE_LIB. Searched:\n  "
+        + "\n  ".join(p for p in _SEARCH if p)
     )
 
 
