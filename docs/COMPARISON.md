@@ -182,3 +182,9 @@ the largest is loading the B operand's 8×8 fragments straight from device memor
 MSL's `simdgroup_load` takes a `device` pointer, each simdgroup reads exactly one
 B fragment per step under the shared-column mapping, and staging it therefore buys
 only masking, at the cost of an entire staging pass.
+
+Every ratio on this page is a GPU-ALU number on M1-generation silicon. M5 adds a
+neural accelerator inside each shader core, reachable from MSL through TensorOps
+([WHITEPAPER §2.1](WHITEPAPER.md#21-where-apples-stack-moved-and-where-this-stands)),
+which raises the ceiling for this backend and for MPS alike — so none of these
+percentages transfers to that hardware in either direction until re-measured on it.

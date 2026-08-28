@@ -244,6 +244,32 @@ backend still trails by roughly a quarter on GEMM. The claim is that the
 portable-kernel moat is crossable, and that a Triton attention layer now trains on
 a Mac — not that the crossing is finished.
 
+### 2.1 Where Apple's stack moved, and where this stands
+
+**TensorOps** is "a Metal Shading Language API which accelerates tensor
+operations on the GPU, including matrix multiplication and convolution", taking
+"full advantage of the neural accelerator in the M5 chip family" — "a new
+hardware block in M5, located directly in each shader core"
+([WWDC26 session 330](https://developer.apple.com/videos/play/wwdc2026/330/);
+MSL's tensor types are in Apple's
+[machine learning passes](https://developer.apple.com/documentation/metal/machine-learning-passes)
+docs). What it asks of a developer is an MSL kernel. Apple shipped no Triton
+frontend, so the bet here — run the ecosystem's existing source unmodified — is
+untouched in kind.
+
+What it *does* supersede is this backend's choice of destination for `tt.dot`:
+on Metal-4-capable silicon the `simdgroup_matrix` path of §5.4 stops being the
+best lowering of the same `ttir`, because TensorOps reaches a compute unit it
+cannot. **Emit TensorOps on Metal-4-capable silicon** is therefore the named
+next-generation lever — spec-level only: no M4 or M5 part was available here,
+nothing was compiled against MSL 4 tensor types, and no number in this paper is
+measured on such hardware.
+
+It also bounds §7, whose every ratio is an M1-generation GPU-ALU number against
+an M1-generation MPS. A second arithmetic path moves both sides at once, so 76%
+of `MPSMatrixMultiplication` does not carry to M5-class silicon in either
+direction until measured there.
+
 ---
 
 ## 3. Related work

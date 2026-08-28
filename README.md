@@ -19,6 +19,22 @@ hand-written numpy autograd and against finite differences;
 has the full case and its boundaries, including which CUDA optimisation techniques
 transfer to M1-generation Apple silicon and which invert.
 
+## Where Apple's stack moved, and where this stands
+
+WWDC 2026 made Metal a first-class ML surface: **TensorOps**, "a Metal Shading
+Language API which accelerates tensor operations on the GPU, including matrix
+multiplication and convolution", taking "full advantage of the neural accelerator
+in the M5 chip family"
+([WWDC26 session 330](https://developer.apple.com/videos/play/wwdc2026/330/)).
+What it asks of a researcher is an MSL kernel. What this asks is nothing: the
+existing `@triton.jit` file runs unmodified. Apple shipped no Triton frontend,
+so the two bets overlap nowhere.
+
+Apple's move improves the target rather than competing with it, and it bounds
+every ratio below to M1-generation silicon.
+[docs/WHITEPAPER.md §2.1](docs/WHITEPAPER.md#21-where-apples-stack-moved-and-where-this-stands)
+states both, and names the next-generation backend lever.
+
 ## Documentation
 
 | | |
